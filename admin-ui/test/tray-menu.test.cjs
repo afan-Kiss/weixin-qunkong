@@ -1,0 +1,23 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { existsSync, readFileSync } = require('node:fs')
+const path = require('node:path')
+
+test('system tray provides the four requested menu entries', () => {
+  const root = path.join(__dirname, '..')
+  const source = readFileSync(path.join(root, 'electron', 'main.cjs'), 'utf8')
+
+  assert.equal(existsSync(path.join(root, 'electron', 'tray-icon.png')), true)
+  assert.equal(existsSync(path.join(root, 'electron', 'app-icon.ico')), true)
+  assert.match(source, /new Tray/)
+  assert.match(source, /app-icon\.ico/)
+  assert.match(source, /label: '显示主界面'/)
+  assert.match(source, /label: '重启软件'/)
+  assert.match(source, /label: '退出软件'/)
+  assert.match(source, /function restartApp/)
+  assert.match(source, /releaseSingleInstanceLock/)
+  assert.match(source, /PORTABLE_EXECUTABLE_FILE/)
+  assert.match(source, /app\.relaunch\(/)
+  assert.match(source, /app\.exit\(0\)/)
+  assert.match(source, /click: \(\) => restartApp\(\)/)
+})

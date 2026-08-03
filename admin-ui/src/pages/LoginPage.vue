@@ -1,0 +1,31 @@
+<script setup lang="ts">
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { User, Lock } from '@element-plus/icons-vue'
+import { login } from '../stores/auth'
+
+const router = useRouter(), username = ref(''), password = ref(''), error = ref(''), loading = ref(false)
+async function submit() {
+  error.value = ''
+  if (!username.value.trim() || !password.value) { error.value = '请输入账号和密码'; return }
+  loading.value = true
+  try { await login(username.value.trim(), password.value); await router.replace('/dashboard') }
+  catch (reason) { error.value = reason instanceof Error ? reason.message : '登录失败，请稍后重试' }
+  finally { loading.value = false }
+}
+</script>
+<template>
+  <main class="auth-page"><section class="auth-panel">
+    <div class="auth-brand"><span>W</span><div><h1>微信群控管理平台</h1><p>账号登录</p></div></div>
+    <el-form @submit.prevent="submit">
+      <el-form-item><el-input v-model="username" :prefix-icon="User" size="large" placeholder="请输入账号" maxlength="32" autofocus /></el-form-item>
+      <el-form-item><el-input v-model="password" :prefix-icon="Lock" size="large" type="password" show-password placeholder="请输入密码" @keyup.enter="submit" /></el-form-item>
+      <p v-if="error" class="auth-error">{{ error }}</p>
+      <el-button type="primary" size="large" :loading="loading" class="auth-submit" @click="submit">登录</el-button>
+    </el-form>
+    <div class="auth-switch">还没有账号？<el-button link type="primary" @click="router.push('/register')">注册账号</el-button></div>
+  </section></main>
+</template>
+<style scoped>
+.auth-page{height:100%;display:grid;place-items:center;background:#f3f6f8;padding:24px}.auth-panel{width:min(400px,100%);background:#fff;border:1px solid #dfe5e8;border-radius:8px;padding:34px;box-shadow:0 12px 32px rgba(28,45,53,.08)}.auth-brand{display:flex;gap:14px;align-items:center;margin-bottom:28px}.auth-brand>span{width:44px;height:44px;display:grid;place-items:center;background:#0f9f90;color:#fff;border-radius:8px;font-size:22px;font-weight:700}.auth-brand h1{font-size:18px;margin:0 0 4px;color:#172126}.auth-brand p{margin:0;color:#718087;font-size:13px}.auth-submit{width:100%}.auth-error{color:#d92d20;font-size:13px;margin:-4px 0 12px}.auth-switch{text-align:center;margin-top:22px;color:#718087;font-size:13px}
+</style>

@@ -1,0 +1,16 @@
+# Files uploaded by local deploy.py (secrets stay in untracked deploy.py)
+server.py
+admin_ui.py
+software_accounts.py
+road_archive.py
+sim_bets.py
+wsutil.py
+text_rotate.py
+analytics_versions.py
+analytics_db.py
+analytics_stats.py
+big_road_engine.py
+road_quality.py
+formula_events.py
+strict_replay.py
+audit_analytics.py

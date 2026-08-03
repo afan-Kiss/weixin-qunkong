@@ -1,0 +1,88 @@
+{
+  "name": "wx-group-admin-ui",
+  "private": true,
+  "version": "1.11.0",
+  "wxqkReleaseSequence": 7,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "extract:har": "node --experimental-strip-types scripts/extract-wechat-har.ts",
+    "test": "node --test test/*.test.cjs",
+    "test:ui": "node scripts/ui-audit.mjs",
+    "test:injection": "node scripts/real-injection-smoke.mjs",
+    "test:prelogin": "node scripts/prelogin-ui-smoke.mjs",
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "bump:version": "node scripts/bump-version.cjs",
+    "ensure:hooks": "node scripts/ensure-hooks.cjs",
+    "package:win": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && electron-builder --win portable",
+    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && electron-builder --win portable",
+    "preview": "vite preview",
+    "electron": "electron ."
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "@undecaf/zbar-wasm": "^0.11.0",
+    "element-plus": "^2.14.3",
+    "jsqr": "^1.4.0",
+    "vue": "^3.5.40",
+    "vue-router": "^4.6.4",
+    "ws": "^8.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/tsconfig": "^0.9.1",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12",
+    "playwright": "^1.62.1",
+    "sass": "^1.102.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.2.0",
+    "vue-tsc": "^3.3.8"
+  },
+  "build": {
+    "appId": "cn.local.wechat.groupcontrol",
+    "productName": "微信群控管理平台",
+    "asar": true,
+    "directories": {
+      "output": "release-v19"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "docs/generated",
+        "to": "docs/generated",
+        "filter": [
+          "wechat-api-contracts.json"
+        ]
+      },
+      {
+        "from": "resources/hook/4.1.8.27",
+        "to": "hook/4.1.8.27",
+        "filter": [
+          "inject.exe",
+          "libGLESv1.dll"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "electron/app-icon.ico",
+      "target": [
+        "portable"
+      ],
+      "artifactName": "微信群控系统v1.11.${ext}",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

@@ -1,0 +1,144 @@
+/**
+ * 启动自动更新（对齐开云）：检查 → 进度条下载 → 替换重启。
+ */
+
+const HOST_ID = 'wxqk-client-update-modal'
+const STARTUP_UPDATE_KEY = 'wxqk-startup-update-checked'
+
+function fmtBytes(n: number) {
+  const value = Number(n) || 0
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function ensureModal() {
+  let el = document.getElementById(HOST_ID)
+  if (el) return el
+  el = document.createElement('div')
+  el.id = HOST_ID
+  el.className = 'wxqk-client-update-modal'
+  el.setAttribute('hidden', '')
+  el.innerHTML = `
+    <div class="wxqk-client-update-box" role="dialog" aria-modal="true" aria-labelledby="wxqk-update-title">
+      <h3 id="wxqk-update-title">发现新版本</h3>
+      <p class="wxqk-client-update-name" id="wxqk-update-name"></p>
+      <div class="wxqk-client-update-bar"><i id="wxqk-update-bar" style="width:0%"></i></div>
+      <p class="wxqk-client-update-pct" id="wxqk-update-pct">准备下载…</p>
+      <p class="wxqk-client-update-hint" id="wxqk-update-hint">正在下载；完成后自动替换并重启</p>
+    </div>
+  `
+  document.body.appendChild(el)
+  return el
+}
+
+/**
+ * 显示进度弹层并执行下载替换。
+ */
+async function runClientUpdateModal(
+  info: { fileName?: string; latestVersion?: string; fileSize?: number },
+  applyFn: () => Promise<{ ok?: boolean; message?: string }>,
+) {
+  const el = ensureModal()
+  const name = String(info?.fileName || (info?.latestVersion ? `微信群控系统v${info.latestVersion}.exe` : '新版本'))
+  const nameEl = document.getElementById('wxqk-update-name')
+  const bar = document.getElementById('wxqk-update-bar')
+  const pctEl = document.getElementById('wxqk-update-pct')
+  const hint = document.getElementById('wxqk-update-hint')
+  if (nameEl) nameEl.textContent = name + (info?.fileSize ? `（${fmtBytes(Number(info.fileSize))}）` : '')
+  if (bar) bar.style.width = '0%'
+  if (pctEl) pctEl.textContent = '0%'
+  if (hint) hint.textContent = '正在下载；完成后自动替换、启动新版本并关闭旧版'
+  el.removeAttribute('hidden')
+
+  const onProgress = (ev: { phase?: string; downloaded?: number; total?: number; percent?: number; message?: string }) => {
+    const phase = String(ev?.phase || '')
+    const percent = Math.max(0, Math.min(100, Number(ev?.percent) || 0))
+    if (bar) bar.style.width = `${percent.toFixed(1)}%`
+    if (phase === 'download') {
+      const loaded = Number(ev?.downloaded) || 0
+      const total = Number(ev?.total) || 0
+      if (pctEl) {
+        pctEl.textContent = total > 0
+          ? `${percent.toFixed(1)}%（${fmtBytes(loaded)} / ${fmtBytes(total)}）`
+          : `${percent.toFixed(1)}%`
+      }
+      if (hint) hint.textContent = '下载中，请勿关闭；完成后自动重启'
+    } else if (phase === 'installing') {
+      if (pctEl) pctEl.textContent = '100% · 新版本已启动，正在关闭旧版…'
+      if (hint) hint.textContent = String(ev?.message || '请稍候，旧版本即将关闭')
+    } else if (phase === 'error') {
+      if (pctEl) pctEl.textContent = String(ev?.message || '更新失败')
+      if (hint) hint.textContent = '更新失败，软件不会关闭，可稍后重开再试'
+    }
+  }
+
+  const stopProgress = window.wxControl?.onUpdateProgress?.(onProgress)
+  try {
+    const res = await applyFn()
+    if (!res?.ok) {
+      onProgress({ phase: 'error', message: res?.message || '更新失败', percent: 0 })
+      await new Promise((resolve) => setTimeout(resolve, 2200))
+      el.setAttribute('hidden', '')
+      return { ok: false as const, message: res?.message || '更新失败' }
+    }
+    onProgress({ phase: 'installing', percent: 100, message: res?.message || '即将重启' })
+    // 替换成功后新进程会拉起并退出旧进程；短暂等待便于展示「正在重启」
+    await new Promise((resolve) => setTimeout(resolve, 15000))
+    el.setAttribute('hidden', '')
+    return { ok: true as const, message: res?.message || '更新完成' }
+  } finally {
+    stopProgress?.()
+  }
+}
+
+let bootstrapStarted = false
+
+/**
+ * 冷启动自动检查更新：有新版直接下载并替换。
+ */
+export async function bootstrapClientUpdate() {
+  if (bootstrapStarted) return
+  bootstrapStarted = true
+  if (!window.wxControl?.checkClientUpdate) return
+
+  let alreadyChecked = false
+  try { alreadyChecked = sessionStorage.getItem(STARTUP_UPDATE_KEY) === '1' } catch { /* ignore */ }
+
+  const run = async () => {
+    if (alreadyChecked) {
+      try { await window.wxControl?.markStartupUpdateDone?.() } catch { /* ignore */ }
+      return
+    }
+    alreadyChecked = true
+    try { sessionStorage.setItem(STARTUP_UPDATE_KEY, '1') } catch { /* ignore */ }
+
+    let applySucceeded = false
+    try {
+      const upd = await window.wxControl?.checkClientUpdate?.()
+      if (!upd) return
+      if (upd.ok === false) {
+        console.warn('[update]', upd.message || '检查更新失败')
+        return
+      }
+      if (!upd.needUpdate) return
+      if (upd.canApply === false) {
+        console.info('[update]', upd.message || '发现新版本（当前环境不自动替换）')
+        return
+      }
+      const applied = await runClientUpdateModal(upd, () => window.wxControl!.applyClientUpdate())
+      if (applied?.ok === true) applySucceeded = true
+      else if (applied?.ok === false) console.warn('[update]', applied.message)
+    } catch (error) {
+      console.warn('[update] check failed', error)
+    } finally {
+      if (!applySucceeded) {
+        try { await window.wxControl?.markStartupUpdateDone?.() } catch { /* ignore */ }
+      }
+    }
+  }
+
+  // 主进程冷启动信号 + 本进程兜底（防止信号早于监听）
+  window.wxControl.onUpdateStartupCheck?.(() => { void run() })
+  void run()
+}

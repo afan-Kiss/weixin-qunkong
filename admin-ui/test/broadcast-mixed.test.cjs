@@ -1,0 +1,33 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { readFileSync } = require('node:fs')
+const path = require('node:path')
+const root = path.join(__dirname, '..')
+
+test('broadcast task keeps text and image as separate steps for every selected target', () => {
+  const page = readFileSync(path.join(root, 'src', 'pages', 'BroadcastPage.vue'), 'utf8')
+  const main = readFileSync(path.join(root, 'electron', 'main.cjs'), 'utf8')
+
+  assert.match(page, /SEND_MIXED_TO_FRIEND/)
+  assert.match(page, /actionType: 'SEND_TEXT'/)
+  assert.match(page, /actionType: 'SEND_IMAGE'/)
+  assert.match(page, /request: \{ wxid: target\.wxid, filepath: imagePath\.value \}/)
+  assert.doesNotMatch(page, /v-model="contentType"/)
+  assert.match(main, /item\.action_type === 'SEND_IMAGE'/)
+  assert.match(main, /api\/send_image_msg/)
+  assert.match(main, /sourceId = 438557485/)
+  assert.doesNotMatch(main, /imageTask \? 'BLOCKED_API_UNVERIFIED'/)
+})
+
+test('broadcast accepts clipboard images without triggering a send', () => {
+  const page = readFileSync(path.join(root, 'src', 'pages', 'BroadcastPage.vue'), 'utf8')
+  const main = readFileSync(path.join(root, 'electron', 'main.cjs'), 'utf8')
+  const preload = readFileSync(path.join(root, 'electron', 'preload.cjs'), 'utf8')
+  assert.match(page, /document\.addEventListener\('paste', onPaste\)/)
+  assert.match(page, /item\.type\.startsWith\('image\/'\)/)
+  assert.match(page, /window\.wxControl\?\.pasteImage\(\)/)
+  assert.match(main, /ipcMain\.handle\('files:paste-image'/)
+  assert.match(main, /clipboard\.readImage\(\)/)
+  assert.match(main, /writeFileSync\(imagePath, png\)/)
+  assert.match(preload, /pasteImage: \(\) => ipcRenderer\.invoke\('files:paste-image'\)/)
+})

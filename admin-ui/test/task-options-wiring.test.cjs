@@ -1,0 +1,59 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { readFileSync } = require('node:fs')
+const path = require('node:path')
+
+const read = (file) => readFileSync(path.join(__dirname, '..', file), 'utf8')
+
+test('QR account limit and cooldown are passed into execution', () => {
+  const page = read('src/pages/QrTasksPage.vue')
+  const main = read('electron/main.cjs')
+  assert.match(page, /capacity = availableInstances\.length \* limitPerAccount\.value/)
+  assert.match(page, /limitPerAccount:\s*limitPerAccount\.value/)
+  assert.match(page, /coolMinutes:\s*coolMinutes\.value/)
+  assert.match(page, /applyText:\s*applyText\.value/)
+  assert.match(page, /skipPersonal:\s*skipPersonal\.value/)
+  assert.match(page, /saveContact:\s*saveContact\.value/)
+  assert.match(main, /task\?\.config\?\.coolMinutes/)
+  assert.match(main, /applyQrOptions\(record, task, item, decodedText, taskId\)/)
+  assert.match(main, /reserveQrJoinDailyAttempt/)
+})
+
+test('group start, count and exclusion rules filter members before profile requests', () => {
+  const page = read('src/pages/GroupsMembersPage.vue')
+  assert.match(page, /function filterCandidates/)
+  assert.match(page, /excludeText\.value\.split/)
+  assert.match(page, /\.slice\(Math\.max\(startFrom\.value - 1/)
+  assert.match(page, /Math\.max\(maxCount\.value/)
+  const body = page.slice(page.indexOf('async function createAddFriendTask'), page.indexOf('async function collectLatestMembers'))
+  assert.match(body, /const candidates = filterCandidates/)
+  assert.match(body, /for \(const member of candidates\)/)
+})
+
+test('scheduled and weighted broadcast options affect task creation and execution', () => {
+  const page = read('src/pages/BroadcastPage.vue')
+  const main = read('electron/main.cjs')
+  assert.match(page, /v-model="scheduledAt" type="datetime"/)
+  assert.match(page, /eligible = available\.filter\(\(item\) => target\.sourceInstanceIds\.includes\(item\.id\)\)/)
+  assert.match(page, /allocationPool = eligible\.flatMap/)
+  assert.match(page, /accountWeights\.value\[item\.id\]/)
+  assert.match(main, /task\?\.config\?\.scheduledAt/)
+  assert.match(main, /waitForTaskTime\(taskId, scheduledAt\)/)
+})
+
+test('send retry uses configured count and delay but stops on uncertain results', () => {
+  const page = read('src/pages/BroadcastPage.vue')
+  const main = read('electron/main.cjs')
+  assert.match(page, /retryMinutes: retryMinutes\.value/)
+  assert.match(page, /skipSame: skipSame\.value/)
+  assert.match(main, /task\?\.config\?\.autoRetry/)
+  assert.match(main, /task\.config\.retryTimes/)
+  assert.match(main, /task\?\.config\?\.retryMinutes/)
+  assert.match(main, /请求结果不确定，为避免重复发送已停止任务/)
+})
+
+test('all task pacing uses only the global random interval', () => {
+  const main = read('electron/main.cjs')
+  assert.match(main, /const min = Math\.max\(Number\(settings\.intervalMin\)/)
+  assert.doesNotMatch(main, /task\?\.config\?\.intervalMin/)
+})

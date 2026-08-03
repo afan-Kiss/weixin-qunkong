@@ -1,0 +1,22 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { readFileSync } = require('node:fs')
+const path = require('node:path')
+
+test('sidebar displays real application resource metrics', () => {
+  const root = path.join(__dirname, '..')
+  const main = readFileSync(path.join(root, 'electron', 'main.cjs'), 'utf8')
+  const preload = readFileSync(path.join(root, 'electron', 'preload.cjs'), 'utf8')
+  const layout = readFileSync(path.join(root, 'src', 'layout', 'MainLayout.vue'), 'utf8')
+
+  assert.match(main, /app\.getAppMetrics\(\)/)
+  assert.match(main, /process\.uptime\(\)/)
+  assert.match(main, /workingSetSize/)
+  assert.match(main, /ipcMain\.handle\('system:metrics'/)
+  assert.match(preload, /systemMetrics: \(\) => ipcRenderer\.invoke\('system:metrics'\)/)
+  assert.match(layout, /软件运行时长/)
+  assert.match(layout, /CPU 占用/)
+  assert.match(layout, /内存占用/)
+  assert.match(layout, /磁盘占用/)
+  assert.doesNotMatch(layout, /本机运行|数据已保存|个微信/)
+})

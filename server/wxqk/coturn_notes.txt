@@ -1,0 +1,21 @@
+# coturn (TURN) for 发财888 WebRTC — install on same VPS as facai888.
+# Host: xiangyuzhubao.xyz / 47.108.21.50
+#
+# Example /etc/turnserver.conf snippet:
+#   listening-port=3478
+#   tls-listening-port=5349
+#   fingerprint
+#   lt-cred-mech
+#   use-auth-secret
+#   static-auth-secret=<FACAI888_TURN_SECRET>
+#   realm=xiangyuzhubao.xyz
+#   server-name=xiangyuzhubao.xyz
+#   no-multicast-peers
+#   no-cli
+#
+# systemd Environment for facai888:
+#   FACAI888_TURN_HOST=xiangyuzhubao.xyz
+#   FACAI888_TURN_SECRET=<same as coturn>
+#
+# Open UDP/TCP 3478 and TCP 5349 in firewall.
+# ICE credentials are minted by server/facai888/webrtc_session.py (REST-style).

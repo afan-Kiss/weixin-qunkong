@@ -1,0 +1,56 @@
+# Dependencies / build
+**/node_modules/
+**/dist/
+**/dist-ssr/
+admin-ui/release/
+admin-ui/release-*/
+admin-ui/test-results/
+*.local
+
+# Packaged binaries (publish locally; do not commit)
+*.exe
+!admin-ui/resources/hook/**/*.exe
+!admin-ui/resources/hook/**/*.dll
+*.zip
+!admin-ui/resources/**/*.zip
+
+# Hook source dump at repo root (use admin-ui/resources/hook)
+/4.1.8.27/
+/_har_提取/
+/_har_extract/
+
+# Python
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+server/**/data/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# Secrets / env
+.env
+.env.*
+**/*.priv
+**/publish_ed25519.priv
+**/session.json
+**/device.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs / temp
+*.log
+npm-debug.log*
+admin-ui/scripts/tmp-*
+admin-ui/scripts/_tmp*
+**/logs/
