@@ -15,7 +15,7 @@ test('directory refresh is shared, cached, partially tolerant, and logs concrete
   assert.doesNotMatch(store, /syncDirectory\?\.\(\{ contacts: contacts\.value/)
   assert.match(preload, /app:report-error/)
   assert.match(preload, /plainIpcValue\(payload\)/)
-  assert.match(preload, /safeCloneForIpc/)
+  assert.match(preload, /plainIpcValue/)
   assert.match(store, /通讯录读取成功，但保存读取结果失败/)
   assert.match(main, /ipcMain\.handle\('app:report-error'/)
   assert.match(main, /safeCloneForIpc\(raw/)

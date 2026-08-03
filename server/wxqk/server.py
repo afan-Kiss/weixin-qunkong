@@ -257,7 +257,18 @@ def save_wx_sync(client_id: str, payload: dict[str, Any]) -> None:
         rows = payload.get(key)
         selected = [row for row in rows[:limit] if isinstance(row, dict)] if isinstance(rows, list) else []
         if key == "logs":
-            log_keys = ("time", "level", "instanceId", "module", "message", "reason", "operation", "status", "durationMs")
+            log_keys = (
+                "time", "level", "instanceId", "module", "message", "reason", "operation",
+                "taskId", "sourceId", "path", "status", "durationMs", "code", "businessCode",
+                "targetWxid", "accountWxid", "senderWxid", "roomId", "missing", "attempts",
+                "endpoint", "httpStatus", "baseRet", "contactCount", "contactListLength",
+                "matchedContact", "matchedTicket", "hasV3", "v3Prefix", "v3Length",
+                "hasV4", "v4Prefix", "v4Length", "attempt", "elapsedMs", "nextAction",
+                "parserVersion", "sourceRoomId", "sourceRoomName", "sourceInstanceId",
+                "sourceInstancePort", "instancePort", "requestUrl", "requestBodyWxid",
+                "requestBodyRoomId", "rawType", "rawTopLevelKeys", "dataType",
+                "dataTopLevelKeys", "bodyLength", "rawPreview",
+            )
             selected = [{field: row[field] for field in log_keys if field in row} for row in selected]
         allowed[key] = selected
     allowed["capturedAt"] = str(payload.get("capturedAt") or now_iso())[:40]

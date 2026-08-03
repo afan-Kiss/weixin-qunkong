@@ -109,22 +109,13 @@ $publishedBuildId = [string]($finished.buildId)
 if (-not $publishedBuildId) { $publishedBuildId = $buildId }
 Write-Host "Upload OK buildId=$publishedBuildId sha256=$($finished.sha256)"
 
-$pubBody = (@{
-  version = $version
-  buildId = $publishedBuildId
-  gitCommit = ''
-  mandatory = [bool]$Mandatory.IsPresent -or $true
-  fileName = $fileName
-} | ConvertTo-Json -Compress)
-# Always mandatory=true like admin UI default unless caller clears it — keep true.
 $pubObj = @{
   version = $version
   buildId = $publishedBuildId
   gitCommit = ''
-  mandatory = $true
+  mandatory = [bool]$Mandatory.IsPresent
   fileName = $fileName
 }
-if ($PSBoundParameters.ContainsKey('Mandatory') -and -not $Mandatory) { $pubObj.mandatory = $false }
 $pubBody = ($pubObj | ConvertTo-Json -Compress)
 $pub = Invoke-RestMethod -Method Post -Uri "$base/api/admin/release/publish" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $pubBody -TimeoutSec 60
 if (-not $pub.ok -and $null -ne $pub.ok) {

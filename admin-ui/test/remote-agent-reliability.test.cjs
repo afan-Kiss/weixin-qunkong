@@ -53,6 +53,7 @@ test('desktop client syncs useful WeChat summaries without message bodies', () =
   assert.match(storage, /members:/)
   assert.match(storage, /tasks:/)
   assert.match(storage, /logs: diagnostics/)
+  assert.match(storage, /businessCode/)
   assert.doesNotMatch(storage.slice(storage.indexOf('function remoteSyncSnapshot')), /request_json|response_json/)
 })
 

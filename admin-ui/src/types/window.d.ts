@@ -17,7 +17,7 @@ declare global {
       listFriendAddStatuses: (targetKeys: string[]) => Promise<Record<string, { status: string; error: string; taskStatus: string; updatedAt: string }>>
       getChatAddRule: () => Promise<{ enabled: boolean; instanceId: string; roomIds: string[]; keywords: string[]; excludeText: string; updatedAt: string }>
       saveChatAddRule: (rule: unknown) => Promise<{ enabled: boolean; instanceId: string; roomIds: string[]; keywords: string[]; excludeText: string; updatedAt: string }>
-      listChatAddCandidates: (filters?: { status?: string; limit?: number }) => Promise<Array<{ id: number; instanceId: string; roomId: string; senderWxid: string; nickname: string; messagePreview: string; matchedKeyword: string; status: string; createdAt: string }>>
+      listChatAddCandidates: (filters?: { status?: string; instanceId?: string; roomIds?: string[]; since?: string; limit?: number }) => Promise<Array<{ id: number; instanceId: string; roomId: string; senderWxid: string; nickname: string; messagePreview: string; matchedKeyword: string; status: string; createdAt: string }>>
       clearChatAddCandidates: (filters?: { status?: string }) => Promise<number>
       markChatAddCandidatesTasked: (ids: number[]) => Promise<number>
       onChatAddCandidate: (listener: (payload: { instanceId: string; candidateId?: number; hit?: unknown }) => void) => () => void
@@ -39,7 +39,7 @@ declare global {
       importQrFiles: () => Promise<unknown[]>
       importQrLinks: (text: string) => Promise<unknown[]>
       collectQrHistory: (payload: { rooms: Array<{ instanceId: string; roomId: string; name: string }>; outputDir: string; folder: string; maxImages?: number }) => Promise<{ groups: number; checked: number; saved: number; duplicates: number; expired: number; nonQr: number; unavailable: number; skippedGroups?: number; records?: unknown[] }>
-      previewQrInvites: (payload: { instanceId: string; urls: string[] }) => Promise<Array<{ url: string; qrType?: string; roomId: string; roomName: string; memberCount: number; fullUrl: string; expired: boolean; label: string; error?: string }>>
+      previewQrInvites: (payload: { instanceId: string; urls: string[] }) => Promise<Array<{ url: string; qrType?: string; roomId: string; roomName: string; memberCount: number; fullUrl: string; expired: boolean; label: string; error?: string; notice?: string }>>
       onQrCollectProgress: (listener: (payload: { phase?: string; roomName?: string; roomIndex?: number; roomTotal?: number; checked?: number; total?: number; saved?: number }) => void) => () => void
       qrMonitorStatus: () => Promise<{ enabled: boolean; watchAll?: boolean; rooms: Array<{ instanceId: string; roomId: string; name: string }>; outputDir: string; folder: string; watchedCount?: number; queueStats?: Array<{ instanceId: string; active: number; pending: number }> }>
       startQrMonitor: (payload: { rooms: Array<{ instanceId: string; roomId: string; name: string }>; outputDir: string; folder: string; watchAll?: boolean }) => Promise<{ enabled: boolean; watchAll?: boolean; watchedCount?: number }>

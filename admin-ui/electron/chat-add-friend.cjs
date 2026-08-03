@@ -108,6 +108,16 @@ function extractSender(event) {
   return { senderWxid, nickname }
 }
 
+function extractSenderV3(event) {
+  const profiles = [event.sender_profile, event.senderProfile, event.member_info, event.memberInfo]
+  for (const profile of profiles) {
+    if (!profile || typeof profile !== 'object') continue
+    const value = stringField(profile.encryptUserName ?? profile.encryptedUserName ?? profile.encrypt_user_name)
+    if (/^v3_/i.test(value)) return value
+  }
+  return ''
+}
+
 /**
  * 解析群聊文本消息为结构化命中候选。
  * @param {unknown} event 原始回调
@@ -124,7 +134,11 @@ function parseGroupTextMessage(event, options = {}) {
   const selfWxid = String(options.accountWxid || '')
   if (selfWxid && senderWxid === selfWxid) return null
   const msgId = stringField(source.newMsgId ?? source.new_msg_id ?? source.msgId ?? source.msg_id)
-  return { roomId, senderWxid, nickname, text, msgId }
+  const timestamp = Number(source.createTime ?? source.create_time ?? source.timestamp)
+  const receivedAt = Number.isFinite(timestamp) && timestamp > 0
+    ? new Date(timestamp < 1e12 ? timestamp * 1000 : timestamp).toISOString()
+    : new Date().toISOString()
+  return { roomId, senderWxid, nickname, text, msgId, senderV3: extractSenderV3(source), receivedAt }
 }
 
 /**
@@ -182,11 +196,14 @@ function matchChatAddRule(event, rule, instanceId) {
     hit: {
       instanceId: String(instanceId),
       roomId: parsed.roomId,
+      sourceRoomId: parsed.roomId,
       senderWxid: parsed.senderWxid,
       nickname: parsed.nickname,
       messagePreview: parsed.text.slice(0, 200),
       matchedKeyword: keywordHit.matchedKeyword,
       msgId: parsed.msgId,
+      senderV3: parsed.senderV3,
+      receivedAt: parsed.receivedAt,
     },
   }
 }

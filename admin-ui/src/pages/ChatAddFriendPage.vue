@@ -6,7 +6,6 @@ import PageHeader from '../components/app/PageHeader.vue'
 import StatusTag from '../components/app/StatusTag.vue'
 import { userErrorMessage } from '../utils/error'
 import { promptGoToTaskCenter } from '../utils/taskFlow'
-import { callWechat } from '../services/wechat'
 import { groups, instances, refreshDirectory, refreshInstances } from '../stores/wechatData'
 import { filterSelectOptions, SELECT_OPTION_LIMIT_SEARCH, useSelectSearchQuery } from '../utils/searchableSelect'
 
@@ -31,6 +30,12 @@ interface CandidateRow {
   matchedKeyword: string
   status: string
   createdAt: string
+  sourceRoomId: string
+  sourceRoomName: string
+  sourceInstancePort: number
+  accountWxid: string
+  senderV3: string
+  receivedAt: string
 }
 
 interface FriendStatus {
@@ -54,8 +59,9 @@ const saving = ref(false)
 const creating = ref(false)
 let stopCandidateListener: (() => void) | undefined
 let refreshTimer: ReturnType<typeof setInterval> | undefined
+let applyRuleTimer: ReturnType<typeof setTimeout> | undefined
+let activeRule: ChatAddRule | undefined
 
-const MEMBER_PROFILE_REQUEST_INTERVAL_MS = 200
 
 const instanceOptions = computed(() => instances.value.map((item) => ({
   label: `${item.nickname || item.accountWxid || item.id}${item.status === 'ONLINE' ? '' : '（未在线）'}`,
@@ -99,11 +105,21 @@ function clearListeningGroups() {
 }
 
 const pendingCount = computed(() => candidates.value.filter((item) => item.status === 'PENDING').length)
+
+/** 将后台 UTC ISO 时间转换为电脑本地时间：YYYY-MM-DD HH:mm:ss。 */
+function formatLocalDateTime(value: string) {
+  const date = new Date(value)
+  if (!value || Number.isNaN(date.getTime())) return '-'
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 const tableRows = computed(() => candidates.value.map((row) => ({
   ...row,
   groupName: groups.value.find((group) => group.roomId === row.roomId && group.sourceInstanceId === row.instanceId)?.name || row.roomId,
   keywordLabel: row.matchedKeyword || '全量发言',
   addStatus: resolveAddStatus(row.senderWxid, row.status),
+  displayTime: formatLocalDateTime(row.createdAt),
 })))
 
 /**
@@ -112,32 +128,6 @@ const tableRows = computed(() => candidates.value.map((row) => ({
  * @param key v3 或 v4
  * @returns 凭证字符串，找不到则空串
  */
-function findCredential(value: unknown, key: 'v3' | 'v4'): string {
-  const seen = new Set<unknown>()
-  function walk(item: unknown): string {
-    if (!item || typeof item !== 'object' || seen.has(item)) return ''
-    seen.add(item)
-    const source = item as Record<string, unknown>
-    const candidates = key === 'v3'
-      ? [source.encryptUserName, source.encryptedUserName, source.userName]
-      : [source.antispamTicket, source.antispamticket, source.antiSpamTicket]
-    for (const candidate of candidates) {
-      const text = typeof candidate === 'string'
-        ? candidate
-        : candidate && typeof candidate === 'object' && typeof (candidate as Record<string, unknown>).String === 'string'
-          ? String((candidate as Record<string, unknown>).String)
-          : ''
-      if (text && (key === 'v4' || text.toLowerCase().startsWith('v3'))) return text
-    }
-    for (const child of Object.values(source)) {
-      const result = walk(child)
-      if (result) return result
-    }
-    return ''
-  }
-  return walk(value)
-}
-
 /**
  * 判断是否包含频繁证据。
  * @param error 错误文案
@@ -168,9 +158,6 @@ function resolveAddStatus(senderWxid: string, candidateStatus: string) {
  * 等待指定毫秒。
  * @param ms 毫秒
  */
-function wait(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
 
 /** 加载规则回填期间不因微信变更清空已选群 */
 let loadingRule = false
@@ -179,7 +166,32 @@ let loadingRule = false
 watch(selectedInstanceId, (next, prev) => {
   if (loadingRule || prev === next) return
   selectedGroupKeys.value = []
+  if (enabled.value) {
+    enabled.value = false
+    activeRule = undefined
+    void window.wxControl?.saveChatAddRule?.(buildRulePayload()).then((rule) => {
+      activeRule = rule as ChatAddRule | undefined
+      void refreshCandidates()
+    })
+    ElMessage.info('已停止旧微信的监听，请选择群聊后重新开启')
+  }
 })
+
+// 监听中修改群、关键词或排除项时，短暂防抖后直接应用到后台。
+watch([selectedGroupKeys, keywordsText, excludeText], () => {
+  if (loadingRule || !enabled.value || !selectedInstanceId.value) return
+  if (applyRuleTimer) clearTimeout(applyRuleTimer)
+  if (!selectedGroupKeys.value.length) {
+    enabled.value = false
+    activeRule = undefined
+    void window.wxControl?.saveChatAddRule?.(buildRulePayload()).then((rule) => {
+      activeRule = rule as ChatAddRule | undefined
+    })
+    ElMessage.info('未选择监听群，已停止监听')
+    return
+  }
+  applyRuleTimer = setTimeout(() => { void saveRule(true, true) }, 400)
+}, { deep: true })
 
 /**
  * 从勾选的群主键解析真实 roomId（兼容 ownershipKey / 直接群 ID）。
@@ -229,6 +241,7 @@ async function loadRule() {
     selectedInstanceId.value = rule.instanceId || ''
     keywordsText.value = (rule.keywords || []).join('\n')
     excludeText.value = rule.excludeText || ''
+    activeRule = rule
     // 仅回填规则里明确保存的群；空 roomIds = 不选中任何群（绝不默认全选）
     const savedRoomIds = new Set((rule.roomIds || []).map(String).filter(Boolean))
     selectedGroupKeys.value = savedRoomIds.size
@@ -247,7 +260,17 @@ async function loadRule() {
  */
 async function refreshCandidates() {
   if (groupSelectOpen.value) return
-  candidates.value = (await window.wxControl?.listChatAddCandidates?.({ limit: 2000 }) ?? []) as CandidateRow[]
+  // 停止监听只阻止新增候选，不清空已有候选；只有“清空候选”按钮可以删除。
+  if (!activeRule?.instanceId || !activeRule.roomIds.length) {
+    candidates.value = []
+    friendStatuses.value = {}
+    return
+  }
+  candidates.value = (await window.wxControl?.listChatAddCandidates?.({
+    instanceId: activeRule.instanceId,
+    roomIds: activeRule.roomIds,
+    limit: 2000,
+  }) ?? []) as CandidateRow[]
   // 仅查待创建候选的状态，减轻 IPC 与渲染压力
   const keys = candidates.value.filter((item) => item.status === 'PENDING').map((item) => item.senderWxid)
   if (!keys.length) {
@@ -261,7 +284,7 @@ async function refreshCandidates() {
  * 保存监听规则（启停）。
  * @param nextEnabled 是否启用监听
  */
-async function saveRule(nextEnabled = enabled.value) {
+async function saveRule(nextEnabled = enabled.value, automatic = false) {
   if (nextEnabled) {
     if (!selectedInstanceId.value) return ElMessage.warning('请先选择要监听的微信')
     if (!selectedGroupKeys.value.length) return ElMessage.warning('请至少选择一个群聊')
@@ -276,8 +299,10 @@ async function saveRule(nextEnabled = enabled.value) {
     if (nextEnabled && !(payload.roomIds || []).length) {
       return ElMessage.warning('未解析到监听群 ID，请刷新通讯录后重新勾选群聊再开启')
     }
-    await window.wxControl?.saveChatAddRule?.(payload)
-    ElMessage.success(nextEnabled ? '已开启群聊发言监听' : '已保存并关闭监听')
+    activeRule = await window.wxControl?.saveChatAddRule?.(payload) as ChatAddRule | undefined
+    // 停止后仍按原微信和群范围读取数据库中的候选，不因规则更新时间变化而消失。
+    await refreshCandidates()
+    if (!automatic) ElMessage.success(nextEnabled ? '已开启群聊发言监听' : '已保存并关闭监听')
   } catch (error) {
     ElMessage.error(userErrorMessage(error, '保存监听规则失败'))
   } finally {
@@ -300,6 +325,8 @@ async function clearCandidates() {
   ElMessage.success('候选已清空')
 }
 
+const DEFAULT_FRIEND_VERIFY_CONTENT = '你好，我是群里的朋友'
+
 /**
  * 创建加好友任务：取资料后入任务中心等待确认。
  * @param rows 候选行
@@ -312,8 +339,7 @@ async function createAddFriendTask(rows?: CandidateRow[]) {
   let prompt: { value: string }
   try {
     prompt = await ElMessageBox.prompt('添加好友验证内容', '创建加好友任务', {
-      inputPlaceholder: '请输入验证内容',
-      inputValidator: (value) => Boolean(value?.trim()) || '验证内容不能为空',
+      inputPlaceholder: `可不填，默认：${DEFAULT_FRIEND_VERIFY_CONTENT}`,
     })
     await ElMessageBox.confirm(`将对 ${source.length} 名发言成员检查资料并创建任务，创建后请到任务中心确认执行。`, '确认创建', { type: 'warning' })
   } catch {
@@ -324,23 +350,26 @@ async function createAddFriendTask(rows?: CandidateRow[]) {
   const taskedIds: number[] = []
   let skippedSelf = 0
   let unavailable = 0
-  let profileRequestCount = 0
   try {
     for (const row of source) {
       const instance = instances.value.find((item) => item.id === row.instanceId)
       if (!instance) { unavailable += 1; continue }
       if (instance.accountWxid && row.senderWxid === instance.accountWxid) { skippedSelf += 1; continue }
-      if (profileRequestCount > 0) await wait(MEMBER_PROFILE_REQUEST_INTERVAL_MS)
-      profileRequestCount += 1
-      const response = await callWechat(instance, '/api/get_group_member_contact', { wxid: row.senderWxid, roomId: row.roomId }, 438557510)
-      if (!response.ok) { unavailable += 1; continue }
-      const v3 = findCredential(response.raw, 'v3')
-      const v4 = findCredential(response.raw, 'v4')
-      if (!v3 || !v4) { unavailable += 1; continue }
       items.push({
         instanceId: instance.id,
         targetKey: row.senderWxid,
-        request: { v3, v4, scence: '3', friendFlg: '0', verifyContent: prompt.value },
+        status: 'PROFILE_PENDING',
+        request: {
+          targetWxid: row.senderWxid,
+          sourceRoomId: row.sourceRoomId || row.roomId,
+          sourceRoomName: row.sourceRoomName,
+          sourceInstanceId: row.instanceId,
+          sourceInstancePort: row.sourceInstancePort || instance.apiPort,
+          accountWxid: row.accountWxid || instance.accountWxid,
+          receivedAt: row.receivedAt || row.createdAt,
+          senderV3: row.senderV3,
+          scence: '3', friendFlg: '0', verifyContent: String(prompt.value || '').trim() || DEFAULT_FRIEND_VERIFY_CONTENT,
+        },
       })
       taskedIds.push(row.id)
     }
@@ -392,6 +421,7 @@ onMounted(() => { void initialize() })
 onBeforeUnmount(() => {
   stopCandidateListener?.()
   if (refreshTimer) clearInterval(refreshTimer)
+  if (applyRuleTimer) clearTimeout(applyRuleTimer)
 })
 </script>
 
@@ -479,7 +509,7 @@ onBeforeUnmount(() => {
             <span :class="{ 'is-frequent': row.addStatus === '已经频繁' }">{{ row.addStatus }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="createdAt" label="时间" min-width="160" />
+        <el-table-column prop="displayTime" label="接收时间" min-width="170" />
       </el-table>
     </div>
   </div>

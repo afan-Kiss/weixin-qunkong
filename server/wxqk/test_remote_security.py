@@ -10,7 +10,7 @@ class RemoteSecurityTest(unittest.TestCase):
         combined = "\n".join((root / name).read_text(encoding="utf-8") for name in ("deploy.py", "deploy_wxqk.py", "deploy_ws.py"))
         self.assertNotIn("Environment=WXQK_PASSWORD=", combined)
         self.assertNotIn("Environment=FACAI888_PASSWORD=", combined)
-        self.assertNotRegex(combined, r'PASSWORD\s*=\s*["\'][^"\']+["\']')
+        self.assertNotRegex(combined, r'(?m)^\s*PASSWORD\s*=\s*["\'][^"\']+["\']')
         self.assertIn("WXQK_SSH_PASSWORD", combined)
 
     def test_viewer_ticket_is_single_use_and_bound_to_client(self):
@@ -21,7 +21,7 @@ class RemoteSecurityTest(unittest.TestCase):
         self.assertFalse(server.consume_viewer_ticket(ticket, "client-one"))
 
     def test_sync_snapshot_is_bounded(self):
-        payload = {"instances": [{"id": str(i)} for i in range(250)], "contacts": [], "groups": [], "members": [], "tasks": [], "logs": [{"message": str(i)} for i in range(250)]}
+        payload = {"instances": [{"id": str(i)} for i in range(250)], "contacts": [], "groups": [], "members": [], "tasks": [], "logs": [{"message": str(i), "businessCode": 500, "taskId": "task-1", "v3": "secret", "verifyContent": "secret"} for i in range(250)]}
         old = server.WX_SYNC_DIR
         try:
             import tempfile
@@ -32,6 +32,10 @@ class RemoteSecurityTest(unittest.TestCase):
                 rows = server.list_wx_sync()
                 self.assertEqual(len(rows[0]["instances"]), 200)
                 self.assertEqual(len(rows[0]["logs"]), 200)
+                self.assertEqual(rows[0]["logs"][0]["businessCode"], 500)
+                self.assertEqual(rows[0]["logs"][0]["taskId"], "task-1")
+                self.assertNotIn("v3", rows[0]["logs"][0])
+                self.assertNotIn("verifyContent", rows[0]["logs"][0])
         finally:
             server.WX_SYNC_DIR = old
 

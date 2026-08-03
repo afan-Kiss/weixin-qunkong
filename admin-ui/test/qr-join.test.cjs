@@ -50,6 +50,7 @@ test('a8key without topic still exposes FullURL/headers for invite page fetch', 
   const pageReq = buildInvitePageRequest(raw, 'https://weixin.qq.com/g/AQYAA-short')
   assert.match(pageReq.url, /addchatroombyinvite/)
   assert.equal(pageReq.headers.Cookie, 'wxuin=1; wxtokenkey=789')
+  assert.match(pageReq.headers['User-Agent'], /WindowsWechat/)
   assert.equal(hasUsableInvitePreview(preview), false)
 
   const pageHtml = `
@@ -66,6 +67,27 @@ test('a8key without topic still exposes FullURL/headers for invite page fetch', 
   assert.equal(merged.memberCount, 326)
   assert.equal(merged.roomId, '50442591080@chatroom')
   assert.equal(hasUsableInvitePreview(merged), true)
+})
+
+test('extractA8KeyHttpHeaders unwraps protobuf String Key/Value', () => {
+  const { extractA8KeyHttpHeaders, a8keyResponseUseful } = require('../electron/qr-join.cjs')
+  const raw = {
+    data: {
+      FullURL: { String: 'https://support.weixin.qq.com/cgi-bin/mmsupport-bin/addchatroombyinvite?ticket=abc' },
+      HttpHeader: [
+        { Key: { String: 'Cookie' }, Value: { String: 'wxuin=9; wxtokenkey=abc' } },
+        { Key: { String: 'Referer' }, Value: { String: 'https://weixin.qq.com/' } },
+      ],
+    },
+  }
+  const headers = extractA8KeyHttpHeaders(raw)
+  assert.equal(headers.Cookie, 'wxuin=9; wxtokenkey=abc')
+  assert.equal(headers.Referer, 'https://weixin.qq.com/')
+  assert.equal(a8keyResponseUseful(raw), true)
+
+  const mapped = extractA8KeyHttpHeaders({ data: { HttpHeader: { Cookie: 'a=1; b=2', Host: 'support.weixin.qq.com' } } })
+  assert.equal(mapped.Cookie, 'a=1; b=2')
+  assert.equal(mapped.Host, 'support.weixin.qq.com')
 })
 
 test('parseInvitePageText reads common invite page copy', () => {
@@ -107,6 +129,11 @@ test('main uses Node http(s) for invite page so Cookie is kept', () => {
   assert.match(main, /function fetchInvitePageBody/)
   assert.match(main, /Accept-Encoding/)
   assert.match(main, /require\('https'\)|require\("https"\)/)
+  assert.match(main, /paramSets/)
+  assert.match(main, /a8keyResponseUseful/)
+  assert.match(main, /仅拿到 FullURL 不能提前结束/)
+  assert.match(main, /currentHeaders\.Cookie/)
+  assert.match(main, /method: 'POST'/)
   assert.doesNotMatch(main, /async function fetchInvitePageBody[\s\S]*await fetch\(target/)
 })
 
@@ -118,7 +145,11 @@ test('main/ui wire invite preview and strict join success', () => {
   assert.match(main, /fetchInvitePreview/)
   assert.match(main, /fetchInvitePageBody/)
   assert.match(main, /buildInvitePageRequest/)
+  assert.match(main, /buildInvitePageRequest,\s*extractA8KeyHttpHeaders,\s*hasUsableInvitePreview/)
   assert.match(main, /evaluateEnterRoomResult/)
+  assert.match(main, /verifyJoinedRoom/)
+  assert.match(main, /readWechatRoomIds/)
+  assert.match(main, /requestApi\(record, '\/api\/enter_room', \{ url: joinUrl \}\)/)
   assert.match(main, /qr:preview-invites/)
   assert.match(main, /优先用 a8key 解析出的完整邀请 URL/)
   assert.match(preload, /previewQrInvites/)
@@ -126,4 +157,15 @@ test('main/ui wire invite preview and strict join success', () => {
   assert.match(page, /确认进群目标/)
   assert.match(page, /正在解析群资料/)
   assert.match(page, /dangerouslyUseHTMLString/)
+  assert.match(page, /pendingPreviewCount/)
+  assert.match(page, /执行任务时仍会逐个尝试/)
+})
+
+test('QR execution preserves a confirmed group link and retries transient control disconnects', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
+  assert.match(main, /applyQrOptionsWithConnectionRetry/)
+  assert.match(main, /attempt <= 3/)
+  assert.match(main, /storedQr\?\.qrType === 'GROUP_LINK'/)
+  assert.match(main, /effectiveDecodedText = storedGroupText \|\| decodedText/)
+  assert.match(main, /attempt < 8/)
 })

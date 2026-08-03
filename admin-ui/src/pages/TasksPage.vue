@@ -177,6 +177,23 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
 
       <div v-if="current" ref="detailRef">
       <DetailPanel title="任务详情">
+        <div class="detail-actions">
+          <el-button
+            v-if="current.statusCode === 'WAITING_CONFIRMATION'"
+            type="primary"
+            @click="confirmTask(current.id)"
+          >确认并开始</el-button>
+          <el-button
+            v-if="['RUNNING', 'QUEUED'].includes(current.statusCode)"
+            @click="pauseTask(current.id)"
+          >暂停任务</el-button>
+          <el-button
+            v-if="!['COMPLETED', 'CANCELLED'].includes(current.statusCode)"
+            type="danger"
+            plain
+            @click="cancelTask(current.id)"
+          >取消任务</el-button>
+        </div>
         <div class="field-grid">
           <div class="field-item"><div class="label">任务名称</div><div class="value">{{ current.name }}</div></div>
           <div class="field-item"><div class="label">任务状态</div><div class="value"><StatusTag :text="current.status" /></div></div>
@@ -217,6 +234,13 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
 
 .page-split {
   min-height: 420px;
+}
+
+.detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
 }
 
 .account-title {

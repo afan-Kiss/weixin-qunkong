@@ -103,6 +103,33 @@ function initStorage(userDataPath) {
   if (!joinColumns.has('inviter_wxid')) db.exec('ALTER TABLE member_join_events ADD COLUMN inviter_wxid TEXT')
   if (!joinColumns.has('source')) db.exec("ALTER TABLE member_join_events ADD COLUMN source TEXT NOT NULL DEFAULT 'callback'")
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_member_join_unique ON member_join_events(instance_id, room_id, member_wxid)')
+  const candidateColumns = new Set(db.prepare('PRAGMA table_info(chat_add_candidates)').all().map((column) => column.name))
+  if (!candidateColumns.has('source_room_id')) {
+    db.exec(`
+      ALTER TABLE chat_add_candidates RENAME TO chat_add_candidates_legacy;
+      CREATE TABLE chat_add_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_id TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        sender_wxid TEXT NOT NULL,
+        nickname TEXT,
+        message_preview TEXT,
+        matched_keyword TEXT,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        created_at TEXT NOT NULL,
+        source_room_id TEXT NOT NULL,
+        source_room_name TEXT,
+        source_instance_port INTEGER,
+        account_wxid TEXT,
+        sender_v3 TEXT,
+        received_at TEXT NOT NULL,
+        UNIQUE(instance_id, sender_wxid, source_room_id)
+      );
+      INSERT INTO chat_add_candidates(id,instance_id,room_id,sender_wxid,nickname,message_preview,matched_keyword,status,created_at,source_room_id,received_at)
+        SELECT id,instance_id,room_id,sender_wxid,nickname,message_preview,matched_keyword,status,created_at,room_id,created_at FROM chat_add_candidates_legacy;
+      DROP TABLE chat_add_candidates_legacy;
+    `)
+  }
   db.exec(`INSERT OR IGNORE INTO friend_target_history(account_key,target_id,first_task_id,first_instance_id,created_at)
     SELECT COALESCE(NULLIF(w.account_wxid,''),'instance:' || ti.instance_id),ti.target_key,ti.task_id,ti.instance_id,COALESCE(ti.started_at,t.created_at)
     FROM task_items ti JOIN tasks t ON t.id=ti.task_id LEFT JOIN wechat_instances w ON w.id=ti.instance_id
@@ -321,15 +348,16 @@ function cancelTask(taskId) {
   const result = database().prepare(`DELETE FROM friend_target_history
     WHERE first_task_id=? AND target_id IN (
       SELECT target_key FROM task_items
-      WHERE task_id=? AND action_type='ADD_FRIEND' AND status='QUEUED' AND started_at IS NULL
+      WHERE task_id=? AND action_type='ADD_FRIEND' AND status IN ('QUEUED','PROFILE_PENDING') AND started_at IS NULL
     )`).run(id, id)
   return { released: Number(result.changes || 0) }
 }
-function setTaskItemStarted(id) { database().prepare("UPDATE task_items SET status='RUNNING',started_at=? WHERE id=? AND status='QUEUED'").run(new Date().toISOString(), id) }
+function setTaskItemStatus(id, status) { database().prepare('UPDATE task_items SET status=? WHERE id=?').run(String(status), String(id)) }
+function setTaskItemStarted(id) { database().prepare("UPDATE task_items SET status='RUNNING',started_at=? WHERE id=? AND status IN ('QUEUED','PROFILE_PENDING','CREDENTIALS_READY')").run(new Date().toISOString(), id) }
 function setTaskItemResult(id, status, response, error) {
   database().prepare('UPDATE task_items SET status=?,response_json=?,error=?,finished_at=? WHERE id=?').run(status, JSON.stringify(response ?? null), error ?? null, new Date().toISOString(), id)
   // FREQUENT 不计 success，避免“已经频繁”被当成已添加
-  const row = database().prepare(`SELECT SUM(status IN ('COMPLETED','SUBMITTED')) success,SUM(status IN ('FAILED','FREQUENT')) failed,SUM(status='SKIPPED') skipped FROM task_items WHERE task_id=(SELECT task_id FROM task_items WHERE id=?)`).get(id)
+  const row = database().prepare(`SELECT SUM(status IN ('COMPLETED','SUBMITTED','REQUEST_SENT')) success,SUM(status IN ('FAILED','FREQUENT','RESOLUTION_FAILED')) failed,SUM(status='SKIPPED') skipped FROM task_items WHERE task_id=(SELECT task_id FROM task_items WHERE id=?)`).get(id)
   database().prepare('UPDATE tasks SET success=?,failed=?,skipped=?,updated_at=? WHERE id=(SELECT task_id FROM task_items WHERE id=?)').run(Number(row.success), Number(row.failed), Number(row.skipped), new Date().toISOString(), id)
 }
 
@@ -478,9 +506,13 @@ function remoteSyncSnapshot() {
       message: row.message,
       reason: String(details.reason || details.error || '').slice(0, 500),
       operation: String(details.operation || '').slice(0, 100),
+      taskId: String(details.taskId || '').slice(0, 100) || undefined,
+      sourceId: details.sourceId === undefined || details.sourceId === null ? undefined : details.sourceId,
+      path: String(details.path || '').slice(0, 200) || undefined,
       status: Number(details.status) || undefined,
       durationMs: Number(details.durationMs) || undefined,
       code: details.code === undefined || details.code === null ? undefined : details.code,
+      businessCode: details.businessCode === undefined || details.businessCode === null ? undefined : details.businessCode,
       injectionFailed: typeof details.injectionFailed === 'boolean' ? details.injectionFailed : undefined,
       succeeded: typeof details.succeeded === 'boolean' ? details.succeeded : undefined,
       failed: typeof details.failed === 'boolean' ? details.failed : undefined,
@@ -489,6 +521,43 @@ function remoteSyncSnapshot() {
       apiPort: Number(details.apiPort) || undefined,
       tcpPort: Number(details.tcpPort) || undefined,
       pid: Number(details.pid) || undefined,
+      targetWxid: String(details.targetWxid || '').slice(0, 160) || undefined,
+      accountWxid: String(details.accountWxid || '').slice(0, 160) || undefined,
+      senderWxid: String(details.senderWxid || '').slice(0, 160) || undefined,
+      roomId: String(details.roomId || '').slice(0, 160) || undefined,
+      missing: String(details.missing || '').slice(0, 80) || undefined,
+      attempts: String(details.attempts || '').slice(0, 300) || undefined,
+      endpoint: String(details.endpoint || '').slice(0, 160) || undefined,
+      httpStatus: Number(details.httpStatus) || undefined,
+      baseRet: details.baseRet === undefined || details.baseRet === null ? undefined : Number(details.baseRet),
+      contactCount: details.contactCount === undefined || details.contactCount === null ? undefined : Number(details.contactCount),
+      contactListLength: details.contactListLength === undefined || details.contactListLength === null ? undefined : Number(details.contactListLength),
+      matchedContact: typeof details.matchedContact === 'boolean' ? details.matchedContact : undefined,
+      matchedTicket: typeof details.matchedTicket === 'boolean' ? details.matchedTicket : undefined,
+      hasV3: typeof details.hasV3 === 'boolean' ? details.hasV3 : undefined,
+      v3Prefix: String(details.v3Prefix || '').slice(0, 12) || undefined,
+      v3Length: Number(details.v3Length) || 0,
+      hasV4: typeof details.hasV4 === 'boolean' ? details.hasV4 : undefined,
+      v4Prefix: String(details.v4Prefix || '').slice(0, 12) || undefined,
+      v4Length: Number(details.v4Length) || 0,
+      attempt: Number(details.attempt) || undefined,
+      elapsedMs: Number(details.elapsedMs) || undefined,
+      nextAction: String(details.nextAction || '').slice(0, 80) || undefined,
+      parserVersion: String(details.parserVersion || '').slice(0, 40) || undefined,
+      sourceRoomId: String(details.sourceRoomId || '').slice(0, 160) || undefined,
+      sourceRoomName: String(details.sourceRoomName || '').slice(0, 160) || undefined,
+      sourceInstanceId: String(details.sourceInstanceId || '').slice(0, 160) || undefined,
+      sourceInstancePort: Number(details.sourceInstancePort) || undefined,
+      instancePort: Number(details.instancePort) || undefined,
+      requestUrl: String(details.requestUrl || '').slice(0, 300) || undefined,
+      requestBodyWxid: String(details.requestBodyWxid || '').slice(0, 160) || undefined,
+      requestBodyRoomId: String(details.requestBodyRoomId || '').slice(0, 160) || undefined,
+      rawType: String(details.rawType || '').slice(0, 40) || undefined,
+      rawTopLevelKeys: String(details.rawTopLevelKeys || '').slice(0, 500) || undefined,
+      dataType: String(details.dataType || '').slice(0, 40) || undefined,
+      dataTopLevelKeys: String(details.dataTopLevelKeys || '').slice(0, 500) || undefined,
+      bodyLength: Number(details.bodyLength) || 0,
+      rawPreview: String(details.rawPreview || '').slice(0, 2000) || undefined,
     }
   })
   return {
@@ -506,13 +575,39 @@ function saveQrItem(item) {
   const now = new Date().toISOString()
   database().prepare('INSERT INTO qr_items(id,sha256,source,local_path,decoded_text,qr_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(sha256) DO UPDATE SET source=excluded.source,local_path=COALESCE(excluded.local_path,qr_items.local_path),decoded_text=COALESCE(excluded.decoded_text,qr_items.decoded_text),qr_type=excluded.qr_type,status=excluded.status,updated_at=excluded.updated_at').run(item.id, item.sha256 ?? null, item.source, item.localPath ?? null, item.decodedText ?? null, item.qrType ?? 'UNKNOWN', item.status, now, now)
 }
+
+/**
+ * 是否已有相同内容哈希（含历史 dup: 前缀记录）。
+ * @param {string} sha contentHash
+ * @returns {boolean}
+ */
+function hasQrContentHash(sha) {
+  const key = String(sha || '').trim().toUpperCase()
+  if (!key) return false
+  const row = database().prepare(`
+    SELECT 1 AS ok FROM qr_items
+    WHERE upper(sha256)=?
+       OR sha256 LIKE ('dup:' || ? || ':%')
+    LIMIT 1
+  `).get(key, key)
+  return Boolean(row)
+}
+
 function listQrItems() { return database().prepare('SELECT id,sha256,source,local_path AS localPath,decoded_text AS decodedText,qr_type AS qrType,status,created_at AS createdAt FROM qr_items ORDER BY created_at DESC').all() }
 function deleteQrItems(ids) { const remove = database().prepare('DELETE FROM qr_items WHERE id=?'); database().exec('BEGIN'); try { for (const id of ids) remove.run(id); database().exec('COMMIT') } catch (error) { database().exec('ROLLBACK'); throw error } }
 function updateQrScanResult(targetKey, response, success) {
   const decoded = response?.data?.scan_res ?? response?.scan_res ?? ''
   const status = success ? 'SCANNED' : 'SCAN_FAILED'
+  const existing = database().prepare('SELECT decoded_text AS decodedText, qr_type AS qrType FROM qr_items WHERE sha256=? OR id=? LIMIT 1')
+    .get(targetKey, targetKey)
+  // 多码海报的微信扫码接口只返回其中一个码，不能用随机扫到的个人码/未知码
+  // 覆盖采集阶段已经离线确认的微信群链接。
+  const scannedType = classifyStoredQr(decoded)
+  const preserveGroup = existing?.qrType === 'GROUP_LINK' && scannedType !== 'GROUP_LINK'
+  const finalDecoded = preserveGroup ? existing.decodedText : (decoded ? String(decoded) : null)
+  const finalType = preserveGroup ? existing.qrType : scannedType
   database().prepare('UPDATE qr_items SET decoded_text=?,qr_type=?,status=?,updated_at=? WHERE sha256=? OR id=?')
-    .run(decoded ? String(decoded) : null, classifyStoredQr(decoded), status, new Date().toISOString(), targetKey, targetKey)
+    .run(finalDecoded, finalType, status, new Date().toISOString(), targetKey, targetKey)
 }
 /**
  * 与 qr-collector.classifyQrText 对齐的落库分类（避免扫码结果把 QQ 群等标成 UNKNOWN）。
@@ -585,28 +680,34 @@ function saveChatAddRule(rule = {}) {
  */
 function upsertChatAddCandidate(hit) {
   const instanceId = String(hit?.instanceId || '')
-  const roomId = String(hit?.roomId || '')
+  const roomId = String(hit?.sourceRoomId || hit?.roomId || '')
   const senderWxid = String(hit?.senderWxid || '')
   if (!instanceId || !roomId || !senderWxid) return { accepted: false, reason: 'INVALID' }
   const nickname = String(hit.nickname || '')
   const messagePreview = String(hit.messagePreview || '').slice(0, 200)
   const matchedKeyword = String(hit.matchedKeyword || '')
-  const now = new Date().toISOString()
-  const existing = database().prepare('SELECT id, status FROM chat_add_candidates WHERE instance_id=? AND sender_wxid=?').get(instanceId, senderWxid)
+  const now = String(hit.receivedAt || '') || new Date().toISOString()
+  const sourceRoomName = String(hit.sourceRoomName || database().prepare('SELECT name FROM chatrooms WHERE source_instance_id=? AND room_id=?').get(instanceId, roomId)?.name || '')
+  const sourceInstancePort = Number(hit.sourceInstancePort) || null
+  const accountWxid = String(hit.accountWxid || '')
+  const senderV3 = String(hit.senderV3 || '')
+  const existing = database().prepare('SELECT id, status FROM chat_add_candidates WHERE instance_id=? AND sender_wxid=? AND source_room_id=?').get(instanceId, senderWxid, roomId)
   if (existing) {
     if (String(existing.status) === 'TASKED') return { accepted: false, reason: 'ALREADY_TASKED', id: existing.id }
-    database().prepare(`UPDATE chat_add_candidates SET room_id=?, nickname=?, message_preview=?, matched_keyword=?, status='PENDING', created_at=?
-      WHERE id=?`).run(roomId, nickname || null, messagePreview || null, matchedKeyword || null, now, existing.id)
+    database().prepare(`UPDATE chat_add_candidates SET room_id=?, nickname=?, message_preview=?, matched_keyword=?, status='PENDING', created_at=?,
+      source_room_name=?,source_instance_port=?,account_wxid=?,sender_v3=?,received_at=? WHERE id=?`)
+      .run(roomId, nickname || null, messagePreview || null, matchedKeyword || null, now, sourceRoomName || null, sourceInstancePort, accountWxid || null, senderV3 || null, now, existing.id)
     return { accepted: true, id: existing.id }
   }
-  const result = database().prepare(`INSERT INTO chat_add_candidates(instance_id,room_id,sender_wxid,nickname,message_preview,matched_keyword,status,created_at)
-    VALUES(?,?,?,?,?,?, 'PENDING', ?)`).run(instanceId, roomId, senderWxid, nickname || null, messagePreview || null, matchedKeyword || null, now)
+  const result = database().prepare(`INSERT INTO chat_add_candidates(instance_id,room_id,sender_wxid,nickname,message_preview,matched_keyword,status,created_at,
+    source_room_id,source_room_name,source_instance_port,account_wxid,sender_v3,received_at) VALUES(?,?,?,?,?,?, 'PENDING', ?,?,?,?,?,?,?)`)
+    .run(instanceId, roomId, senderWxid, nickname || null, messagePreview || null, matchedKeyword || null, now, roomId, sourceRoomName || null, sourceInstancePort, accountWxid || null, senderV3 || null, now)
   return { accepted: true, id: Number(result.lastInsertRowid) }
 }
 
 /**
  * 列出群聊发言加好友候选。
- * @param {{ status?: string, limit?: number }} [filters]
+ * @param {{ status?: string, instanceId?: string, roomIds?: string[], since?: string, limit?: number }} [filters]
  * @returns {Array<{ id: number, instanceId: string, roomId: string, senderWxid: string, nickname: string, messagePreview: string, matchedKeyword: string, status: string, createdAt: string }>}
  */
 function listChatAddCandidates(filters = {}) {
@@ -616,9 +717,26 @@ function listChatAddCandidates(filters = {}) {
     clauses.push('status=?')
     params.push(String(filters.status))
   }
+  if (filters.instanceId) {
+    clauses.push('instance_id=?')
+    params.push(String(filters.instanceId))
+  }
+  if (Array.isArray(filters.roomIds)) {
+    const roomIds = [...new Set(filters.roomIds.map(String).filter(Boolean))]
+    if (!roomIds.length) return []
+    clauses.push(`room_id IN (${roomIds.map(() => '?').join(',')})`)
+    params.push(...roomIds)
+  }
+  if (filters.since) {
+    clauses.push('created_at>=?')
+    params.push(String(filters.since))
+  }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
   const limit = Math.min(Math.max(Number(filters.limit) || 2000, 1), 20000)
   return database().prepare(`SELECT id, instance_id AS instanceId, room_id AS roomId, sender_wxid AS senderWxid,
+      source_room_id AS sourceRoomId, COALESCE(source_room_name,'') AS sourceRoomName,
+      source_instance_port AS sourceInstancePort, COALESCE(account_wxid,'') AS accountWxid,
+      COALESCE(sender_v3,'') AS senderV3, received_at AS receivedAt,
       COALESCE(nickname,'') AS nickname, COALESCE(message_preview,'') AS messagePreview,
       COALESCE(matched_keyword,'') AS matchedKeyword, status, created_at AS createdAt
     FROM chat_add_candidates ${where}
@@ -661,8 +779,9 @@ function clearChatAddCandidates(filters = {}) {
 module.exports = {
   initStorage, database, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts,
   saveLog, listLogs, clearLogs, saveApiSample, saveEvent, recordMemberJoin, listMemberJoins, listFriendAddStatuses,
-  createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStarted, setTaskItemResult, recoverInterruptedTasks,
+  createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, recoverInterruptedTasks,
   repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent,
   hasDirectoryOwnership, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult,
   getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates,
+  hasQrContentHash,
 }

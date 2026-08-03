@@ -266,7 +266,7 @@ a {
   margin: 0;
 }
 
-/* 启动自动更新进度（对齐开云） */
+/* 启动更新确认 + 进度（对齐开云） */
 .wxqk-client-update-modal {
   position: fixed;
   inset: 0;
@@ -292,10 +292,49 @@ a {
   color: #0f172a;
 }
 .wxqk-client-update-name {
-  margin: 0 0 14px;
+  margin: 0 0 10px;
   font-size: 13px;
   color: #475569;
   word-break: break-all;
+}
+.wxqk-client-update-hint {
+  margin: 0 0 16px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #64748b;
+}
+.wxqk-client-update-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.wxqk-client-update-actions[hidden],
+.wxqk-client-update-progress[hidden] {
+  display: none !important;
+}
+.wxqk-client-update-btn {
+  min-width: 96px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  font-size: 13px;
+  cursor: pointer;
+}
+.wxqk-client-update-btn--primary {
+  background: #2563eb;
+  color: #fff;
+}
+.wxqk-client-update-btn--primary:hover {
+  background: #1d4ed8;
+}
+.wxqk-client-update-btn--ghost {
+  background: #fff;
+  border-color: #cbd5e1;
+  color: #334155;
+}
+.wxqk-client-update-btn--ghost:hover {
+  background: #f8fafc;
 }
 .wxqk-client-update-bar {
   height: 10px;
@@ -315,12 +354,6 @@ a {
   font-size: 13px;
   font-weight: 600;
   color: #0f172a;
-}
-.wxqk-client-update-hint {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.45;
-  color: #64748b;
 }
 
 .section-title {

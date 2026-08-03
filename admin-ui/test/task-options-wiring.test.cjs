@@ -28,6 +28,7 @@ test('group start, count and exclusion rules filter members before profile reque
   const body = page.slice(page.indexOf('async function createAddFriendTask'), page.indexOf('async function collectLatestMembers'))
   assert.match(body, /const candidates = filterCandidates/)
   assert.match(body, /for \(const member of candidates\)/)
+  assert.match(body, /resolveFriendCredentials\(instance, member\.wxid, member\.roomId\)/)
 })
 
 test('scheduled and weighted broadcast options affect task creation and execution', () => {
@@ -55,5 +56,6 @@ test('send retry uses configured count and delay but stops on uncertain results'
 test('all task pacing uses only the global random interval', () => {
   const main = read('electron/main.cjs')
   assert.match(main, /const min = Math\.max\(Number\(settings\.intervalMin\)/)
+  assert.match(main, /itemIndex < taskItems\.length - 1/)
   assert.doesNotMatch(main, /task\?\.config\?\.intervalMin/)
 })

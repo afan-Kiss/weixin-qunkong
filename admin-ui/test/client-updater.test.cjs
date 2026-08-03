@@ -95,6 +95,34 @@ test('applyUpdate falls back from legacy 发财888 downloadURL to /wxqk package 
   assert.match(src, /微信群控系统v\$\{ver\}\.exe/)
 })
 
+test('apply does not reject a newer semantic version when local releaseSequence is ahead', () => {
+  const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
+  const applySource = src.slice(src.indexOf('async function applyUpdate'), src.indexOf('function cleanupUpdateTrashBestEffort'))
+  assert.doesNotMatch(applySource, /拒绝降级/)
+  assert.doesNotMatch(applySource, /latest\s*<\s*curSeq/)
+})
+
+test('non-mandatory manifest stays non-mandatory when an update is available', () => {
+  const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
+  const checkSource = src.slice(src.indexOf('async function checkForUpdate'), src.indexOf('async function reportUpdate'))
+  assert.match(checkSource, /const mandatory = Boolean\(manifest\.mandatory\)/)
+  assert.doesNotMatch(checkSource, /const mandatory[\s\S]*latest > currentSeq/)
+})
+
+test('portable update writes and verifies the new executable before launching it directly', () => {
+  const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
+  const ui = readFileSync(path.join(__dirname, '..', 'src', 'utils', 'clientUpdate.ts'), 'utf8')
+  assert.match(src, /copyFileSync\(downloadPath, finalPath\)/)
+  assert.match(src, /await verifyPackageFile\(finalPath, man\)/)
+  assert.match(src, /const child = spawn\(finalPath, \['--after-update'\]/)
+  assert.match(src, /PORTABLE_EXECUTABLE_FILE: finalPath/)
+  assert.match(src, /\[UPDATE_OLD_TRASH_ENV\]: currentExe/)
+  assert.match(src, /if \(!child\.pid\) throw new Error/)
+  assert.doesNotMatch(src, /\$child\.HasExited/)
+  assert.doesNotMatch(src.slice(src.indexOf('async function applyUpdate'), src.indexOf('function cleanupUpdateTrashBestEffort')), /renameSync\(currentExe/)
+  assert.match(ui, /applyClientUpdate\(\), true/)
+})
+
 test('manifest signature failure does not block fetchManifest contract', () => {
   const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
   assert.match(src, /不依赖密钥/)
@@ -127,6 +155,9 @@ test('main wires updater scheduler and publish branding is wxqk', () => {
   assert.match(preload, /applyClientUpdate/)
   assert.match(ui, /bootstrapClientUpdate/)
   assert.match(ui, /runClientUpdateModal/)
+  assert.match(ui, /立即更新/)
+  assert.match(ui, /稍后更新/)
+  assert.match(ui, /绝不能提前 markStartupUpdateDone/)
   assert.match(identity, /wxqkReleaseSequence/)
   assert.match(bump, /wxqkReleaseSequence/)
   assert.match(bump, /releaseSequence/)

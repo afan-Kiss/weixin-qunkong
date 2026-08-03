@@ -12,18 +12,21 @@ const net = require('net')
 const http = require('http')
 const https = require('https')
 const path = require('path')
-const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, saveApiSample, saveEvent, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStarted, setTaskItemResult, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates } = require('./storage.cjs')
-const { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, hasFrequentEvidence, isVerifiedSuccess } = require('./protocol.cjs')
+const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, saveApiSample, saveEvent, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, hasQrContentHash } = require('./storage.cjs')
+const { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, hasFrequentEvidence, isVerifiedSuccess, evaluateFriendAddResult } = require('./protocol.cjs')
 const { createSerialExecutor, parseInjectorOutput, decodeInjectorChunks, waitForInjectorClose } = require('./instance-runtime.cjs')
 const { rawErrorMessage, toUserErrorMessage } = require('./user-error.cjs')
+const { parseProfileCredentials, rawStructure } = require('./friend-profile.cjs')
 const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
 const softwareAuth = require('./software-auth.cjs')
-const { safeFolderName, classifyQrText, qrTypeLabel, contentHash, messageTableName, rowsFromApi, valueOf, fieldString, existingImagePath, cdnDownloadRequest, downloadRequest, decodeNativeImages, accurateFileName, prepareHistoryMessageRow, yieldMain } = require('./qr-collector.cjs')
+const { safeFolderName, classifyQrText, qrTypeLabel, contentHash, messageTableName, rowsFromApi, valueOf, fieldString, existingImagePath, cdnDownloadRequest, downloadRequest, decodeNativeImages, accurateFileName, prepareHistoryMessageRow, yieldMain, normalizeQrText } = require('./qr-collector.cjs')
 const {
   parseInvitePreview,
   mergeInvitePreview,
   buildInvitePageRequest,
+  extractA8KeyHttpHeaders,
   hasUsableInvitePreview,
+  a8keyResponseUseful,
   evaluateEnterRoomResult,
   formatInvitePreviewLine,
   findRoomId,
@@ -109,6 +112,7 @@ const enqueueStart = createSerialExecutor()
 const execFileAsync = promisify(execFile)
 let diskMetricsCache = { bytes: 0, measuredAt: 0 }
 let mainWindow = null
+let splashWindow = null
 let tray = null
 let quitting = false
 let runtimeAllowed = true
@@ -507,6 +511,8 @@ const apiOperationLabels = {
   '/api/qrscan': '识别二维码', '/api/get_db_handle': '读取消息库', '/api/sqlite3_exec': '读取群聊历史', '/api/download_img': '下载历史图片', '/api/cdn_download': '下载高清原图', '/api/get_a8key': '验证二维码有效期',
 }
 
+const DEFAULT_FRIEND_VERIFY_CONTENT = '你好，我是群里的朋友'
+
 function apiOperationLabel(apiPath) {
   return apiOperationLabels[apiPath] || '执行微信功能'
 }
@@ -607,19 +613,20 @@ function qrContentHashSet() {
   const set = new Set()
   for (const item of listQrItems()) {
     const sha = String(item.sha256 || '')
-    if (!sha) continue
     if (sha.startsWith('dup:')) {
       const real = sha.slice(4).split(':')[0]
-      if (real) set.add(real)
-      continue
+      if (real) set.add(real.toUpperCase())
+    } else if (sha) {
+      set.add(sha.toUpperCase())
     }
-    set.add(sha)
+    // 用当前归一化规则重算，兼容历史「未去参」链接，避免同邀请再存一份
+    if (item.decodedText) set.add(contentHash(item.decodedText))
   }
   return set
 }
 
 /**
- * 解码图片中全部二维码，按类型分类落盘；同图多码（如微信群码+QQ群码）分别保存，内容哈希去重。
+ * 解码图片中全部二维码；同图多码保留多条内容记录，但共享一个物理图片文件。
  * @param {object} record 微信实例
  * @param {{ roomId: string, name: string }} room 监控群
  * @param {string} sourcePath 图片路径
@@ -630,9 +637,17 @@ function qrContentHashSet() {
 async function saveClassifiedQrImage(record, room, sourcePath, message, options) {
   const decodeMode = options?.decodeMode === 'fast' ? 'fast' : 'full'
   const decodedValues = await decodeNativeImages(nativeImage.createFromPath(sourcePath), { mode: decodeMode })
-  const recognized = decodedValues
-    .map((decodedText) => ({ decodedText, qrType: classifyQrText(decodedText) }))
-    .filter((item) => item.qrType !== 'UNKNOWN')
+  // 同图内先按归一化内容去重（海报常贴两个一模一样的群码）
+  const recognized = []
+  const seenInImage = new Set()
+  for (const decodedText of decodedValues) {
+    const qrType = classifyQrText(decodedText)
+    if (qrType === 'UNKNOWN') continue
+    const hash = contentHash(decodedText)
+    if (!hash || seenInImage.has(hash)) continue
+    seenInImage.add(hash)
+    recognized.push({ decodedText: normalizeQrText(decodedText) || String(decodedText || '').trim(), qrType, hash })
+  }
   const result = { detected: recognized.length, saved: 0, duplicates: 0, expired: 0, types: [] }
   const existing = options?.existingHashes instanceof Set
     ? options.existingHashes
@@ -641,37 +656,63 @@ async function saveClassifiedQrImage(record, room, sourcePath, message, options)
   const extension = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'].includes(path.extname(sourcePath).toLowerCase())
     ? path.extname(sourcePath).toLowerCase()
     : '.jpg'
-  const messageId = String(valueOf(message, ['server_id', 'msg_svr_id', 'msgid', 'msg_id', 'local_id', 'newMsgId', 'new_msg_id']) || Date.now())
-  const savedAt = Date.now()
+  const imageFileHash = await sha256(sourcePath)
+  let sharedDestination = ''
   for (const item of recognized) {
-    const hash = contentHash(item.decodedText)
-    if (existing.has(hash)) {
+    const hash = item.hash
+    // 先占位，避免监控并发 2 路同时通过「未存在」检查而各存一份
+    if (existing.has(hash) || hasQrContentHash(hash)) {
+      existing.add(hash)
       result.duplicates += 1
-      // 实时监控落一条重复记录供列表展示；历史批量只计数，避免刷屏
-      if (decodeMode !== 'fast') {
-        saveQrItem({
-          id: randomUUID(),
-          sha256: `dup:${hash}:${randomUUID()}`,
-          source: `${record.nickname || record.accountWxid} · ${room.name}`,
-          localPath: null,
-          decodedText: item.decodedText,
-          qrType: item.qrType,
-          status: 'DUPLICATE',
-        })
-      }
       continue
     }
+    existing.add(hash)
     // 历史批量采集跳过 a8key，避免每张图网络校验把界面卡死；监控实时仍校验
     if (validateLinks && !await isQrLinkCurrentlyValid(record, item.decodedText, item.qrType)) {
+      existing.delete(hash)
       result.expired += 1
       continue
     }
+    // 二次确认：异步校验期间另一路可能已入库
+    if (hasQrContentHash(hash)) {
+      result.duplicates += 1
+      continue
+    }
     const typeLabel = qrTypeLabel(item.qrType)
-    const destinationFolder = path.join(options.outputDir, safeFolderName(options.folder, '默认分组'), typeLabel)
-    mkdirSync(destinationFolder, { recursive: true })
-    // 同图多码各自一份文件：类型文件夹不同，文件名含类型+内容哈希，避免互相覆盖
-    const destination = path.join(destinationFolder, accurateFileName(typeLabel, room.name, messageId, hash, extension, savedAt))
+    if (!sharedDestination) {
+      const destinationFolder = path.join(options.outputDir, safeFolderName(options.folder, '默认分组'), typeLabel)
+      mkdirSync(destinationFolder, { recursive: true })
+      // 文件名使用整张图片哈希：同一海报即使含多个不同二维码，也只保存一份图片。
+      sharedDestination = path.join(
+        destinationFolder,
+        `${safeFolderName(typeLabel, '未知类型')}_${String(imageFileHash).slice(0, 16).toUpperCase()}${extension}`,
+      )
+    }
+    const destination = sharedDestination
+    if (existsSync(destination)) {
+      if (!hasQrContentHash(hash)) {
+        saveQrItem({
+          id: randomUUID(),
+          sha256: hash,
+          source: `${record.nickname || record.accountWxid} · ${room.name}`,
+          localPath: destination,
+          decodedText: item.decodedText,
+          qrType: item.qrType,
+          status: 'CLASSIFIED',
+        })
+        result.saved += 1
+      } else {
+        result.duplicates += 1
+      }
+      if (!result.types.includes(typeLabel)) result.types.push(typeLabel)
+      continue
+    }
     await copyVerified(sourcePath, destination)
+    if (hasQrContentHash(hash)) {
+      // 同图多码共享文件；并发输家不能删除可能已被其他二维码记录引用的文件。
+      result.duplicates += 1
+      continue
+    }
     saveQrItem({
       id: randomUUID(),
       sha256: hash,
@@ -681,7 +722,6 @@ async function saveClassifiedQrImage(record, room, sourcePath, message, options)
       qrType: item.qrType,
       status: 'CLASSIFIED',
     })
-    existing.add(hash)
     result.saved += 1
     if (!result.types.includes(typeLabel)) result.types.push(typeLabel)
   }
@@ -812,7 +852,11 @@ function handleChatAddFriendEvent(record, event) {
     }
     return { accepted: false, reason }
   }
-  const saved = upsertChatAddCandidate(matched.hit)
+  const saved = upsertChatAddCandidate({
+    ...matched.hit,
+    sourceInstancePort: record.apiPort,
+    accountWxid: record.accountWxid || '',
+  })
   if (saved.accepted) {
     appLog('INFO', '已记录群聊发言加好友候选', {
       instanceId: record.id,
@@ -1180,11 +1224,13 @@ function deliveryContentHash(actionType, request) {
  * @param {string} pageUrl
  * @param {Record<string, string>} headers
  * @param {number} [redirectsLeft]
+ * @param {{ method?: 'GET'|'POST' }} [options]
  * @returns {Promise<string>}
  */
-function fetchInvitePageBody(pageUrl, headers = {}, redirectsLeft = 5) {
+function fetchInvitePageBody(pageUrl, headers = {}, redirectsLeft = 5, options = {}) {
   const target = String(pageUrl || '').trim()
   if (!target || !/^https?:\/\//i.test(target)) return Promise.resolve('')
+  const method = String(options?.method || 'GET').toUpperCase() === 'POST' ? 'POST' : 'GET'
   return new Promise((resolve) => {
     let settled = false
     const finish = (value) => {
@@ -1196,26 +1242,43 @@ function fetchInvitePageBody(pageUrl, headers = {}, redirectsLeft = 5) {
       const parsed = new URL(target)
       const lib = parsed.protocol === 'https:' ? https : http
       const reqHeaders = { ...(headers && typeof headers === 'object' ? headers : {}) }
-      // Node 会自动处理压缩；显式声明避免部分网关返回异常体
       if (!reqHeaders['Accept-Encoding'] && !reqHeaders['accept-encoding']) {
         reqHeaders['Accept-Encoding'] = 'identity'
+      }
+      if (method === 'POST') {
+        if (!reqHeaders['Content-Type'] && !reqHeaders['content-type']) {
+          reqHeaders['Content-Type'] = 'application/x-www-form-urlencoded'
+        }
+        reqHeaders['Content-Length'] = '0'
       }
       const req = lib.request({
         protocol: parsed.protocol,
         hostname: parsed.hostname,
         port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
         path: `${parsed.pathname || '/'}${parsed.search || ''}`,
-        method: 'GET',
+        method,
         headers: reqHeaders,
         timeout: 10000,
       }, (res) => {
         const status = Number(res.statusCode || 0)
         const location = String(res.headers.location || '').trim()
+        const nextHeaders = { ...reqHeaders }
+        const setCookie = res.headers['set-cookie']
+        if (setCookie) {
+          const parts = (Array.isArray(setCookie) ? setCookie : [setCookie])
+            .map((item) => String(item).split(';')[0].trim())
+            .filter(Boolean)
+          if (parts.length) {
+            const prev = String(nextHeaders.Cookie || nextHeaders.cookie || '').trim()
+            nextHeaders.Cookie = prev ? `${prev}; ${parts.join('; ')}` : parts.join('; ')
+            delete nextHeaders.cookie
+          }
+        }
         if (status >= 300 && status < 400 && location && redirectsLeft > 0) {
           res.resume()
           let nextUrl = location
           try { nextUrl = new URL(location, target).toString() } catch { /* keep location */ }
-          fetchInvitePageBody(nextUrl, reqHeaders, redirectsLeft - 1).then(finish, () => finish(''))
+          fetchInvitePageBody(nextUrl, nextHeaders, redirectsLeft - 1, options).then(finish, () => finish(''))
           return
         }
         const chunks = []
@@ -1242,14 +1305,43 @@ async function fetchInvitePreview(record, url) {
   const sourceUrl = String(url || '').trim()
   if (!sourceUrl) return { roomId: '', roomName: '', memberCount: 0, fullUrl: '', expired: false, label: '空链接', error: '链接为空' }
   try {
-    const startedAt = Date.now()
-    const { response, raw } = await requestApi(record, '/api/get_a8key', { url: sourceUrl, urlType: '0', scene: '0' }, 12000)
-    saveApiSample({
-      instanceId: record.id, sourceId: 438557511, path: '/api/get_a8key',
-      request: { url: sourceUrl, urlType: '0', scene: '0' }, response: raw,
-      httpStatus: response.status, durationMs: Date.now() - startedAt,
-    })
-    let preview = parseInvitePreview(raw, sourceUrl)
+    // 短链 / 完整邀请链在不同 urlType、scene 下返回差异大；依次尝试
+    const paramSets = [
+      { url: sourceUrl, urlType: '0', scene: '0' },
+      { url: sourceUrl, urlType: '1', scene: '4' },
+      { url: sourceUrl, urlType: '2', scene: '4' },
+      { url: sourceUrl, urlType: '0', scene: '4' },
+    ]
+    let response = null
+    let raw = null
+    let preview = { roomId: '', roomName: '', memberCount: 0, fullUrl: sourceUrl, expired: false }
+    for (const params of paramSets) {
+      const startedAt = Date.now()
+      const result = await requestApi(record, '/api/get_a8key', params, 12000)
+      const currentResponse = result.response
+      const currentRaw = result.raw
+      saveApiSample({
+        instanceId: record.id, sourceId: 438557511, path: '/api/get_a8key',
+        request: params, response: currentRaw,
+        httpStatus: currentResponse.status, durationMs: Date.now() - startedAt,
+      })
+      const currentPreview = parseInvitePreview(currentRaw, sourceUrl)
+      const currentHeaders = extractA8KeyHttpHeaders(currentRaw)
+      // 保留信息更完整的一轮；仅拿到 FullURL 不能提前结束，后续参数可能返回 Cookie/群资料。
+      const currentScore = (hasUsableInvitePreview(currentPreview) ? 4 : 0)
+        + (currentHeaders.Cookie || currentHeaders.cookie ? 2 : 0)
+        + (a8keyResponseUseful(currentRaw) ? 1 : 0)
+      const savedHeaders = extractA8KeyHttpHeaders(raw)
+      const savedScore = (hasUsableInvitePreview(preview) ? 4 : 0)
+        + (savedHeaders.Cookie || savedHeaders.cookie ? 2 : 0)
+        + (a8keyResponseUseful(raw) ? 1 : 0)
+      if (!raw || currentScore > savedScore) {
+        response = currentResponse
+        raw = currentRaw
+        preview = currentPreview
+      }
+      if (currentPreview.expired || hasUsableInvitePreview(currentPreview) || currentHeaders.Cookie || currentHeaders.cookie) break
+    }
 
     // get_a8key 多数只返回 FullURL/HttpHeader，需再抓邀请页才能拿到群名/人数
     if (!preview.expired && (!preview.roomName || !preview.memberCount)) {
@@ -1260,7 +1352,11 @@ async function fetchInvitePreview(record, url) {
       let sawDownloadGate = false
       for (const pageUrl of urlsToFetch) {
         if (preview.roomName && preview.memberCount) break
-        const pageBody = await fetchInvitePageBody(pageUrl, pageReq.headers)
+        let pageBody = await fetchInvitePageBody(pageUrl, pageReq.headers, 5, { method: 'GET' })
+        if (pageBody && /weixin_getdownurl|请在微信中打开|下载微信|getdownurl_sms/i.test(pageBody)) {
+          sawDownloadGate = true
+          pageBody = await fetchInvitePageBody(pageUrl, pageReq.headers, 5, { method: 'POST' })
+        }
         if (!pageBody) continue
         if (/weixin_getdownurl|请在微信中打开|下载微信|getdownurl_sms/i.test(pageBody)) {
           sawDownloadGate = true
@@ -1269,20 +1365,17 @@ async function fetchInvitePreview(record, url) {
         preview = mergeInvitePreview(preview, parseInvitePreview(pageBody, pageUrl))
       }
       if (!hasUsableInvitePreview(preview) && sawDownloadGate && !pageReq.headers.Cookie && !pageReq.headers.cookie) {
-        preview = {
-          ...preview,
-          error: preview.error || '邀请页需要登录态 Cookie（get_a8key 未返回 HttpHeader）',
-        }
+        preview = { ...preview, notice: '暂时无法读取群名和人数，执行任务时仍会尝试进群' }
       }
     }
 
     const label = formatInvitePreviewLine(preview)
     if (preview.expired) return { ...preview, label, error: '邀请已过期或无效' }
-    if (!response.ok && !hasUsableInvitePreview(preview) && !preview.fullUrl) {
+    if (response && !response.ok && !hasUsableInvitePreview(preview) && !preview.fullUrl) {
       return { ...preview, label, error: '无法解析群资料，请确认链接有效且微信在线' }
     }
     if (!hasUsableInvitePreview(preview) && preview.fullUrl && !preview.error) {
-      return { ...preview, label, error: '已解析进群链接，但未读到群名/人数' }
+      return { ...preview, label, notice: preview.notice || '暂时无法读取群名和人数，执行任务时仍会尝试进群' }
     }
     return { ...preview, label }
   } catch (error) {
@@ -1302,6 +1395,26 @@ async function fetchInvitePreview(record, url) {
  * @param {string} taskId 任务 ID
  * @returns {Promise<object>} 处理结果
  */
+async function readWechatRoomIds(record) {
+  try {
+    const { response, raw } = await requestApi(record, '/api/get_chatroom_list', {}, 15000)
+    if (!response.ok) return new Set()
+    return new Set(extractRoomsFromApiRaw(raw).map((room) => room.roomId).filter(Boolean))
+  } catch {
+    return new Set()
+  }
+}
+
+async function verifyJoinedRoom(record, beforeRoomIds, expectedRoomId = '') {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (attempt) await new Promise((resolve) => setTimeout(resolve, 1500))
+    const current = await readWechatRoomIds(record)
+    if (expectedRoomId && current.has(expectedRoomId)) return expectedRoomId
+    for (const roomId of current) if (!beforeRoomIds.has(roomId)) return roomId
+  }
+  return ''
+}
+
 async function applyQrOptions(record, task, item, decodedText, taskId) {
   const text = String(decodedText || '')
   const type = classifyQrText(text)
@@ -1329,17 +1442,43 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
   const applyText = String(task?.config?.applyText || '').replaceAll('{昵称}', record.nickname || record.accountWxid || '微信用户')
   // 短链 weixin.qq.com/g/ 直接 enter_room 常返回空成功；优先用 a8key 解析出的完整邀请 URL
   const joinUrl = String(preview.fullUrl || text).trim() || text
-  const joinRequest = { url: joinUrl, msg: applyText, verifyContent: applyText }
+  const joinRequest = {
+    url: joinUrl,
+    link: joinUrl,
+    inviteUrl: joinUrl,
+    msg: applyText,
+    verifyContent: applyText,
+    applyText,
+  }
+  const beforeRoomIds = await readWechatRoomIds(record)
   const startedAt = Date.now()
-  const { response, raw } = await requestApi(record, '/api/enter_room', joinRequest)
+  let { response, raw } = await requestApi(record, '/api/enter_room', joinRequest)
   saveApiSample({ instanceId: record.id, sourceId: 438557545, path: '/api/enter_room', request: joinRequest, response: raw, httpStatus: response.status, durationMs: Date.now() - startedAt })
   if (hasFrequentEvidence(raw)) {
     appLog('ERROR', '进群检测到明确频繁状态', { instanceId: record.id, taskId, status: response.status })
     return { frequent: true, joinResponse: raw, preview }
   }
-  const verdict = evaluateEnterRoomResult(response.ok, raw)
+  let verdict = evaluateEnterRoomResult(response.ok, raw)
+  if (!verdict.ok) {
+    let verifiedRoomId = await verifyJoinedRoom(record, beforeRoomIds, preview.roomId)
+    if (!verifiedRoomId && response.ok) {
+      const retryStartedAt = Date.now()
+      const retry = await requestApi(record, '/api/enter_room', { url: joinUrl })
+      response = retry.response
+      raw = retry.raw
+      saveApiSample({ instanceId: record.id, sourceId: 438557545, path: '/api/enter_room', request: { url: joinUrl }, response: raw, httpStatus: response.status, durationMs: Date.now() - retryStartedAt })
+      if (hasFrequentEvidence(raw)) {
+        appLog('ERROR', '进群重试检测到明确频繁状态', { instanceId: record.id, taskId, status: response.status })
+        return { frequent: true, joinResponse: raw, preview }
+      }
+      verdict = evaluateEnterRoomResult(response.ok, raw)
+      if (!verdict.ok) verifiedRoomId = await verifyJoinedRoom(record, beforeRoomIds, preview.roomId)
+    }
+    if (verifiedRoomId) verdict = { ok: true, reason: '已从群列表确认进群', roomId: verifiedRoomId }
+  }
   appLog(verdict.ok ? 'INFO' : 'ERROR', verdict.ok ? `进群成功：${preview.label}` : `进群未确认：${verdict.reason}`, {
-    instanceId: record.id, taskId, module: '二维码进群', status: response.status, roomId: verdict.roomId,
+    instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群并核验群列表',
+    sourceId: 438557545, path: '/api/enter_room', status: response.status, roomId: verdict.roomId, targetKey: item.target_key,
   })
   if (verdict.ok && task?.config?.saveContact) {
     const roomId = verdict.roomId || preview.roomId || findRoomId(raw)
@@ -1368,6 +1507,75 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
     roomId: verdict.roomId,
     preview,
   }
+}
+
+async function applyQrOptionsWithConnectionRetry(record, task, item, decodedText, taskId) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await applyQrOptions(record, task, item, decodedText, taskId)
+    } catch (error) {
+      const message = rawErrorMessage(error)
+      const transient = /fetch failed|econnrefused|connect.*refused|socket hang up|econnreset/i.test(message)
+      if (!transient || attempt === 3) throw error
+      appLog('WARN', '微信控制接口暂时不可用，等待恢复后重试二维码任务', {
+        instanceId: record.id, taskId, module: '二维码进群', attempt, waitMs: 2500,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 2500))
+    }
+  }
+  throw new Error('微信控制接口重试失败')
+}
+
+async function resolvePendingFriendProfile(record, request, taskId) {
+  const targetWxid = String(request.targetWxid || '')
+  const sourceRoomId = String(request.sourceRoomId || '')
+  const sourceRoomName = String(request.sourceRoomName || '')
+  const sourceInstanceId = String(request.sourceInstanceId || record.id)
+  const sourceInstancePort = Number(request.sourceInstancePort)
+  const profilePort = sourceInstancePort > 0 ? sourceInstancePort : record.apiPort
+  const requestUrl = `http://127.0.0.1:${profilePort}/api/get_group_member_contact`
+  appLog('INFO', 'MESSAGE_CANDIDATE -> PROFILE_RESOLUTION', {
+    module: '群聊加好友', operation: 'PROFILE_RESOLUTION', taskId,
+    accountWxid: String(request.accountWxid || record.accountWxid || ''), targetWxid,
+    sourceRoomId, sourceRoomName, sourceInstanceId, sourceInstancePort: profilePort,
+    instanceId: record.id, instancePort: profilePort, requestUrl,
+  })
+  if (!targetWxid || !sourceRoomId || sourceInstanceId !== record.id) {
+    return { ok: false, missing: ['source'], diagnostics: [], reason: '候选来源实例或群标识无效' }
+  }
+  const profileRecord = profilePort === record.apiPort ? record : { ...record, apiPort: profilePort, apiQueue: Promise.resolve(), apiBusy: false }
+  const diagnostics = []
+  const fetchProfile = async (endpoint, body, sourceId, attempt) => {
+    const startedAt = Date.now()
+    const url = `http://127.0.0.1:${profilePort}${endpoint}`
+    const { response, raw } = await requestApi(profileRecord, endpoint, body)
+    const parsed = parseProfileCredentials(raw, targetWxid, sourceRoomId)
+    const diagnostic = {
+      endpoint, requestUrl: url, requestBodyWxid: String(body.wxid || ''), requestBodyRoomId: String(body.roomId || ''),
+      httpStatus: response.status, ...rawStructure(raw), parserVersion: 'profile-resolution-v2',
+      baseRet: parsed.baseRet, contactCount: parsed.contactCount, contactListLength: parsed.contactListLength,
+      matchedContact: parsed.matchedContact, matchedTicket: parsed.matchedTicket,
+      hasV3: Boolean(parsed.v3), hasV4: Boolean(parsed.v4), missing: parsed.missing.join(','),
+      attempt, elapsedMs: Date.now() - startedAt,
+    }
+    diagnostics.push(diagnostic)
+    appLog('INFO', '群成员资料原始响应结构（凭证已脱敏）', {
+      module: '群聊加好友', operation: 'PROFILE_RESOLUTION_RAW', taskId, instanceId: record.id,
+      accountWxid: String(request.accountWxid || record.accountWxid || ''), targetWxid, sourceRoomId, sourceRoomName,
+      ...diagnostic,
+    })
+    return { response, parsed }
+  }
+  const group = await fetchProfile('/api/get_group_member_contact', { wxid: targetWxid, roomId: sourceRoomId }, 438557510, 1)
+  let v3 = /^v3_/i.test(String(request.senderV3 || '')) ? String(request.senderV3) : group.parsed.v3
+  let v4 = group.parsed.v4
+  if (!v3 || !v4) {
+    const contact = await fetchProfile('/api/get_contact', { wxid: targetWxid }, 438557509, 2)
+    v3 ||= contact.parsed.v3
+    v4 ||= contact.parsed.v4
+  }
+  const missing = [v3 ? '' : 'v3', v4 ? '' : 'v4'].filter(Boolean)
+  return { ok: !missing.length, v3, v4, missing, diagnostics, reason: missing.length ? `凭证解析失败：缺少 ${missing.join('、')}` : '' }
 }
 async function runTask(taskId) {
   if (runningTasks.has(taskId)) return
@@ -1401,6 +1609,33 @@ async function runTask(taskId) {
       else if (item.action_type === 'QR_SCAN') { apiPath = '/api/qrscan'; sourceId = 438557574 }
       else if (item.action_type === 'ADD_FRIEND') { apiPath = '/api/add_friend'; sourceId = 438557515 }
       else { setTaskItemResult(item.id, 'SKIPPED', null, '接口未验证'); continue }
+      if (item.action_type === 'ADD_FRIEND') {
+        if (!request.v3 || !request.v4) {
+          const resolution = await resolvePendingFriendProfile(record, request, taskId)
+          if (!resolution.ok) {
+            setTaskItemResult(item.id, 'RESOLUTION_FAILED', { diagnostics: resolution.diagnostics, missing: resolution.missing }, resolution.reason)
+            appLog('ERROR', '群成员资料解析最终失败', {
+              module: '群聊加好友', operation: 'PROFILE_RESOLUTION', taskId, instanceId: record.id,
+              accountWxid: String(request.accountWxid || record.accountWxid || ''), targetWxid: String(request.targetWxid || item.target_key),
+              sourceRoomId: String(request.sourceRoomId || ''), sourceRoomName: String(request.sourceRoomName || ''),
+              missing: resolution.missing.join(','), parserVersion: 'profile-resolution-v2',
+            })
+            continue
+          }
+          request.v3 = resolution.v3
+          request.v4 = resolution.v4
+          setTaskItemStatus(item.id, 'CREDENTIALS_READY')
+        }
+        const scene = String(request.scence ?? request.scene ?? '3')
+        const verifyContent = String(request.verifyContent ?? request.msg ?? '').trim() || DEFAULT_FRIEND_VERIFY_CONTENT
+        request = {
+          v3: String(request.v3 ?? ''),
+          v4: String(request.v4 ?? ''),
+          scence: scene,
+          friendFlg: String(request.friendFlg ?? '0'),
+          verifyContent,
+        }
+      }
       let contentHash = ''
       try {
         const settings = generalSettings()
@@ -1431,7 +1666,7 @@ async function runTask(taskId) {
         // 链接进群：无需本地图片扫码，直接走 enter_room
         if (item.action_type === 'QR_SCAN' && (request.url || request.link || request.decodedText)) {
           const linkText = String(request.url || request.link || request.decodedText || '')
-          const joinResult = await applyQrOptions(record, task, item, linkText, taskId)
+          const joinResult = await applyQrOptionsWithConnectionRetry(record, task, item, linkText, taskId)
           if (joinResult.frequent) {
             setTaskItemResult(item.id, 'FREQUENT', joinResult.joinResponse, '已经频繁')
             setTaskStatus(taskId, 'COOLING_DOWN')
@@ -1494,7 +1729,18 @@ async function runTask(taskId) {
             break
           }
           if (item.action_type === 'ADD_FRIEND') {
-            setTaskItemResult(item.id, 'SUBMITTED', raw, '好友申请已提交，微信接口不返回可靠的最终结果')
+            const verdict = evaluateFriendAddResult(response.ok, raw)
+            if (!verdict.accepted) {
+              appLog('ERROR', '添加好友业务请求被拒绝', {
+                instanceId: record.id,
+                taskId,
+                sourceId,
+                status: response.status,
+                businessCode: raw?.code ?? raw?.errCode ?? raw?.data?.code ?? null,
+                reason: verdict.reason,
+              })
+            }
+            setTaskItemResult(item.id, verdict.accepted ? 'REQUEST_SENT' : 'FAILED', raw, verdict.reason)
             break
           }
           const success = isVerifiedSuccess(sourceId, response.ok, raw)
@@ -1512,7 +1758,10 @@ async function runTask(taskId) {
             updateQrScanResult(item.target_key, raw, success)
             if (success) {
               const decodedText = raw?.data?.scan_res ?? raw?.scan_res ?? ''
-              const joinResult = await applyQrOptions(record, task, item, decodedText, taskId)
+              const storedQr = listQrItems().find((candidate) => candidate.sha256 === item.target_key || candidate.id === item.target_key)
+              const storedGroupText = storedQr?.qrType === 'GROUP_LINK' ? String(storedQr.decodedText || '') : ''
+              const effectiveDecodedText = storedGroupText || decodedText
+              const joinResult = await applyQrOptionsWithConnectionRetry(record, task, item, effectiveDecodedText, taskId)
               if (joinResult.frequent) {
                 setTaskItemResult(item.id, 'FREQUENT', joinResult.joinResponse, '已经频繁')
                 setTaskStatus(taskId, 'COOLING_DOWN')
@@ -1535,7 +1784,7 @@ async function runTask(taskId) {
                 break
               }
               if (joinResult.scannedOnly || !joinResult.joinSubmitted) {
-                const linkType = classifyQrText(decodedText)
+                const linkType = classifyQrText(effectiveDecodedText)
                 const reason = joinResult.reason || (linkType === 'QQ_GROUP_LINK'
                   ? 'QQ群链接不支持微信进群，已跳过'
                   : linkType === 'PERSONAL_LINK'
@@ -1562,7 +1811,7 @@ async function runTask(taskId) {
         const operation = apiOperationLabel(apiPath)
         appLog('ERROR', `${operation}失败`, { instanceId: record.id, module: operation, operation, taskId, path: apiPath, error: rawErrorMessage(error) })
         if (item.action_type === 'ADD_FRIEND') {
-          setTaskItemResult(item.id, 'SUBMITTED', null, '好友申请已发起，但返回结果不确定')
+          setTaskItemResult(item.id, 'FAILED', null, toUserErrorMessage(error, '添加好友请求失败'))
         } else if (item.action_type === 'SEND_TEXT' || item.action_type === 'SEND_IMAGE') {
           if (contentHash && record.accountWxid) recordDeliveredContent(record.accountWxid, item.target_key, contentHash, item.id)
           setTaskItemResult(item.id, 'UNSAFE_RESUME', null, '请求结果不确定，为避免重复发送已停止任务')
@@ -1598,7 +1847,8 @@ function createLocalTask(payload) {
       const isGroup = payload.type.endsWith('_TO_GROUP')
       if (!hasDirectoryOwnership(instanceId, targetKey, isGroup)) throw new Error('所选微信不包含这个接收对象，请刷新通讯录后重试')
     }
-    return { id: randomUUID(), instanceId, targetKey, actionType, status: 'QUEUED', request: item.request }
+    const itemStatus = actionType === 'ADD_FRIEND' && item.status === 'PROFILE_PENDING' ? 'PROFILE_PENDING' : 'QUEUED'
+    return { id: randomUUID(), instanceId, targetKey, actionType, status: itemStatus, request: item.request }
   })
   const created = createTask(task, items)
   if (!created.inserted) throw new Error('这些成员已经创建过加好友任务，本次没有重复添加')
@@ -1976,7 +2226,24 @@ function registerIpc() {
   ipcMain.handle('qr:import-files', async () => {
     const result = await dialog.showOpenDialog({ defaultPath: generalSettings().qrDir || undefined, properties: ['openFile', 'multiSelections'], filters: [{ name: '二维码图片', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp'] }] })
     if (result.canceled) return []
-    for (const file of result.filePaths) saveQrItem({ id: randomUUID(), sha256: await sha256(file), source: '本地图片', localPath: file, qrType: 'UNKNOWN', status: 'WAITING_SCAN' })
+    for (const file of result.filePaths) {
+      const decodedValues = await decodeNativeImages(nativeImage.createFromPath(file), { mode: 'full' })
+      const recognized = new Map()
+      for (const rawText of decodedValues) {
+        const decodedText = normalizeQrText(rawText) || String(rawText || '').trim()
+        const qrType = classifyQrText(decodedText)
+        if (!decodedText || qrType === 'UNKNOWN') continue
+        recognized.set(contentHash(decodedText), { decodedText, qrType })
+      }
+      if (!recognized.size) {
+        saveQrItem({ id: randomUUID(), sha256: await sha256(file), source: '本地图片', localPath: file, qrType: 'UNKNOWN', status: 'WAITING_SCAN' })
+        continue
+      }
+      // 同一张海报可包含多个群码：每个链接单独建任务记录，共享原图片文件。
+      for (const [hash, item] of recognized) {
+        saveQrItem({ id: randomUUID(), sha256: hash, source: '本地图片', localPath: file, decodedText: item.decodedText, qrType: item.qrType, status: 'READY' })
+      }
+    }
     return listQrItems()
   })
   ipcMain.handle('qr:import-links', (_event, text) => {
@@ -2239,6 +2506,43 @@ function fitWindowBounds() {
   }
 }
 
+function closeSplashWindow() {
+  const win = splashWindow
+  splashWindow = null
+  if (win && !win.isDestroyed()) win.destroy()
+}
+
+function createSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) return splashWindow
+  const win = new BrowserWindow({
+    width: 300,
+    height: 132,
+    show: false,
+    frame: false,
+    resizable: false,
+    movable: true,
+    center: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    backgroundColor: '#ffffff',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  splashWindow = win
+  win.on('closed', () => { if (splashWindow === win) splashWindow = null })
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+    *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;background:#fff;color:#202124;font-family:"Microsoft YaHei UI","Microsoft YaHei",sans-serif;user-select:none;border:1px solid #dfe3e8}
+    .content{display:flex;align-items:center;gap:18px}.spinner{width:34px;height:34px;border:4px solid #dce8ff;border-top-color:#1677ff;border-radius:50%;animation:spin .75s linear infinite}.title{font-size:16px;font-weight:600}.status{margin-top:7px;font-size:13px;color:#70757a}@keyframes spin{to{transform:rotate(360deg)}}
+  </style></head><body><div class="content"><div class="spinner"></div><div><div class="title">微信群控管理平台</div><div class="status">正在启动，请稍候...</div></div></div></body></html>`
+  win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+    .then(() => { if (!win.isDestroyed()) win.show() })
+    .catch(() => { if (!win.isDestroyed()) win.show() })
+  return win
+}
+
 function createWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) return mainWindow
   const bounds = fitWindowBounds()
@@ -2265,12 +2569,14 @@ function createWindow() {
     if (win.isDestroyed()) return
     win.show()
     win.focus()
+    closeSplashWindow()
   })
   // 防止 ready-to-show 未触发时界面一直不出现
   setTimeout(() => {
     if (!win.isDestroyed() && !win.isVisible()) {
       win.show()
       win.focus()
+      closeSplashWindow()
     }
   }, 2500).unref()
 
@@ -2289,6 +2595,12 @@ function createWindow() {
   })
   win.webContents.on('did-fail-load', (_event, code, desc, url) => {
     appLog('ERROR', '界面渲染失败', { code, desc, url })
+  })
+  win.webContents.on('render-process-gone', (_event, details) => {
+    appLog('ERROR', '界面进程异常退出', { reason: details.reason, exitCode: details.exitCode })
+  })
+  win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) appLog('ERROR', '界面脚本错误', { reason: String(message || '').slice(0, 1000), line, sourceId })
   })
   return win
 }
@@ -2352,6 +2664,7 @@ function createTray() {
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
+  createSplashWindow()
   try {
     initStorage(app.getPath('userData'))
     softwareAuth.initSoftwareAuth(app.getPath('userData'))
@@ -2432,6 +2745,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   quitting = true
+  closeSplashWindow()
   try { stopUpdateScheduler() } catch {}
   stopRemoteAgent()
   tray?.destroy()

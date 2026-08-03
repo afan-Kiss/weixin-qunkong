@@ -9,7 +9,7 @@ import PageHeader from '../components/app/PageHeader.vue'
 import StatusTag from '../components/app/StatusTag.vue'
 import { statusLabel } from '../utils/status'
 import { groups, instances, loadMembers, loading, members, refreshDirectory, refreshInstances, type MemberRow } from '../stores/wechatData'
-import { callWechat } from '../services/wechat'
+import { resolveFriendCredentials } from '../services/wechat'
 import { filterSelectOptions, SELECT_OPTION_LIMIT_SEARCH, useSelectSearchQuery } from '../utils/searchableSelect'
 
 const router = useRouter()
@@ -394,32 +394,6 @@ function clearFilterGroups() { selectedGroups.value = [] }
  * @param value 接口原始响应
  * @param key v3 或 v4
  */
-function findCredential(value: unknown, key: 'v3' | 'v4'): string {
-  const seen = new Set<unknown>()
-  function walk(item: unknown): string {
-    if (!item || typeof item !== 'object' || seen.has(item)) return ''
-    seen.add(item)
-    const source = item as Record<string, unknown>
-    const candidates = key === 'v3'
-      ? [source.encryptUserName, source.encryptedUserName, source.userName]
-      : [source.antispamTicket, source.antispamticket, source.antiSpamTicket]
-    for (const candidate of candidates) {
-      const text = typeof candidate === 'string'
-        ? candidate
-        : candidate && typeof candidate === 'object' && typeof (candidate as Record<string, unknown>).String === 'string'
-          ? String((candidate as Record<string, unknown>).String)
-          : ''
-      if (text && (key === 'v4' || text.toLowerCase().startsWith('v3'))) return text
-    }
-    for (const child of Object.values(source)) {
-      const result = walk(child)
-      if (result) return result
-    }
-    return ''
-  }
-  return walk(value)
-}
-
 /**
  * 按筛选规则生成候选成员列表。
  * @param source 勾选成员或最新入群成员
@@ -430,6 +404,8 @@ function filterCandidates(source: MemberRow[]) {
     .filter((member) => !excluded.some((rule) => member.wxid.toLowerCase() === rule || member.nickname.trim().toLowerCase() === rule))
     .slice(Math.max(startFrom.value - 1, 0), Math.max(startFrom.value - 1, 0) + Math.max(maxCount.value, 0))
 }
+
+const DEFAULT_FRIEND_VERIFY_CONTENT = '你好，我是群里的朋友'
 
 /**
  * 创建加好友任务（需求 7 与普通加群成员共用执行链路，频繁状态由任务引擎写入）。
@@ -442,7 +418,7 @@ async function createAddFriendTask(sourceMembers = selectedMembers.value, taskNa
   if (!candidates.length) return ElMessage.warning('按起始位置、最大人数和排除规则筛选后没有可处理的成员')
   let prompt: { value: string }
   try {
-    prompt = await ElMessageBox.prompt('添加好友验证内容', '创建加好友任务', { inputPlaceholder: '请输入验证内容', inputValidator: (value) => Boolean(value.trim()) || '验证内容不能为空' })
+    prompt = await ElMessageBox.prompt('添加好友验证内容', '创建加好友任务', { inputPlaceholder: `可不填，默认：${DEFAULT_FRIEND_VERIFY_CONTENT}` })
     await ElMessageBox.confirm(`筛选后将检查 ${candidates.length} 名成员的好友资料，只有资料完整的成员会进入任务。`, '确认检查成员资料', { type: 'warning' })
   } catch {
     return
@@ -459,12 +435,18 @@ async function createAddFriendTask(sourceMembers = selectedMembers.value, taskNa
       if (instance.accountWxid && member.wxid === instance.accountWxid) { skippedSelf += 1; continue }
       if (profileRequestCount > 0) await wait(MEMBER_PROFILE_REQUEST_INTERVAL_MS)
       profileRequestCount += 1
-      const response = await callWechat(instance, '/api/get_group_member_contact', { wxid: member.wxid, roomId: member.roomId }, 438557510)
-      if (!response.ok) { unavailable += 1; continue }
-      const v3 = findCredential(response.raw, 'v3')
-      const v4 = findCredential(response.raw, 'v4')
-      if (!v3 || !v4) { unavailable += 1; continue }
-      items.push({ instanceId: instance.id, targetKey: member.wxid, request: { v3, v4, scence: '3', friendFlg: '0', verifyContent: prompt.value } })
+      const credentials = await resolveFriendCredentials(instance, member.wxid, member.roomId)
+      const { v3, v4 } = credentials
+      if (!v3 || !v4) {
+        unavailable += 1
+        void window.wxControl?.reportError?.('群成员加好友资料仍不完整', {
+          module: '群成员加好友', operation: '解析加好友凭证', instanceId: instance.id,
+          accountWxid: instance.accountWxid, targetWxid: member.wxid, roomId: member.roomId, missing: credentials.missing.join(','), attempts: credentials.attempts.join('、'),
+          ...(credentials.diagnostics.at(-1) || {}),
+        })
+        continue
+      }
+      items.push({ instanceId: instance.id, targetKey: member.wxid, request: { v3, v4, scence: '3', friendFlg: '0', verifyContent: String(prompt.value || '').trim() || DEFAULT_FRIEND_VERIFY_CONTENT } })
     }
     if (!items.length) {
       const reasons = [skippedSelf ? `已排除本人 ${skippedSelf} 人` : '', unavailable ? `暂时无法取得资料 ${unavailable} 人` : ''].filter(Boolean).join('，')

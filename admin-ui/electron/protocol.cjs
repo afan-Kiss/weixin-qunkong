@@ -31,10 +31,30 @@ function isVerifiedSuccess(sourceId, responseOk, raw) {
   if (!responseOk) return false
   if (Number(sourceId) === 438557482) return raw?.code === 1 || raw?.errCode === 1
   if (Number(sourceId) === 438557485) return raw?.code === 1 || raw?.errCode === 1
-  if (Number(sourceId) === 438557574) return raw?.errCode === 1
+  if (Number(sourceId) === 438557574) {
+    const scanResult = raw?.data?.scan_res ?? raw?.scan_res
+    return raw?.errCode === 1 && typeof scanResult === 'string' && scanResult.trim().length > 0
+  }
   if (Number(sourceId) === 438557576) return raw?.code === 0
   if (Number(sourceId) === 438557503) return raw?.baseResponse?.ret === 0 || raw?.data?.baseResponse?.ret === 0
   return null
 }
 
-module.exports = { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, encodeFrame, hasFrequentEvidence, isVerifiedSuccess }
+/**
+ * 添加好友接口没有稳定成功回包，但明确的 HTTP/业务错误必须判为失败。
+ * @param {boolean} responseOk
+ * @param {unknown} raw
+ * @returns {{ accepted: boolean, reason: string }}
+ */
+function evaluateFriendAddResult(responseOk, raw) {
+  if (!responseOk) return { accepted: false, reason: '添加好友接口请求失败' }
+  const source = raw && typeof raw === 'object' ? raw : {}
+  const code = Number(source.code ?? source.errCode ?? source.baseResponse?.ret)
+  const message = String(source.msg ?? source.message ?? source.errMsg ?? source.baseResponse?.errMsg ?? '').trim()
+  if ((Number.isFinite(code) && (code >= 400 || code < 0)) || /exception|error|失败|参数|不能为空|类型/i.test(message)) {
+    return { accepted: false, reason: message || `添加好友失败（错误码 ${code}）` }
+  }
+  return { accepted: true, reason: '好友申请已提交，等待对方确认' }
+}
+
+module.exports = { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, encodeFrame, hasFrequentEvidence, isVerifiedSuccess, evaluateFriendAddResult }

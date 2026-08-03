@@ -372,13 +372,19 @@ async function createScanTask(rows = selected.value) {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
-      const lines = previews.map((item, index) => {
-        const name = item.roomName || (item.error ? '解析失败' : '未知群名')
+      const invalid = previews.filter((item) => item.expired || item.error)
+      const invalidSet = new Set(invalid)
+      const resolved = previews.filter((item) => !invalidSet.has(item) && (item.roomName || item.roomId || Number(item.memberCount) > 0))
+      const pendingPreviewCount = previews.length - resolved.length - invalid.length
+      const lines = resolved.slice(0, 20).map((item, index) => {
+        const name = item.roomName || '未知群名'
         const count = Number(item.memberCount) > 0 ? `${item.memberCount} 人` : '人数未知'
         const id = item.roomId ? `<br/>&nbsp;&nbsp;&nbsp;ID：${escapeHtml(item.roomId)}` : ''
-        const warn = item.expired || item.error ? ` ⚠ ${escapeHtml(item.error || '邀请可能无效')}` : ''
-        return `${index + 1}. <b>${escapeHtml(name)}</b>（${escapeHtml(count)}）${warn}${id}`
+        return `${index + 1}. <b>${escapeHtml(name)}</b>（${escapeHtml(count)}）${id}`
       })
+      if (resolved.length > 20) lines.push(`另有 ${resolved.length - 20} 个已解析群邀请`)
+      if (pendingPreviewCount > 0) lines.push(`<b>${pendingPreviewCount} 个群邀请</b>暂时无法读取群名和人数，执行任务时仍会逐个尝试`)
+      if (invalid.length > 0) lines.push(`<b>${invalid.length} 个邀请无效</b>：${escapeHtml(invalid[0].error || '邀请已过期')}`)
       previewBlock = lines.length
         ? `将进群的目标：<br/>${lines.join('<br/>')}<br/><br/>`
         : '未能解析出群资料，仍可尝试提交（结果以微信实际为准）。<br/><br/>'

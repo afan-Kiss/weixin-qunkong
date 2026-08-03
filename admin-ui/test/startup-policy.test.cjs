@@ -16,6 +16,10 @@ test('app startup shows UI before restoring WeChat sessions', () => {
   assert.doesNotMatch(source, /autoStart/)
   assert.match(source, /disableHardwareAcceleration/)
   assert.match(source, /fitWindowBounds/)
+  assert.match(source, /function createSplashWindow\(\)/)
+  assert.match(source, /正在启动，请稍候/)
+  assert.ok(readyBlock.indexOf('createSplashWindow()') < readyBlock.indexOf('initStorage('))
+  assert.match(source, /ready-to-show[\s\S]*closeSplashWindow\(\)/)
 })
 
 test('application uses an operating system single-instance lock', () => {

@@ -321,33 +321,69 @@ function formatInvitePreviewLine(preview) {
 }
 
 /**
+ * 解开微信 protobuf/JSON 里常见的 { String: "x" } / { string: "x" } 包装。
+ * @param {unknown} value
+ * @returns {string}
+ */
+function unwrapProtoString(value) {
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (!value || typeof value !== 'object') return ''
+  if (typeof value.String === 'string') return value.String.trim()
+  if (typeof value.string === 'string') return value.string.trim()
+  if (typeof value.value === 'string') return value.value.trim()
+  if (typeof value.Value === 'string') return value.Value.trim()
+  return ''
+}
+
+/**
  * 从 a8key 响应提取可用于抓取邀请页的 HTTP 头。
+ * 兼容：[{Key,Value}]、[{key,value}]、Key/Value 为 {String}、以及 { Cookie: "..." } 映射。
  * @param {unknown} raw
  * @returns {Record<string, string>}
  */
 function extractA8KeyHttpHeaders(raw) {
   const headers = {}
-  const list = findByNames(raw, ['HttpHeader', 'httpHeader', 'http_header'])
-  const rows = Array.isArray(list)
-    ? list
-    : (list && typeof list === 'object' ? Object.values(list) : [])
-  for (const row of rows) {
-    if (!row || typeof row !== 'object') continue
-    const key = String(row.Key ?? row.key ?? row.name ?? row.Name ?? '').trim()
-    const value = String(row.Value ?? row.value ?? row.val ?? row.Val ?? '').trim()
-    if (key && value) headers[key] = value
+  const list = findByNames(raw, ['HttpHeader', 'httpHeader', 'http_header', 'HttpHeaders', 'httpHeaders'])
+
+  const assignHeader = (keyRaw, valueRaw) => {
+    const key = unwrapProtoString(keyRaw) || (typeof keyRaw === 'string' ? keyRaw.trim() : '')
+    const value = unwrapProtoString(valueRaw) || (typeof valueRaw === 'string' ? valueRaw.trim() : '')
+    if (!key || !value || /^\[object Object\]$/i.test(key) || /^\[object Object\]$/i.test(value)) return
+    headers[key] = value
   }
+
+  if (Array.isArray(list)) {
+    for (const row of list) {
+      if (!row || typeof row !== 'object') continue
+      assignHeader(row.Key ?? row.key ?? row.name ?? row.Name, row.Value ?? row.value ?? row.val ?? row.Val)
+    }
+  } else if (list && typeof list === 'object') {
+    // 映射形态：{ Cookie: "a=1", Referer: "..." } 或 { 0: {Key,Value}, 1: {...} }
+    for (const [mapKey, mapVal] of Object.entries(list)) {
+      if (mapVal && typeof mapVal === 'object' && (mapVal.Key != null || mapVal.key != null || mapVal.Value != null || mapVal.value != null)) {
+        assignHeader(mapVal.Key ?? mapVal.key ?? mapVal.name ?? mapVal.Name, mapVal.Value ?? mapVal.value ?? mapVal.val ?? mapVal.Val)
+      } else {
+        assignHeader(mapKey, mapVal)
+      }
+    }
+  }
+
   // 兼容 Cookie 单独字段
   if (!headers.Cookie && !headers.cookie) {
     const cookie = findByNames(raw, ['Cookie', 'cookie', 'HttpCookie', 'httpCookie'])
-    if (typeof cookie === 'string' && cookie.trim()) headers.Cookie = cookie.trim()
+    const cookieText = unwrapProtoString(cookie) || (typeof cookie === 'string' ? cookie.trim() : '')
+    if (cookieText) headers.Cookie = cookieText
   }
   return headers
 }
 
+/** 邀请页抓取用 UA：模拟 PC 微信内置浏览器，降低「请下载微信」门禁页概率 */
+const INVITE_PAGE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 NetType/WIFI MicroMessenger/7.0.20.1781(0x6700143B) WindowsWechat(0x63090a13) XWEB/9185'
+
 /**
  * 组装抓取邀请页所需的 URL 与请求头。
- * get_a8key 本身通常不含群名/人数，需要再 HTTP GET FullURL。
+ * get_a8key 本身通常不含群名/人数，需要再 HTTP GET/POST FullURL。
  * @param {unknown} raw get_a8key 响应
  * @param {string} [sourceUrl] 原始短链/邀请链
  * @returns {{ url: string, headers: Record<string, string> }}
@@ -355,13 +391,38 @@ function extractA8KeyHttpHeaders(raw) {
 function buildInvitePageRequest(raw, sourceUrl = '') {
   const fullUrl = findInviteFullUrl(raw, sourceUrl)
   const url = String(fullUrl || sourceUrl || '').trim()
+  const extracted = extractA8KeyHttpHeaders(raw)
   const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 MicroMessenger/7.0.20',
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'User-Agent': INVITE_PAGE_USER_AGENT,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'zh-CN,zh;q=0.9',
-    ...extractA8KeyHttpHeaders(raw),
+    'Upgrade-Insecure-Requests': '1',
+    ...extracted,
+  }
+  // 保证 Cookie 标准大小写，部分网关只认 Cookie
+  if (!headers.Cookie && headers.cookie) {
+    headers.Cookie = headers.cookie
+    delete headers.cookie
+  }
+  if (url && !headers.Referer && !headers.referer) {
+    try {
+      const host = new URL(url).origin
+      headers.Referer = host + '/'
+    } catch { /* ignore */ }
   }
   return { url, headers }
+}
+
+/**
+ * 判断 a8key 响应是否已具备继续抓邀请页的条件。
+ * @param {unknown} raw
+ * @returns {boolean}
+ */
+function a8keyResponseUseful(raw) {
+  const headers = extractA8KeyHttpHeaders(raw)
+  if (headers.Cookie || headers.cookie) return true
+  const full = findInviteFullUrl(raw, '')
+  return /addchatroombyinvite|a8key=|pass_ticket=/i.test(full)
 }
 
 /**
@@ -383,8 +444,11 @@ module.exports = {
   parseInvitePageText,
   parseInvitePreview,
   mergeInvitePreview,
+  unwrapProtoString,
   extractA8KeyHttpHeaders,
   buildInvitePageRequest,
+  INVITE_PAGE_USER_AGENT,
+  a8keyResponseUseful,
   hasUsableInvitePreview,
   evaluateEnterRoomResult,
   formatInvitePreviewLine,

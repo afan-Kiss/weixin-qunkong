@@ -21,7 +21,11 @@ REMOTE_SCRIPT = r'''
 import json, glob, os
 files = sorted(glob.glob("/opt/wxqk/data/wx-sync/*.json"), key=os.path.getmtime, reverse=True)
 print("FILE_COUNT", len(files))
-keys = ("inject", "DLL", "注入", "启动微信", "微信实例", "新增微信")
+keys = (
+    "inject", "DLL", "注入", "启动微信", "微信实例", "新增微信",
+    "get_group_member_contact", "get_contact", "群成员", "暂时无法取得资料",
+    "添加好友", "加好友", "438557509",
+)
 for fp in files[:3]:
     data = json.load(open(fp, "r", encoding="utf-8"))
     print("FILE", os.path.basename(fp), "capturedAt", data.get("capturedAt"), "logs", len(data.get("logs") or []))

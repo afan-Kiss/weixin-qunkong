@@ -43,8 +43,63 @@ function qrTypeLabel(qrType) {
   })[qrType] || '未知二维码'
 }
 
+/**
+ * 归一化二维码解码文本，避免同链不同写法产生不同哈希。
+ * - 去空白、统一小写协议/主机
+ * - 微信群短链只保留 /g/{token}
+ * - 个人名片去掉追踪参数（如 ?s=2）
+ * @param {string} text 原始解码
+ * @returns {string}
+ */
+function normalizeQrText(text) {
+  let value = String(text || '').trim()
+  if (!value) return ''
+  // 解码结果里偶夹杂不可见字符 / 全角空格
+  value = value.replace(/[\u0000-\u001F\u007F\u00A0\u200B-\u200D\uFEFF]/g, '').trim()
+  const urlMatch = value.match(/https?:\/\/[^\s<>"']+/i)
+  if (urlMatch) value = urlMatch[0]
+  value = value.replace(/[),.;，。]+$/g, '')
+
+  try {
+    const parsed = new URL(value)
+    const host = parsed.hostname.toLowerCase()
+    const pathName = parsed.pathname || ''
+
+    // 微信群邀请：https://weixin.qq.com/g/TOKEN
+    if ((host === 'weixin.qq.com' || host === 'www.weixin.qq.com' || host === 'wechat.com') && /^\/g\//i.test(pathName)) {
+      const token = pathName.split('/').filter(Boolean)[1] || ''
+      if (token) return `https://weixin.qq.com/g/${token}`
+    }
+
+    // 个人名片：https://u.wechat.com/xxx 忽略 query
+    if (host === 'u.wechat.com' || host === 'www.u.wechat.com') {
+      const id = pathName.replace(/^\//, '').split('/')[0] || ''
+      if (id) return `https://u.wechat.com/${id}`
+    }
+
+    // QQ 群：保留关键参数 k / group_code
+    if (/qq\.com$/i.test(host) || host.endsWith('.qq.com')) {
+      const key = parsed.searchParams.get('k') || parsed.searchParams.get('group_code') || ''
+      if (key) return `https://qm.qq.com/q/${key}`
+      if (/^\/q\//i.test(pathName)) {
+        const id = pathName.split('/').filter(Boolean)[1] || ''
+        if (id) return `https://qm.qq.com/q/${id}`
+      }
+    }
+
+    parsed.hash = ''
+    // 去掉常见追踪参数
+    for (const drop of ['s', 'from', 'scene', 'subscene', 'clicktime', 'ascene']) {
+      parsed.searchParams.delete(drop)
+    }
+    return parsed.toString()
+  } catch {
+    return value
+  }
+}
+
 function contentHash(text) {
-  return createHash('sha256').update(String(text || '').trim()).digest('hex').toUpperCase()
+  return createHash('sha256').update(normalizeQrText(text) || String(text || '').trim()).digest('hex').toUpperCase()
 }
 
 function messageTableName(roomId) {
@@ -446,7 +501,7 @@ async function decodeNativeImages(image, options = {}) {
     if (!rgba) return []
     try {
       const hit = jsQR(rgba.rgba, rgba.width, rgba.height, { inversionAttempts: 'dontInvert' })?.data || ''
-      if (hit) return [String(hit).trim()]
+      if (hit) decoded.add(String(hit).trim())
     } catch { /* continue */ }
     await yieldUi()
     // 宽图再试左右半幅（常见双码拼图），仍基于缩略图
@@ -463,7 +518,6 @@ async function decodeNativeImages(image, options = {}) {
           await yieldUi()
         }
       } catch { /* ignore */ }
-      if (decoded.size) return [...decoded]
     }
     try {
       zbarPromise ||= Promise.resolve().then(() => {
@@ -550,6 +604,7 @@ module.exports = {
   safeFolderName,
   classifyQrText,
   qrTypeLabel,
+  normalizeQrText,
   contentHash,
   messageTableName,
   rowsFromApi,

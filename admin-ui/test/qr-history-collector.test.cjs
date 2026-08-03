@@ -8,6 +8,7 @@ const {
   classifyQrText,
   qrTypeLabel,
   contentHash,
+  normalizeQrText,
   messageTableName,
   rowsFromApi,
   cdnDownloadRequest,
@@ -27,6 +28,66 @@ test('QR history collector classifies and deduplicates by decoded content', () =
   assert.equal(qrTypeLabel('QQ_GROUP_LINK'), 'QQ群二维码')
   assert.equal(contentHash('same-code'), contentHash('same-code'))
   assert.notEqual(contentHash('same-code'), contentHash('another-code'))
+})
+
+test('normalizeQrText collapses tracking params and same-group invite variants', () => {
+  assert.equal(
+    normalizeQrText('https://u.wechat.com/EIF7yWpV8W8TElETfjXL9f4?s=2'),
+    'https://u.wechat.com/EIF7yWpV8W8TElETfjXL9f4',
+  )
+  assert.equal(
+    contentHash('https://u.wechat.com/EIF7yWpV8W8TElETfjXL9f4?s=2'),
+    contentHash('https://u.wechat.com/EIF7yWpV8W8TElETfjXL9f4'),
+  )
+  assert.equal(
+    normalizeQrText('HTTPS://weixin.qq.com/g/AQYAAtoken123?from=group'),
+    'https://weixin.qq.com/g/AQYAAtoken123',
+  )
+  assert.equal(
+    contentHash('https://weixin.qq.com/g/AQYAAtoken123'),
+    contentHash('HTTPS://weixin.qq.com/g/AQYAAtoken123/?s=1'),
+  )
+  // 同图贴两个相同码：归一化后哈希一致
+  const a = contentHash('https://weixin.qq.com/g/sameInvite')
+  const b = contentHash(' https://weixin.qq.com/g/sameInvite\n')
+  assert.equal(a, b)
+})
+
+test('saveClassifiedQrImage keeps multiple QR records but writes one physical image per poster', () => {
+  const main = readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
+  assert.match(main, /seenInImage/)
+  assert.match(main, /先占位/)
+  assert.match(main, /hasQrContentHash/)
+  assert.match(main, /const imageFileHash = await sha256\(sourcePath\)/)
+  assert.match(main, /let sharedDestination = ''/)
+  assert.match(main, /整张图片哈希/)
+  assert.doesNotMatch(main, /\$\{String\(hash\)\.slice\(0, 16\)/)
+  assert.doesNotMatch(main, /status: 'DUPLICATE'/)
+  assert.doesNotMatch(main, /dup:\$\{hash\}:\$\{randomUUID\(\)\}/)
+})
+
+test('local image import decodes every QR and creates one record per link', () => {
+  const main = readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
+  const importBody = main.slice(main.indexOf("ipcMain.handle('qr:import-files'"), main.indexOf("ipcMain.handle('qr:import-links'"))
+  assert.match(importBody, /decodeNativeImages/)
+  assert.match(importBody, /mode: 'full'/)
+  assert.match(importBody, /recognized = new Map/)
+  assert.match(importBody, /decodedText: item\.decodedText/)
+  assert.match(importBody, /status: 'READY'/)
+})
+
+test('fast history decoding does not return after the first QR in a poster', () => {
+  const collector = readFileSync(path.join(__dirname, '..', 'electron', 'qr-collector.cjs'), 'utf8')
+  const fastBody = collector.slice(collector.indexOf("if (mode === 'fast')"), collector.indexOf('// —— 完整模式'))
+  assert.doesNotMatch(fastBody, /if \(hit\) return/)
+  assert.doesNotMatch(fastBody, /if \(decoded\.size\) return/)
+})
+
+test('scan result cannot replace a confirmed group link with another code from the same poster', () => {
+  const storage = readFileSync(path.join(__dirname, '..', 'electron', 'storage.cjs'), 'utf8')
+  const updateBody = storage.slice(storage.indexOf('function updateQrScanResult'), storage.indexOf('function classifyStoredQr'))
+  assert.match(updateBody, /preserveGroup/)
+  assert.match(updateBody, /existing\?\.qrType === 'GROUP_LINK'/)
 })
 
 test('QR history collector derives the room message table and accurate file names', () => {
@@ -123,7 +184,7 @@ test('QR history UI supports multi-room collection and offline decoding', () => 
   assert.match(main, /qrType === 'PERSONAL_LINK'/)
   assert.match(main, /仅明确过期才拒绝/)
   assert.match(main, /qrTypeLabel/)
-  assert.match(main, /同图多码各自一份文件/)
+  assert.match(main, /同图内先按归一化内容去重|内容哈希去重/)
   assert.match(main, /QQ_GROUP_LINK/)
   assert.match(collector, /downscaleForScan/)
   assert.match(collector, /mode === 'fast'/)

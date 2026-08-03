@@ -3,7 +3,7 @@
  * 产品要求：不依赖发布密钥；清单签名缺失/失败不阻断更新。
  */
 const { createHash, createPublicKey, verify } = require('crypto')
-const { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, copyFileSync, unlinkSync, statSync, writeFileSync, rmSync, readdirSync } = require('fs')
+const { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, unlinkSync, statSync, writeFileSync, rmSync, readdirSync } = require('fs')
 const http = require('http')
 const https = require('https')
 const path = require('path')
@@ -267,10 +267,9 @@ async function checkForUpdate(options) {
   if (needsUpgrade(manifest, currentSeq, currentBuild, options.currentVersion)) {
     const minSeq = Number(manifest.minimumReleaseSequence || 0) || 0
     const latest = Number(manifest.releaseSequence || 0) || 0
+    // 是否强制更新只服从发布清单。releaseSequence 和版本号只用于判断
+    // 是否存在新版，不能把后台发布的非强制更新擅自升级为强制更新。
     const mandatory = Boolean(manifest.mandatory)
-      || latest > currentSeq
-      || isRemoteVersionNewer(manifest.version, options.currentVersion)
-      || (minSeq > 0 && currentSeq < minSeq)
     return {
       needUpdate: true,
       mandatory,
@@ -417,13 +416,60 @@ async function childDiedWithin(pid, windowMs) {
 }
 
 /**
+ * 由独立进程等待当前程序退出后替换便携 EXE，规避 Windows 对运行中 EXE 的文件锁。
+ */
+function schedulePortableReplacement({ currentExe, finalPath, downloadPath, expectedSha256 }) {
+  const workDir = path.dirname(downloadPath)
+  const helperPath = path.join(workDir, `install-${Date.now()}-${process.pid}.ps1`)
+  const logPath = path.join(workDir, 'install.log')
+  const script = [
+    'param([int]$ParentPid,[string]$CurrentExe,[string]$FinalPath,[string]$DownloadPath,[string]$ExpectedSha256,[string]$LogPath)',
+    "$ErrorActionPreference = 'Stop'",
+    'function Log([string]$Message) { Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value ((Get-Date -Format o) + " " + $Message) }',
+    'Log "等待旧版退出 parent=$ParentPid current=$CurrentExe final=$FinalPath"',
+    'try { Wait-Process -Id $ParentPid -Timeout 60 -ErrorAction SilentlyContinue } catch {}',
+    'for ($i = 0; $i -lt 60; $i++) {',
+    '  try { if (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500; continue }; break } catch { break }',
+    '}',
+    'try {',
+    '  if (-not (Test-Path -LiteralPath $FinalPath)) { throw "新版文件不存在" }',
+    "  $actual = (Get-FileHash -LiteralPath $FinalPath -Algorithm SHA256).Hash.ToLowerInvariant()",
+    "  if ($actual -ne $ExpectedSha256.ToLowerInvariant()) { throw 'SHA256 mismatch after install' }",
+    '  $env:PORTABLE_EXECUTABLE_FILE = $FinalPath',
+    '  $env:PORTABLE_EXECUTABLE_DIR = Split-Path -Parent $FinalPath',
+    '  $env:WXQK_UPDATE_OLD_TRASH = $CurrentExe',
+    "  Start-Process -FilePath $FinalPath -ArgumentList '--after-update' -WorkingDirectory (Split-Path -Parent $FinalPath) -ErrorAction Stop",
+    '  Log "新版启动命令成功"',
+    '  Remove-Item -LiteralPath $DownloadPath -Force -ErrorAction SilentlyContinue',
+    '} catch {',
+    '  Log ("更新启动失败: " + $_.Exception.Message)',
+    '  try { Start-Process -FilePath $CurrentExe -WorkingDirectory (Split-Path -Parent $CurrentExe) } catch {}',
+    '  exit 1',
+    '}',
+  ].join('\r\n')
+  // Windows PowerShell 5 会把无 BOM 的 UTF-8 脚本按系统 ANSI 读取，中文字符串
+  // 可能被解码成破坏引号的乱码，导致脚本尚未执行就 ParserError。
+  writeFileSync(helperPath, `\uFEFF${script}`, 'utf8')
+  const child = spawn('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helperPath,
+    process.pid.toString(), currentExe, finalPath, downloadPath, String(expectedSha256 || ''), logPath,
+  ], { detached: true, stdio: 'ignore', windowsHide: true })
+  child.unref()
+  if (!child.pid) throw new Error('无法启动独立更新器')
+  return child.pid
+}
+
+/**
  * 下载、校验、替换便携包并拉起新进程。
  * @param {{ baseUrl?: string, currentBuild: string, currentVersion: string, currentReleaseSequence: number|string, onProgress?: Function, app?: import('electron').App }} options
  * @returns {Promise<{ ok: boolean, finalPath?: string, message?: string }>}
  */
 async function applyUpdate(options) {
   if (applying) return { ok: false, message: '更新正在进行中' }
-  if (!startupApplyAllowed) return { ok: false, message: '运行中不自动更新，请重启软件后再试' }
+  // 仅在入口检查一次：MarkStartupUpdateDone 不应打断已通过检查的下载/替换
+  if (!startupApplyAllowed) {
+    return { ok: false, deferred: true, message: '运行中禁止因更新关闭软件，请完全退出后重新打开再更新' }
+  }
   applying = true
   const baseUrl = options.baseUrl || DEFAULT_BASE
   const meta = {
@@ -435,10 +481,6 @@ async function applyUpdate(options) {
     const check = await checkForUpdate({ ...options, baseUrl })
     if (!check.needUpdate || !check.manifest) return { ok: false, message: '无需更新' }
     const man = check.manifest
-    const curSeq = Number(options.currentReleaseSequence || 0) || 0
-    const latest = Number(man.releaseSequence || 0) || 0
-    if (latest > 0 && curSeq > 0 && latest < curSeq) return { ok: false, message: '拒绝降级' }
-
     const currentExe = resolvePortableExePath()
     const installDir = path.dirname(currentExe)
     let destName = path.basename(String(man.fileName || `${man.buildId}.exe`))
@@ -470,58 +512,29 @@ async function applyUpdate(options) {
     await verifyPackageFile(downloadPath, man)
 
     await reportUpdate(baseUrl, 'INSTALL_STARTED', meta, { buildId: man.buildId, version: man.version })
-    const oldTrash = prepareUpdateOldTrashPath(installDir)
-    try {
-      renameSync(currentExe, oldTrash)
-    } catch (error) {
-      await reportUpdate(baseUrl, 'INSTALL_FAILED', meta, { reason: String(error?.message || error) })
-      throw new Error(`无法替换原文件（可能被占用）：${error.message || error}`)
+    if (path.resolve(finalPath) === path.resolve(currentExe)) {
+      throw new Error('新版文件名与当前版本相同，无法安全替换')
     }
-
-    const rollback = () => {
-      try { if (existsSync(finalPath) && path.resolve(finalPath) !== path.resolve(oldTrash)) unlinkSync(finalPath) } catch {}
-      renameSync(oldTrash, currentExe)
-    }
-
-    try {
-      if (path.resolve(finalPath) !== path.resolve(currentExe) && existsSync(finalPath)) {
-        try { unlinkSync(finalPath) } catch {}
-      }
-      copyFileSync(downloadPath, finalPath)
-      await verifyPackageFile(finalPath, man)
-    } catch (error) {
-      try { rollback() } catch (rb) {
-        await reportUpdate(baseUrl, 'INSTALL_FAILED', meta, { reason: String(error?.message || error), rollback: String(rb?.message || rb) })
-        throw new Error(`${error.message || error}；回滚失败：${rb.message || rb}`)
-      }
-      await reportUpdate(baseUrl, 'INSTALL_FAILED', meta, { reason: String(error?.message || error) })
-      throw error
-    }
-
-    try { unlinkSync(downloadPath) } catch {}
-
-    // 必须先释放单实例锁，否则新进程会被 second-instance 立刻退出
+    // 旧版仍运行时先把新版写入同目录并校验；只有确认文件存在后才允许退出。
+    copyFileSync(downloadPath, finalPath)
+    await verifyPackageFile(finalPath, man)
     try { options.app?.releaseSingleInstanceLock?.() } catch { /* ignore */ }
-
     const child = spawn(finalPath, ['--after-update'], {
       cwd: installDir,
       detached: true,
       stdio: 'ignore',
-      env: { ...process.env, [UPDATE_OLD_TRASH_ENV]: oldTrash },
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PORTABLE_EXECUTABLE_FILE: finalPath,
+        PORTABLE_EXECUTABLE_DIR: installDir,
+        [UPDATE_OLD_TRASH_ENV]: currentExe,
+      },
     })
     child.unref()
-    const pid = child.pid || 0
-    if (await childDiedWithin(pid, 3000)) {
-      try { rollback() } catch (rb) {
-        await reportUpdate(baseUrl, 'INSTALL_FAILED', meta, { reason: 'child_exit', rollback: String(rb?.message || rb) })
-        throw new Error(`新版本启动失败且回滚失败：${rb.message || rb}`)
-      }
-      await reportUpdate(baseUrl, 'INSTALL_FAILED', meta, { reason: 'child_exit' })
-      throw new Error('新版本启动失败，已回滚到旧版本')
-    }
-
-    await reportUpdate(baseUrl, 'INSTALL_OK', meta, { buildId: man.buildId, version: man.version })
-    return { ok: true, finalPath, message: `软件已更新成功：${destName}` }
+    if (!child.pid) throw new Error('新版启动失败，旧版将继续运行')
+    try { unlinkSync(downloadPath) } catch { /* ignore */ }
+    return { ok: true, finalPath, message: `新版已下载，正在自动重启：${destName}` }
   } finally {
     applying = false
   }
@@ -669,7 +682,7 @@ async function ipcApplyClientUpdate(options) {
       log('INFO', applied.message || '更新成功，即将退出旧进程', { module: '软件更新' })
       setTimeout(() => {
         try { options.app.exit(0) } catch { process.exit(0) }
-      }, 1200)
+      }, 250)
       return applied
     }
     markStartupUpdateDone()
