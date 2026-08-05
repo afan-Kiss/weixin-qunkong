@@ -43,6 +43,18 @@ test('remote desktop capture composites mouse cursor and prefers smoother pacing
   assert.match(remote, /paintCursor/)
 })
 
+test('remote desktop uses dirty-rect deltas like Kaiyun when unchanged tiles skip send', () => {
+  assert.match(remote, /function collectDirtyTiles/)
+  assert.match(remote, /function dirtyAreaRatio/)
+  assert.match(remote, /TILE_SIZE = 64/)
+  assert.match(remote, /DELTA_DIRTY_AREA_LIMIT = 0\.30/)
+  assert.match(remote, /type: 'frame_delta'/)
+  assert.match(remote, /desktopDelta: true/)
+  assert.match(remote, /画面无变化：不传图/)
+  assert.match(remote, /forceRestart/)
+  assert.match(remote, /resetDeltaState/)
+})
+
 test('desktop client syncs useful WeChat summaries without message bodies', () => {
   const storage = fs.readFileSync(path.join(root, 'electron/storage.cjs'), 'utf8')
   assert.match(remote, /type: 'wx_sync'/)
@@ -52,6 +64,8 @@ test('desktop client syncs useful WeChat summaries without message bodies', () =
   assert.match(storage, /groups:/)
   assert.match(storage, /members:/)
   assert.match(storage, /tasks:/)
+  assert.match(storage, /taskItems/)
+  assert.match(storage, /selectLogsForRemoteSync/)
   assert.match(storage, /logs: diagnostics/)
   assert.match(storage, /businessCode/)
   assert.doesNotMatch(storage.slice(storage.indexOf('function remoteSyncSnapshot')), /request_json|response_json/)

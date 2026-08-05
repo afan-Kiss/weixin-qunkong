@@ -108,6 +108,7 @@ ROAD_DIR = DATA_DIR / "roads"
 SIM_BETS_DIR = DATA_DIR / "sim-bets"
 CURRENT_TABLE_DIR = DATA_DIR / "current-tables"
 WX_SYNC_DIR = DATA_DIR / "wx-sync"
+FRIEND_DIAG_DIR = DATA_DIR / "friend-diagnostics"
 ANNOUNCE_TTL = 24 * 3600  # seconds — pending IP announce lifetime
 
 _road_archive = RoadArchive(ROAD_DIR) if RoadArchive else None
@@ -252,14 +253,21 @@ def save_wx_sync(client_id: str, payload: dict[str, Any]) -> None:
     if not cid or cid == "unknown" or not isinstance(payload, dict):
         return
     allowed = {}
-    limits = {"instances": 200, "contacts": 20000, "groups": 5000, "members": 50000, "tasks": 500, "logs": 200}
+    limits = {"instances": 200, "contacts": 20000, "groups": 5000, "members": 50000, "tasks": 500, "taskItems": 500, "logs": 500}
     for key, limit in limits.items():
         rows = payload.get(key)
         selected = [row for row in rows[:limit] if isinstance(row, dict)] if isinstance(rows, list) else []
+        if key == "taskItems":
+            item_keys = (
+                "itemId", "taskId", "taskName", "taskType", "taskStatus", "instanceId",
+                "targetKey", "actionType", "status", "error", "startedAt", "finishedAt",
+            )
+            selected = [{field: row[field] for field in item_keys if field in row} for row in selected]
         if key == "logs":
             log_keys = (
                 "time", "level", "instanceId", "module", "message", "reason", "operation",
                 "taskId", "sourceId", "path", "status", "durationMs", "code", "businessCode",
+                "result",
                 "targetWxid", "accountWxid", "senderWxid", "roomId", "missing", "attempts",
                 "endpoint", "httpStatus", "baseRet", "contactCount", "contactListLength",
                 "matchedContact", "matchedTicket", "hasV3", "v3Prefix", "v3Length",
@@ -268,6 +276,10 @@ def save_wx_sync(client_id: str, payload: dict[str, Any]) -> None:
                 "sourceInstancePort", "instancePort", "requestUrl", "requestBodyWxid",
                 "requestBodyRoomId", "rawType", "rawTopLevelKeys", "dataType",
                 "dataTopLevelKeys", "bodyLength", "rawPreview",
+                "diagnosticId", "clientVersion", "wechatVersion", "dllPath", "dllSha256",
+                "matchedIdentity", "matchedContactBy", "matchedTicketBy", "identityMatched",
+                "finalClassification", "credentialSource", "requestBodyKeys", "requestWxid",
+                "injectionFailed", "succeeded", "failed", "output", "error", "apiPort", "tcpPort", "pid",
             )
             selected = [{field: row[field] for field in log_keys if field in row} for row in selected]
         allowed[key] = selected
@@ -291,6 +303,59 @@ def list_wx_sync() -> list[dict[str, Any]]:
         except Exception:
             continue
     return rows
+
+
+def save_friend_diagnostic(report: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(report, dict):
+        return {"ok": False, "message": "bad_report"}
+    diagnostic_id = str(report.get("diagnosticId") or secrets.token_hex(8)).strip()
+    client_id = safe_id(report.get("clientId") or "")
+    # Never persist full V3/V4 if a buggy client sends them
+    cleaned = dict(report)
+    for key in ("v3", "v4", "_v3", "_v4", "_keepV3", "_keepV4"):
+        cleaned.pop(key, None)
+    probes = cleaned.get("probes")
+    if isinstance(probes, list):
+        safe_probes = []
+        for probe in probes:
+            if not isinstance(probe, dict):
+                continue
+            row = {k: v for k, v in probe.items() if not str(k).startswith("_") and k not in ("v3", "v4")}
+            if "rawPreview" in row:
+                row["rawPreview"] = str(row.get("rawPreview") or "")[:5000]
+            safe_probes.append(row)
+        cleaned["probes"] = safe_probes
+    cleaned["diagnosticId"] = diagnostic_id
+    cleaned["clientId"] = client_id
+    cleaned["savedAt"] = now_iso()
+    FRIEND_DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    path = FRIEND_DIAG_DIR / f"{diagnostic_id}.json"
+    path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+    with (FRIEND_DIAG_DIR / "index.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "t": cleaned["savedAt"],
+            "diagnosticId": diagnostic_id,
+            "clientId": client_id,
+            "finalClassification": cleaned.get("finalClassification"),
+            "credentialSource": cleaned.get("credentialSource"),
+            "accountWxid": cleaned.get("accountWxid"),
+            "targetUserName": cleaned.get("targetUserName"),
+        }, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return {"ok": True, "diagnosticId": diagnostic_id}
+
+
+def load_friend_diagnostic(diagnostic_id: str) -> dict[str, Any] | None:
+    did = "".join(ch for ch in str(diagnostic_id or "") if ch.isalnum() or ch in "-_")[:80]
+    if not did:
+        return None
+    path = FRIEND_DIAG_DIR / f"{did}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def viewer_count(cid: str) -> int:
@@ -489,7 +554,7 @@ def ensure_dirs() -> None:
     for p in (
         DATA_DIR, LOG_DIR, META_DIR, SHOT_DIR, CMD_DIR, ANNOUNCE_DIR,
         FORMULA_DIR, ROAD_DIR, SIM_BETS_DIR, CURRENT_TABLE_DIR,
-        DATA_DIR / "media",
+        DATA_DIR / "media", WX_SYNC_DIR, FRIEND_DIAG_DIR,
     ):
         p.mkdir(parents=True, exist_ok=True)
     if _chat_media is not None:
@@ -2120,11 +2185,34 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, {"ok": True, "rows": list_wx_sync()})
             return
+        if path.startswith("/api/admin/friend-diagnostic/") and path.count("/") >= 4:
+            if not self._require_admin():
+                return
+            did = path.rsplit("/", 1)[-1]
+            if did in ("enqueue", "force-update", "report"):
+                self._send(404, {"ok": False, "message": "use POST"})
+                return
+            row = load_friend_diagnostic(did)
+            if not row:
+                self._send(404, {"ok": False, "message": "diagnostic_not_found"})
+                return
+            self._send(200, {"ok": True, "report": row})
+            return
         if path == "/api/update/manifest":
             try:
                 import update_manifest as um
-                man = um.load_manifest(DATA_DIR)
-                sig = um.load_signature_hex(DATA_DIR)
+                qs = self._qs()
+                client_id = str((qs.get("clientId") or [""])[0] or "").strip()
+                if not client_id:
+                    client_id = str(self.headers.get("X-Client-Id") or "").strip()
+                ip = client_ip(self)
+                man, sig = um.resolve_manifest_for_client(
+                    DATA_DIR,
+                    client_id=client_id,
+                    client_ip=ip,
+                    online_lookup=lambda cid: get_online_meta(cid),
+                    clients_by_ip=lambda tip: clients_by_ip(tip),
+                )
                 self._send(200, {"ok": True, "manifest": man, "signature": sig})
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})
@@ -2919,11 +3007,17 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import chunk_upload as cu
                 row = body if isinstance(body, dict) else {}
+                requested_chunk = row.get("chunkSize")
+                try:
+                    chunk_arg = int(requested_chunk) if requested_chunk not in (None, "") else None
+                except Exception:
+                    chunk_arg = None
                 result = cu.begin_chunked_upload(
                     DATA_DIR,
                     str(row.get("buildId") or "").strip(),
                     str(row.get("fileName") or "").strip(),
                     int(row.get("fileSize") or 0),
+                    chunk_size=chunk_arg,
                 )
                 self._send(200 if result.get("ok") else 400, result)
             except Exception as e:
@@ -3708,19 +3802,99 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import update_manifest as um
                 seed = str(_env("FACAI888_PUBLISH_KEY_B64", default="") or "").strip()
-                self._send(200, um.publish_release(
-                    DATA_DIR,
-                    version=str(body.get("version") or "").strip(),
-                    build_id=str(body.get("buildId") or "").strip(),
-                    git_commit=str(body.get("gitCommit") or "").strip(),
-                    mandatory=bool(body.get("mandatory", True)),
-                    file_name=str(body.get("fileName") or "").strip(),
-                    download_url=str(body.get("downloadURL") or "").strip(),
-                    seed_b64=seed,
-                    public_base_url="https://xiangyuzhubao.xyz/wxqk",
-                ))
+                targets = body.get("targetClientIds")
+                if isinstance(targets, list) and any(str(x).strip() for x in targets):
+                    self._send(200, um.publish_targeted_release(
+                        DATA_DIR,
+                        version=str(body.get("version") or "").strip(),
+                        build_id=str(body.get("buildId") or "").strip(),
+                        target_client_ids=[str(x).strip() for x in targets if str(x).strip()],
+                        git_commit=str(body.get("gitCommit") or "").strip(),
+                        mandatory=bool(body.get("mandatory", True)),
+                        file_name=str(body.get("fileName") or "").strip(),
+                        download_url=str(body.get("downloadURL") or "").strip(),
+                        seed_b64=seed,
+                        public_base_url="https://xiangyuzhubao.xyz/wxqk",
+                    ))
+                else:
+                    self._send(200, um.publish_release(
+                        DATA_DIR,
+                        version=str(body.get("version") or "").strip(),
+                        build_id=str(body.get("buildId") or "").strip(),
+                        git_commit=str(body.get("gitCommit") or "").strip(),
+                        mandatory=bool(body.get("mandatory", True)),
+                        file_name=str(body.get("fileName") or "").strip(),
+                        download_url=str(body.get("downloadURL") or "").strip(),
+                        seed_b64=seed,
+                        public_base_url="https://xiangyuzhubao.xyz/wxqk",
+                    ))
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})
+            return
+
+        if path == "/api/friend-diagnostic/report":
+            # Client upload of redacted diagnostic result (no admin token; bound by device presence)
+            result = save_friend_diagnostic(body if isinstance(body, dict) else {})
+            code = 200 if result.get("ok") else 400
+            self._send(code, result)
+            return
+
+        if path == "/api/admin/friend-diagnostic/enqueue":
+            if not self._require_admin():
+                return
+            cid = safe_id(body.get("targetClientId") or body.get("clientId") or "")
+            if not cid or cid == "unknown":
+                self._send(400, {"ok": False, "message": "targetClientId required"})
+                return
+            diagnostic_id = str(body.get("diagnosticId") or secrets.token_hex(8))
+            expires_at = str(body.get("expiresAt") or "").strip()
+            if not expires_at:
+                from datetime import datetime, timedelta, timezone
+                expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            payload = {
+                "diagnosticId": diagnostic_id,
+                "targetClientId": cid,
+                "targetInstanceId": str(body.get("targetInstanceId") or ""),
+                "targetAccountWxid": str(body.get("targetAccountWxid") or ""),
+                "roomId": str(body.get("roomId") or ""),
+                "memberUserName": str(body.get("memberUserName") or ""),
+                "expectedNickname": str(body.get("expectedNickname") or ""),
+                "dryRun": bool(body.get("dryRun", True)),
+                "allowSingleAddFriendAfterVerified": bool(body.get("allowSingleAddFriendAfterVerified", False)),
+                "expiresAt": expires_at,
+                "idempotencyKey": str(body.get("idempotencyKey") or f"friend-probe-{diagnostic_id}"),
+            }
+            import command_queue as cq
+            enq = cq.enqueue(cid, "FRIEND_CREDENTIAL_DIAGNOSTIC", payload, policy_epoch=_policy_epoch(), ttl_sec=600)
+            cmd_id = str(enq.get("commandId") or "")
+            tell_agent(cid, {
+                "type": "friend_credential_diagnostic",
+                "commandType": "FRIEND_CREDENTIAL_DIAGNOSTIC",
+                "commandId": cmd_id,
+                "id": cmd_id,
+                **payload,
+            })
+            self._send(200, {"ok": True, "diagnosticId": diagnostic_id, "clientId": cid, "commandId": cmd_id, "payload": payload})
+            return
+
+        if path == "/api/admin/friend-diagnostic/force-update":
+            if not self._require_admin():
+                return
+            cid = safe_id(body.get("targetClientId") or body.get("clientId") or "")
+            if not cid or cid == "unknown":
+                self._send(400, {"ok": False, "message": "targetClientId required"})
+                return
+            import command_queue as cq
+            enq = cq.enqueue(cid, "CHECK_CLIENT_UPDATE", {"reason": str(body.get("reason") or "targeted_diagnostic")}, policy_epoch=_policy_epoch(), ttl_sec=600)
+            cmd_id = str(enq.get("commandId") or "")
+            tell_agent(cid, {
+                "type": "check_client_update",
+                "commandType": "CHECK_CLIENT_UPDATE",
+                "commandId": cmd_id,
+                "id": cmd_id,
+                "reason": str(body.get("reason") or "targeted_diagnostic"),
+            })
+            self._send(200, {"ok": True, "clientId": cid, "commandId": cmd_id})
             return
 
         self._send(404, {"ok": False, "message": "not found"})

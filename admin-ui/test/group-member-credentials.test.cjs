@@ -81,6 +81,32 @@ test('main-process parser handles nested JSON strings and numeric string baseRet
   assert.doesNotMatch(structure.rawPreview, /v3_abcdef@stranger|v4_abcdef@stranger/)
 })
 
+test('main-process parser does not take another member ticket when target is specified', () => {
+  const { parseProfileCredentials } = require('../electron/friend-profile.cjs')
+  const raw = {
+    baseResponse: { ret: 0 },
+    contactCount: 2,
+    contactList: [
+      { userName: 'wxid_other', encryptUserName: 'v3_other@stranger' },
+      { userName: 'wxid_target', encryptUserName: 'v3_target@stranger' },
+    ],
+    verifyUserValidTicketList: [
+      { username: 'wxid_other', antispamticket: 'v4_other@stranger' },
+      { username: 'wxid_target', antispamticket: 'v4_target@stranger' },
+    ],
+  }
+  const hit = parseProfileCredentials(raw, 'wxid_target', '123@chatroom')
+  assert.equal(hit.v3, 'v3_target@stranger')
+  assert.equal(hit.v4, 'v4_target@stranger')
+  const missTicket = parseProfileCredentials({
+    ...raw,
+    verifyUserValidTicketList: [{ username: 'wxid_other', antispamticket: 'v4_other@stranger' }],
+  }, 'wxid_target', '123@chatroom')
+  assert.equal(missTicket.v3, 'v3_target@stranger')
+  assert.equal(missTicket.v4, '')
+  assert.deepEqual(missTicket.missing, ['v4'])
+})
+
 test('candidate source and PROFILE_PENDING fields remain wired end to end', () => {
   const storage = fs.readFileSync(path.join(__dirname, '..', 'electron', 'storage.cjs'), 'utf8')
   const page = fs.readFileSync(path.join(__dirname, '..', 'src', 'pages', 'ChatAddFriendPage.vue'), 'utf8')

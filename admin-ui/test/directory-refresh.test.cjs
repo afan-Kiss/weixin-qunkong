@@ -9,6 +9,8 @@ test('directory refresh is shared, cached, partially tolerant, and logs concrete
   const main = readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
   assert.match(store, /directoryRefreshPromise/)
   assert.match(store, /Date\.now\(\) - directoryRefreshedAt < 5000/)
+  assert.match(store, /options\?\.force/)
+  assert.match(store, /force && directoryRefreshPromise/)
   assert.match(store, /刷新通讯录部分失败/)
   assert.match(store, /directorySyncPayload\(\{ contactInstanceIds: refreshedContactInstances, groupInstanceIds: refreshedGroupInstances \}\)/)
   assert.match(store, /memberRooms: \[\{ instanceId: instance\.id, roomId \}\]/)
@@ -19,6 +21,12 @@ test('directory refresh is shared, cached, partially tolerant, and logs concrete
   assert.match(store, /通讯录读取成功，但保存读取结果失败/)
   assert.match(main, /ipcMain\.handle\('app:report-error'/)
   assert.match(main, /safeCloneForIpc\(raw/)
+})
+
+test('group saved flag does not stick after contact list drop', () => {
+  const store = readFileSync(path.join(__dirname, '..', 'src', 'stores', 'wechatData.ts'), 'utf8')
+  assert.match(store, /saved: contactMap\.has\(key\)/)
+  assert.doesNotMatch(store, /saved: contactMap\.has\(key\) \|\| Boolean\(previous\?\.saved\)/)
 })
 
 test('directory refresh merges chatroom list, room cache, all-room detail and contact groups', () => {

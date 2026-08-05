@@ -41,6 +41,7 @@ function parseProfileCredentials(raw, targetWxid, roomId) {
   let contactListLength = 0
   let matchedContact = false
   let matchedTicket = false
+  const target = String(targetWxid || '')
   for (const payload of payloadLayers(raw)) {
     const base = isRecord(payload.baseResponse) ? payload.baseResponse : null
     if (base && baseRet === undefined && (typeof base.ret === 'number' || typeof base.ret === 'string')) baseRet = Number(base.ret)
@@ -48,14 +49,36 @@ function parseProfileCredentials(raw, targetWxid, roomId) {
     if (contacts.length) {
       contactListLength = Math.max(contactListLength, contacts.length)
       contactCount = Math.max(contactCount, Number(payload.contactCount) || contacts.length)
-      const contact = contacts.find((item) => readString(item.userName) === targetWxid || readString(item.friendUserName) === targetWxid) || contacts[0]
+      // 指定目标时禁止回落到其他人的 contact，避免错配 V3
+      let contact = contacts.find((item) => readString(item.userName) === target || readString(item.friendUserName) === target)
+      if (!contact && contacts.length === 1) {
+        const only = contacts[0]
+        const onlyName = readString(only.userName) || readString(only.friendUserName)
+        if (!target || !onlyName || onlyName === target) contact = only
+      }
+      if (!contact && !target) contact = contacts[0]
       matchedContact = Boolean(contact)
       const candidate = readString(contact?.encryptUserName) || readString(contact?.userName)
       if (!v3 && /^v3_/i.test(candidate)) v3 = candidate
     }
+    // update_single_profile / get_contact_fast 等扁平联系人响应：顶层 encryptUserName
+    const flatUserName = readString(payload.userName)
+    const flatEncrypt = readString(payload.encryptUserName)
+    if (flatEncrypt && /^v3_/i.test(flatEncrypt)) {
+      if (!target || !flatUserName || flatUserName === target) {
+        matchedContact = true
+        if (!v3) v3 = flatEncrypt
+      }
+    }
     const tickets = records(payload.verifyUserValidTicketList)
     if (tickets.length) {
-      const ticket = tickets.find((item) => readString(item.username) === targetWxid) || tickets[0]
+      // 指定目标时禁止回落到其他人的 ticket，避免错配 V4 → Invalid argument
+      let ticket = tickets.find((item) => readString(item.username) === target)
+      if (!ticket && tickets.length === 1) {
+        const onlyName = readString(tickets[0].username)
+        if (!target || !onlyName || onlyName === target) ticket = tickets[0]
+      }
+      if (!ticket && !target) ticket = tickets[0]
       matchedTicket = Boolean(ticket)
       const candidate = readString(ticket?.antispamticket) || readString(ticket?.antispamTicket)
       if (!v4 && /^v4_/i.test(candidate)) v4 = candidate

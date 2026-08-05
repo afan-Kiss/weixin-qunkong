@@ -145,27 +145,23 @@ npm run package:portable
 
 发布约定：
 
-- 下载基址：`https://xiangyuzhubao.xyz/wxqk`
+- 下载基址与控制台：由发版脚本 / 环境配置指定（勿把生产 URL 明文写进公开文档）
 - 清单文件名：`微信群控系统vX.Y.exe`
-- 打包时 `bump-version.cjs` 会递增 `package.json` 的 `wxqkReleaseSequence`（并尽量对齐远端序号+1）
+- 打包时 `bump-version.cjs` 会递增 `package.json` 的 `releaseSequence`（并尽量对齐远端序号+1）
+- 客户端强制校验清单 Ed25519 签名；签名缺失或失败则拒绝更新
 
 请把便携包放在可写目录（如桌面）；开发模式只提示有更新，不自动替换。
 
-## 远程桌面
+更新通道与控制台地址以运维环境变量 / 内网文档为准，勿把生产主机与口令写入公开仓库。
 
-桌面端通过 `electron/remote-agent.cjs` 推送 JPEG 画面到管理台。
+## 远程支援（内部）
 
-- **流畅优先**：自适应帧间隔约 120–320ms（约 3–8 FPS），抓完再调度下一帧，避免堆积更卡
-- **鼠标**：网络正常时合成箭头；拥塞时只传光标坐标以减轻 CPU
-- **清晰度**：分辨率上限约 1280×720，JPEG 质量约 70（拥塞时自动降到约 42–55）
+桌面端主进程在登录后保持与控制面的加密链路，用于运维支援与策略下发；产品界面不提供入口。
 
-复测：重启本机软件并保持在线 → 管理台远程桌面开启查看，确认拖动窗口时明显更顺。
+## 排查入口（运维）
 
-## 排查入口（服务器日志）
-
-- 控制台：`https://xiangyuzhubao.xyz/wxqk/`
-- SSH：`47.108.21.50`，同步目录 `/opt/wxqk/data/wx-sync/`
-- 脚本：`admin-ui/scripts/fetch-wxqk-inject-logs.py`（需 `WXQK_SSH_PASSWORD`）
+- 控制台与 SSH：见内网运维文档（勿提交明文主机与口令）
+- 脚本：`admin-ui/scripts/fetch-wxqk-inject-logs.py`（需环境变量提供凭据）
 
 ## 确认状态
 

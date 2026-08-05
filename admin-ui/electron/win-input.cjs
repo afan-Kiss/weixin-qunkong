@@ -73,7 +73,7 @@ function resolveXY(x, y) {
       y: Math.max(0, Math.min(height - 1, Math.round(yf * (height - 1)))),
     }
   }
-  // 已是绝对像素（与 facai888 一致），不再二次缩放
+  // 已是绝对像素，不再二次缩放
   return { x: Math.round(xf), y: Math.round(yf) }
 }
 

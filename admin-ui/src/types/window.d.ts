@@ -28,6 +28,7 @@ declare global {
       createTask: (payload: unknown) => Promise<unknown>
       confirmTask: (id: string) => Promise<boolean>
       pauseTask: (id: string) => Promise<boolean>
+      resumeTask: (id: string) => Promise<boolean>
       cancelTask: (id: string) => Promise<boolean>
       getSettings: () => Promise<Record<string, unknown>>
       saveSettings: (value: unknown) => Promise<Record<string, unknown>>
@@ -35,6 +36,9 @@ declare global {
       clearLogs: () => Promise<boolean>
       reportError: (message: string, details?: Record<string, unknown>) => Promise<boolean>
       syncDirectory: (payload: unknown) => Promise<boolean>
+      listBlockedChatrooms: () => Promise<Array<{ accountWxid: string; roomId: string; roomName: string; reason: string; evidence: string; sourceInstanceId: string; createdAt: string; updatedAt: string }>>
+      listBlockedRoomIds: (instanceIds: string[]) => Promise<Record<string, string[]>>
+      onBlockedDirectoryChanged: (listener: (payload: { instanceId: string; roomId: string; roomName?: string }) => void) => () => void
       listQrItems: () => Promise<unknown[]>
       importQrFiles: () => Promise<unknown[]>
       importQrLinks: (text: string) => Promise<unknown[]>
@@ -48,16 +52,24 @@ declare global {
       onQrMonitorResult: (listener: (payload: { roomName: string; detected: number; saved: number; duplicates: number; expired?: number }) => void) => () => void
       onQrMonitorRoomsChanged: (listener: (payload: { enabled: boolean; watchAll?: boolean; watchedCount: number; rooms: Array<{ instanceId: string; roomId: string; name: string }>; added?: Array<{ instanceId: string; roomId: string; name: string }>; reason?: string }) => void) => () => void
       deleteQrItems: (ids: string[]) => Promise<unknown[]>
+      updateQrItemType: (payload: { id: string; qrType: string }) => Promise<{ ok: boolean; items: unknown[] }>
       selectImage: () => Promise<string>
       pasteImage: () => Promise<{ ok: boolean; path?: string; dataUrl?: string; error?: string }>
       selectDirectory: (defaultPath?: string) => Promise<string>
       revealInFolder: (targetPath: string) => Promise<{ ok: boolean; message?: string }>
       selectWeixinExecutable: (defaultPath?: string) => Promise<string>
       detectWeixinInstall: () => Promise<{ exePath: string; version: string; source: string; candidates: Array<{ exePath: string; version: string; source: string }> }>
-      remoteStatus: () => Promise<Record<string, unknown>>
-      remoteStart: (opts?: { baseUrl?: string; account?: string }) => Promise<Record<string, unknown>>
-      remoteStop: () => Promise<Record<string, unknown>>
-      openRemoteConsole: (token: string, baseUrl?: string) => Promise<boolean>
+      cleanupKickedGroups: () => Promise<{
+        ok: boolean
+        queued?: boolean
+        taskId?: string
+        online?: number
+        rebound?: number
+        pending?: number
+        historyDiscovered?: number
+        cleaned?: number
+        message?: string
+      }>
       checkClientUpdate: () => Promise<{
         ok: boolean
         needUpdate: boolean

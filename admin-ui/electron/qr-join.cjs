@@ -72,17 +72,41 @@ function normalizeRoomName(value) {
 }
 
 /**
+ * 邀请页/接口文案是否表明「需填写申请理由 / 群主确认后才能进群」。
+ * @param {unknown} raw
+ * @returns {boolean}
+ */
+function isJoinApplicationRequired(raw) {
+  const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '')
+  if (!text) return false
+  return /请填写.{0,12}(申请|理由|验证)|填写.{0,8}进群申请|进群申请理由|群聊邀请确认|群主已启用|需要.{0,8}(群主|管理员).{0,8}(确认|同意|验证)|等待.{0,8}(群主|管理员).{0,8}(确认|同意|审核)|NeedVerify|need_verify|accessVerify|access_verify|inviteConfirm|chatroomAccessVerify/i.test(text)
+}
+
+/**
+ * 进群接口是否表示「申请已提交，等待审核」（尚未真正进群）。
+ * @param {unknown} raw
+ * @returns {boolean}
+ */
+function isJoinApplicationPending(raw) {
+  const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '')
+  if (!text) return false
+  if (isJoinApplicationRequired(raw)) return true
+  return /申请.{0,8}(已提交|成功)|已提交.{0,8}(申请|入群)|等待.{0,8}(审核|确认|同意)|群主.{0,8}(确认|同意|审核)|管理员.{0,8}(确认|同意|审核)/i.test(text)
+}
+
+/**
  * 从文本/HTML 中提取群名与人数（邀请页常见文案）。
  * @param {string} text
- * @returns {{ roomName: string, memberCount: number }}
+ * @returns {{ roomName: string, memberCount: number, needApply: boolean }}
  */
 function parseInvitePageText(text) {
   const raw = String(text || '')
-  if (!raw.trim()) return { roomName: '', memberCount: 0 }
+  if (!raw.trim()) return { roomName: '', memberCount: 0, needApply: false }
   // 无登录态时微信返回下载跳转页，不应误解析
   if (/weixin_getdownurl|getdownurl_sms|请在微信客户端打开|请在微信中打开/i.test(raw) && !/memberCount|member_count|人已加入/i.test(raw)) {
-    return { roomName: '', memberCount: 0 }
+    return { roomName: '', memberCount: 0, needApply: false }
   }
+  const needApply = isJoinApplicationRequired(raw)
 
   let memberCount = 0
   const countPatterns = [
@@ -144,7 +168,7 @@ function parseInvitePageText(text) {
     }
   }
 
-  return { roomName, memberCount }
+  return { roomName, memberCount, needApply }
 }
 
 /**
@@ -193,12 +217,13 @@ function findInviteFullUrl(raw, sourceUrl = '') {
  * 从 a8key / 进群响应 / 邀请页文本解析群预览信息。
  * @param {unknown} raw get_a8key 或 enter_room 响应
  * @param {string} [sourceUrl] 原始链接
- * @returns {{ roomId: string, roomName: string, memberCount: number, fullUrl: string, expired: boolean, rawText: string }}
+ * @returns {{ roomId: string, roomName: string, memberCount: number, fullUrl: string, expired: boolean, needApply: boolean, rawText: string }}
  */
 function parseInvitePreview(raw, sourceUrl = '') {
   const rawText = typeof raw === 'string' ? raw : JSON.stringify(raw ?? {})
   const expired = /二维码.{0,8}(?:过期|失效)|邀请.{0,8}(?:过期|失效)|链接.{0,8}(?:过期|失效)|expired|invalid|已失效/i.test(rawText)
   const roomId = findRoomId(raw)
+  let needApply = isJoinApplicationRequired(rawText)
 
   // 优先取邀请语义字段；避免 DFS 先撞到成员 nickName / 通用 name
   const nameCandidates = [
@@ -228,14 +253,16 @@ function parseInvitePreview(raw, sourceUrl = '') {
     const parsed = parseInvitePageText(bit)
     if (!roomName && parsed.roomName) roomName = parsed.roomName
     if (!memberCount && parsed.memberCount) memberCount = parsed.memberCount
-    if (roomName && memberCount) break
+    if (parsed.needApply) needApply = true
+    if (roomName && memberCount && needApply) break
   }
 
   // 整包再扫一遍（兼容 Content 被嵌套/转义）
-  if (!roomName || !memberCount) {
+  if (!roomName || !memberCount || !needApply) {
     const parsedAll = parseInvitePageText(rawText)
     if (!roomName) roomName = parsedAll.roomName
     if (!memberCount) memberCount = parsedAll.memberCount
+    if (parsedAll.needApply) needApply = true
   }
 
   const fullUrl = findInviteFullUrl(raw, sourceUrl)
@@ -245,6 +272,7 @@ function parseInvitePreview(raw, sourceUrl = '') {
     memberCount: Number.isFinite(memberCount) && memberCount > 0 ? memberCount : 0,
     fullUrl,
     expired,
+    needApply,
     rawText: rawText.slice(0, 2000),
   }
 }
@@ -261,6 +289,7 @@ function mergeInvitePreview(...parts) {
     memberCount: 0,
     fullUrl: '',
     expired: false,
+    needApply: false,
     rawText: '',
   }
   for (const part of parts) {
@@ -271,53 +300,114 @@ function mergeInvitePreview(...parts) {
     if (part.fullUrl && /addchatroombyinvite/i.test(part.fullUrl)) base.fullUrl = part.fullUrl
     else if (part.fullUrl && !base.fullUrl) base.fullUrl = part.fullUrl
     if (part.expired) base.expired = true
+    if (part.needApply) base.needApply = true
     if (part.rawText) base.rawText = String(part.rawText).slice(0, 2000)
   }
   return base
 }
 
 /**
- * 判定 enter_room 是否真正进群成功（不能仅凭 HTTP/errCode=1 + 空 data）。
+ * 判定 enter_room 接口响应（不能仅凭 HTTP/errCode=1 或扫到任意 @chatroom 就算成功）。
+ * 真正成功必须以群列表核验为准；本函数只区分硬失败 vs 待列表确认。
  * @param {boolean} responseOk HTTP 是否 2xx
  * @param {unknown} raw 响应体
- * @returns {{ ok: boolean, reason: string, roomId: string }}
+ * @returns {{ ok: boolean, hardFail: boolean, reason: string, roomId: string }}
  */
 function evaluateEnterRoomResult(responseOk, raw) {
   const text = JSON.stringify(raw ?? '')
-  if (!responseOk) return { ok: false, reason: '进群接口 HTTP 失败', roomId: '' }
-  if (/频繁|frequent|too many requests/i.test(text)) return { ok: false, reason: '已经频繁', roomId: '' }
+  if (!responseOk) return { ok: false, hardFail: true, reason: '进群接口 HTTP 失败', roomId: '', pendingApply: false }
+  if (/频繁|frequent|too many requests/i.test(text)) {
+    return { ok: false, hardFail: true, reason: '已经频繁', roomId: '', pendingApply: false }
+  }
   if (/二维码.{0,8}(?:过期|失效)|邀请.{0,8}(?:过期|失效)|已失效|expired|invalid/i.test(text)) {
-    return { ok: false, reason: '邀请已过期或无效', roomId: '' }
+    return { ok: false, hardFail: true, reason: '邀请已过期或无效', roomId: '', pendingApply: false }
   }
   const roomId = findRoomId(raw)
-  if (roomId) return { ok: true, reason: '已返回群标识', roomId }
+  const pendingApply = isJoinApplicationPending(raw)
   const data = raw && typeof raw === 'object' ? (raw.data ?? raw.Data ?? null) : null
   const emptyData = data == null
     || (typeof data === 'object' && !Array.isArray(data) && Object.keys(data).length === 0)
     || (Array.isArray(data) && data.length === 0)
   const errCode = Number(raw?.errCode ?? raw?.code ?? raw?.baseResponse?.ret)
+  if (Number.isFinite(errCode) && errCode < 0) {
+    // 部分版本用负错误码表示「需申请/等待确认」，不当硬失败
+    if (pendingApply) {
+      return { ok: false, hardFail: false, pendingApply: true, reason: '进群申请已提交，等待群主确认', roomId: roomId || '' }
+    }
+    return { ok: false, hardFail: true, reason: `进群失败（错误码 ${errCode}）`, roomId: roomId || '', pendingApply: false }
+  }
+  if (pendingApply) {
+    return { ok: false, hardFail: false, pendingApply: true, reason: '进群申请已提交，等待群主确认', roomId: roomId || '' }
+  }
+  // 响应里扫到的 roomId 只作候选，不能直接 ok=true（假成功根因）
+  if (roomId) {
+    return { ok: false, hardFail: false, pendingApply: false, reason: '接口疑似成功，待群列表确认', roomId }
+  }
   // 本项目常见空成功：errCode=1 + data:{} —— 不能算进群成功
   if (emptyData && (errCode === 1 || errCode === 0 || Number.isNaN(errCode))) {
-    return { ok: false, reason: '接口返回空结果，未确认进群（短链需先解析群资料）', roomId: '' }
+    return { ok: false, hardFail: false, pendingApply: false, reason: '接口返回空结果，待群列表确认', roomId: '' }
   }
-  if (errCode < 0) return { ok: false, reason: `进群失败（错误码 ${errCode}）`, roomId: '' }
-  // 有非空业务数据但无 roomId：记为已提交待确认，不算完成
-  if (!emptyData) return { ok: false, reason: '已提交进群申请，但未返回群标识，请到微信确认是否入群', roomId: '' }
-  return { ok: false, reason: '未能确认进群成功', roomId: '' }
+  if (!emptyData) {
+    return { ok: false, hardFail: false, pendingApply: false, reason: '已提交进群申请，待群列表确认', roomId: '' }
+  }
+  return { ok: false, hardFail: false, pendingApply: false, reason: '未能从接口确认进群，待群列表确认', roomId: '' }
 }
 
 /**
- * 生成给用户看的群预览文案。
+ * 用进群前后群列表判定是否真正新进目标群。
+ * - 有 expectedRoomId：进群前不在、进群后出现 → JOINED
+ * - 无 expectedRoomId（短链常见）：仅当恰好新增 1 个 @chatroom 才认成功，避免任意新群误判
+ * @param {Iterable<string>|Set<string>} beforeRoomIds
+ * @param {Iterable<string>|Set<string>} currentRoomIds
+ * @param {string} expectedRoomId
+ * @returns {{ status: 'JOINED'|'ALREADY_IN'|'MISSING_TARGET'|'NOT_YET', roomId: string, reason: string }}
+ */
+function confirmJoinedFromRoomList(beforeRoomIds, currentRoomIds, expectedRoomId = '') {
+  const before = beforeRoomIds instanceof Set ? beforeRoomIds : new Set(beforeRoomIds || [])
+  const current = currentRoomIds instanceof Set ? currentRoomIds : new Set(currentRoomIds || [])
+  const target = String(expectedRoomId || '').trim()
+  if (target.endsWith('@chatroom')) {
+    if (before.has(target)) {
+      return { status: 'ALREADY_IN', roomId: target, reason: '进群前已在该群中，不算本次进群成功' }
+    }
+    if (current.has(target)) {
+      return { status: 'JOINED', roomId: target, reason: '已从群列表确认进群' }
+    }
+    return { status: 'NOT_YET', roomId: target, reason: '群列表尚未出现目标群' }
+  }
+  const added = [...current].filter((id) => String(id).endsWith('@chatroom') && !before.has(id))
+  if (added.length === 1) {
+    return {
+      status: 'JOINED',
+      roomId: added[0],
+      reason: '短链未解析出群标识，但群列表恰好新增 1 个群，已确认进群',
+    }
+  }
+  if (added.length > 1) {
+    return {
+      status: 'MISSING_TARGET',
+      roomId: '',
+      reason: '无法确认目标群（缺少群标识且新增多群），不能凭任意新群判成功',
+    }
+  }
+  return {
+    status: 'NOT_YET',
+    roomId: '',
+    reason: '短链缺少群标识，群列表尚未出现新群',
+  }
+}
+
+/**
+ * 生成给用户看的群预览文案（只含群名与人数，不含 roomId）。
  * @param {{ roomName?: string, memberCount?: number, roomId?: string, fullUrl?: string, error?: string }} preview
  * @returns {string}
  */
 function formatInvitePreviewLine(preview) {
   if (!preview) return '未知群'
   if (preview.error && !preview.roomName) return `失败：${preview.error}`
-  const name = preview.roomName || '未知群名'
+  const name = String(preview.roomName || '').trim() || '未知群名'
   const count = Number(preview.memberCount) > 0 ? `${preview.memberCount} 人` : '人数未知'
-  const id = preview.roomId ? ` · ${preview.roomId}` : ''
-  return `${name}（${count}${id}）`
+  return `${name}（${count}）`
 }
 
 /**
@@ -450,6 +540,9 @@ module.exports = {
   INVITE_PAGE_USER_AGENT,
   a8keyResponseUseful,
   hasUsableInvitePreview,
+  isJoinApplicationRequired,
+  isJoinApplicationPending,
   evaluateEnterRoomResult,
+  confirmJoinedFromRoomList,
   formatInvitePreviewLine,
 }

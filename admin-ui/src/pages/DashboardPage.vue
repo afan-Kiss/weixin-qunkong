@@ -44,7 +44,9 @@ onMounted(load)
         <div class="table-wrap">
           <el-table :data="dashboardInstances" stripe height="260" style="width: 100%">
             <el-table-column prop="nickname" label="账号昵称" min-width="140" show-overflow-tooltip />
-            <el-table-column prop="accountWxid" label="微信账号" min-width="180" show-overflow-tooltip />
+            <el-table-column label="微信号" min-width="180" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.alias || row.accountWxid || '-' }}</template>
+            </el-table-column>
             <el-table-column label="登录状态" width="100">
               <template #default="{ row }"><StatusTag :text="row.loginStatus" /></template>
             </el-table-column>

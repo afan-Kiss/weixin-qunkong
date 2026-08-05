@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   --app-bg: #f4f5f7;
   --app-card: #ffffff;
   --app-border: #e6e8ec;
@@ -267,7 +267,7 @@ a {
 }
 
 /* 启动更新确认 + 进度（对齐开云） */
-.wxqk-client-update-modal {
+.app-upd-modal {
   position: fixed;
   inset: 0;
   z-index: 10000;
@@ -276,43 +276,43 @@ a {
   justify-content: center;
   background: rgba(15, 23, 42, 0.45);
 }
-.wxqk-client-update-modal[hidden] {
+.app-upd-modal[hidden] {
   display: none !important;
 }
-.wxqk-client-update-box {
+.app-upd-box {
   width: min(420px, calc(100vw - 40px));
   padding: 22px 24px 20px;
   border-radius: 12px;
   background: #fff;
   box-shadow: 0 18px 50px rgba(15, 23, 42, 0.22);
 }
-.wxqk-client-update-box h3 {
+.app-upd-box h3 {
   margin: 0 0 8px;
   font-size: 17px;
   color: #0f172a;
 }
-.wxqk-client-update-name {
+.app-upd-name {
   margin: 0 0 10px;
   font-size: 13px;
   color: #475569;
   word-break: break-all;
 }
-.wxqk-client-update-hint {
+.app-upd-hint {
   margin: 0 0 16px;
   font-size: 12px;
   line-height: 1.45;
   color: #64748b;
 }
-.wxqk-client-update-actions {
+.app-upd-actions {
   display: flex;
   gap: 10px;
   justify-content: flex-end;
 }
-.wxqk-client-update-actions[hidden],
-.wxqk-client-update-progress[hidden] {
+.app-upd-actions[hidden],
+.app-upd-progress[hidden] {
   display: none !important;
 }
-.wxqk-client-update-btn {
+.app-upd-btn {
   min-width: 96px;
   height: 34px;
   padding: 0 14px;
@@ -321,35 +321,35 @@ a {
   font-size: 13px;
   cursor: pointer;
 }
-.wxqk-client-update-btn--primary {
+.app-upd-btn--primary {
   background: #2563eb;
   color: #fff;
 }
-.wxqk-client-update-btn--primary:hover {
+.app-upd-btn--primary:hover {
   background: #1d4ed8;
 }
-.wxqk-client-update-btn--ghost {
+.app-upd-btn--ghost {
   background: #fff;
   border-color: #cbd5e1;
   color: #334155;
 }
-.wxqk-client-update-btn--ghost:hover {
+.app-upd-btn--ghost:hover {
   background: #f8fafc;
 }
-.wxqk-client-update-bar {
+.app-upd-bar {
   height: 10px;
   border-radius: 999px;
   background: #e2e8f0;
   overflow: hidden;
 }
-.wxqk-client-update-bar i {
+.app-upd-bar i {
   display: block;
   height: 100%;
   width: 0;
   background: linear-gradient(90deg, #2563eb, #38bdf8);
   transition: width 0.15s linear;
 }
-.wxqk-client-update-pct {
+.app-upd-pct {
   margin: 10px 0 4px;
   font-size: 13px;
   font-weight: 600;

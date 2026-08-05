@@ -1,5 +1,5 @@
 /**
- * 打包前版本 +1，并同步递增 wxqkReleaseSequence（对齐服务端 releaseSequence）。
+ * 打包前版本 +1，并同步递增 releaseSequence（对齐服务端 releaseSequence）。
  * - package.json 使用合法 semver：1.0.0 → 1.1.0 → 1.2.0（electron-builder 要求）
  * - 产物文件名/界面只显示一位小数：微信群控系统v1.1.exe
  * - releaseSequence：取 max(本地+1, 远端清单+1)，避免发版后客户端序号落后
@@ -7,10 +7,11 @@
 const { readFileSync, writeFileSync } = require('fs')
 const https = require('https')
 const path = require('path')
+const { getServiceBase } = require('../electron/secure-config.cjs')
 
 const pkgPath = path.join(__dirname, '..', 'package.json')
 const lockPath = path.join(__dirname, '..', 'package-lock.json')
-const MANIFEST_URL = 'https://xiangyuzhubao.xyz/wxqk/api/update/manifest'
+const MANIFEST_URL = `${getServiceBase()}/api/update/manifest`
 
 /**
  * 拉取远端 releaseSequence；失败返回 0。
@@ -50,12 +51,13 @@ async function main() {
   const next = `${major}.${nextMinor}.0`
   const display = `${major}.${nextMinor}`
 
-  const localSeq = Number(pkg.wxqkReleaseSequence || 0) || 0
+  const localSeq = Number(pkg.releaseSequence || pkg.wxqkReleaseSequence || 0) || 0
   const remoteSeq = await fetchRemoteReleaseSequence()
   const nextSeq = Math.max(localSeq + 1, remoteSeq + 1, 1)
 
   pkg.version = next
-  pkg.wxqkReleaseSequence = nextSeq
+  pkg.releaseSequence = nextSeq
+  delete pkg.wxqkReleaseSequence
   if (!pkg.build) pkg.build = {}
   if (!pkg.build.win) pkg.build.win = {}
   pkg.build.win.artifactName = `微信群控系统v${display}.\${ext}`
@@ -66,9 +68,8 @@ async function main() {
     lock.version = next
     if (lock.packages && lock.packages['']) {
       lock.packages[''].version = next
-      if ('wxqkReleaseSequence' in (lock.packages[''] || {})) {
-        lock.packages[''].wxqkReleaseSequence = nextSeq
-      }
+      lock.packages[''].releaseSequence = nextSeq
+      delete lock.packages[''].wxqkReleaseSequence
     }
     writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8')
   } catch { /* lock 可选 */ }

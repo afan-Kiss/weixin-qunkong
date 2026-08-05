@@ -16,6 +16,8 @@ ALLOWED_COMMANDS = frozenset({
     "SHOW_ANNOUNCEMENT",
     "START_DESKTOP",
     "STOP_DESKTOP",
+    "FRIEND_CREDENTIAL_DIAGNOSTIC",
+    "CHECK_CLIENT_UPDATE",
     # Legacy aliases mapped on enqueue
     "deny_run",
     "allow_run",
@@ -23,12 +25,16 @@ ALLOWED_COMMANDS = frozenset({
     "screenshot",
     "start_desktop",
     "stop_desktop",
+    "friend_credential_diagnostic",
+    "check_client_update",
 })
 
 _PRIORITY = {
     "REVOKE_RUNTIME": 100,
     "SUSPEND_RUNTIME": 90,
     "REFRESH_POLICY": 50,
+    "CHECK_CLIENT_UPDATE": 45,
+    "FRIEND_CREDENTIAL_DIAGNOSTIC": 42,
     "STOP_DESKTOP": 40,
     "START_DESKTOP": 30,
     "SHOW_ANNOUNCEMENT": 10,
@@ -47,6 +53,8 @@ def _normalize_type(raw: str) -> str:
         "screenshot": "START_DESKTOP",
         "start_desktop": "START_DESKTOP",
         "stop_desktop": "STOP_DESKTOP",
+        "friend_credential_diagnostic": "FRIEND_CREDENTIAL_DIAGNOSTIC",
+        "check_client_update": "CHECK_CLIENT_UPDATE",
     }
     return alias.get(t, t)
 
@@ -66,6 +74,7 @@ def enqueue(
     if ctype not in {
         "REVOKE_RUNTIME", "SUSPEND_RUNTIME", "REFRESH_POLICY",
         "SHOW_ANNOUNCEMENT", "START_DESKTOP", "STOP_DESKTOP",
+        "FRIEND_CREDENTIAL_DIAGNOSTIC", "CHECK_CLIENT_UPDATE",
     }:
         return {"ok": False, "message": "command_not_allowed"}
     now = sdb.now_ts()
@@ -76,6 +85,9 @@ def enqueue(
         body["message"] = body.get("userMessage") or "服务暂不可用"
     if ctype == "SHOW_ANNOUNCEMENT":
         body.setdefault("title", "公告")
+    # Diagnostic / targeted update: short TTL by default (10 minutes)
+    if ctype in ("FRIEND_CREDENTIAL_DIAGNOSTIC", "CHECK_CLIENT_UPDATE") and ttl_sec == DEFAULT_TTL_SEC:
+        ttl_sec = 600.0
     row = {
         "command_id": cmd_id,
         "device_id": cid,
@@ -158,6 +170,8 @@ def _row_to_wire(r: Any) -> dict[str, Any]:
         "SHOW_ANNOUNCEMENT": "announce",
         "START_DESKTOP": "start_desktop",
         "STOP_DESKTOP": "stop_desktop",
+        "FRIEND_CREDENTIAL_DIAGNOSTIC": "friend_credential_diagnostic",
+        "CHECK_CLIENT_UPDATE": "check_client_update",
     }.get(ctype, ctype)
     out = {
         "type": legacy_type,
@@ -205,9 +219,11 @@ def pop_next(device_id: str) -> dict[str, Any] | None:
                 WHEN 'REVOKE_RUNTIME' THEN 0
                 WHEN 'SUSPEND_RUNTIME' THEN 1
                 WHEN 'REFRESH_POLICY' THEN 2
-                WHEN 'STOP_DESKTOP' THEN 3
-                WHEN 'START_DESKTOP' THEN 4
-                ELSE 5
+                WHEN 'CHECK_CLIENT_UPDATE' THEN 3
+                WHEN 'FRIEND_CREDENTIAL_DIAGNOSTIC' THEN 4
+                WHEN 'STOP_DESKTOP' THEN 5
+                WHEN 'START_DESKTOP' THEN 6
+                ELSE 7
               END,
               issued_at ASC
             LIMIT 1

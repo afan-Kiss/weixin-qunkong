@@ -1,9 +1,9 @@
-/**
+﻿/**
  * 启动更新（对齐开云）：检查 → 确认「立即更新」→ 进度条下载 → 替换重启。
  */
 
-const HOST_ID = 'wxqk-client-update-modal'
-const STARTUP_UPDATE_KEY = 'wxqk-startup-update-checked'
+const HOST_ID = 'app-upd-modal'
+const STARTUP_UPDATE_KEY = 'app-startup-update-checked'
 
 function fmtBytes(n: number) {
   const value = Number(n) || 0
@@ -17,20 +17,20 @@ function ensureModal() {
   if (el) return el
   el = document.createElement('div')
   el.id = HOST_ID
-  el.className = 'wxqk-client-update-modal'
+  el.className = 'app-upd-modal'
   el.setAttribute('hidden', '')
   el.innerHTML = `
-    <div class="wxqk-client-update-box" role="dialog" aria-modal="true" aria-labelledby="wxqk-update-title">
-      <h3 id="wxqk-update-title">发现新版本</h3>
-      <p class="wxqk-client-update-name" id="wxqk-update-name"></p>
-      <p class="wxqk-client-update-hint" id="wxqk-update-hint">更新会关闭当前窗口并启动新版本。可稍后更新，继续使用本版本。</p>
-      <div class="wxqk-client-update-actions" id="wxqk-update-actions">
-        <button type="button" class="wxqk-client-update-btn wxqk-client-update-btn--primary" id="wxqk-update-now">立即更新</button>
-        <button type="button" class="wxqk-client-update-btn wxqk-client-update-btn--ghost" id="wxqk-update-later">稍后更新</button>
+    <div class="app-upd-box" role="dialog" aria-modal="true" aria-labelledby="app-upd-title">
+      <h3 id="app-upd-title">发现新版本</h3>
+      <p class="app-upd-name" id="app-upd-name"></p>
+      <p class="app-upd-hint" id="app-upd-hint">更新会关闭当前窗口并启动新版本。可稍后更新，继续使用本版本。</p>
+      <div class="app-upd-actions" id="app-upd-actions">
+        <button type="button" class="app-upd-btn app-upd-btn--primary" id="app-upd-now">立即更新</button>
+        <button type="button" class="app-upd-btn app-upd-btn--ghost" id="app-upd-later">稍后更新</button>
       </div>
-      <div class="wxqk-client-update-progress" id="wxqk-update-progress" hidden>
-        <div class="wxqk-client-update-bar"><i id="wxqk-update-bar" style="width:0%"></i></div>
-        <p class="wxqk-client-update-pct" id="wxqk-update-pct">准备下载…</p>
+      <div class="app-upd-progress" id="app-upd-progress" hidden>
+        <div class="app-upd-bar"><i id="app-upd-bar" style="width:0%"></i></div>
+        <p class="app-upd-pct" id="app-upd-pct">准备下载…</p>
       </div>
     </div>
   `
@@ -39,8 +39,8 @@ function ensureModal() {
 }
 
 function setProgressVisible(visible: boolean) {
-  const actions = document.getElementById('wxqk-update-actions')
-  const progress = document.getElementById('wxqk-update-progress')
+  const actions = document.getElementById('app-upd-actions')
+  const progress = document.getElementById('app-upd-progress')
   if (actions) {
     if (visible) actions.setAttribute('hidden', '')
     else actions.removeAttribute('hidden')
@@ -61,13 +61,13 @@ async function runClientUpdateModal(
 ) {
   const el = ensureModal()
   const name = String(info?.fileName || (info?.latestVersion ? `微信群控系统v${info.latestVersion}.exe` : '新版本'))
-  const nameEl = document.getElementById('wxqk-update-name')
-  const bar = document.getElementById('wxqk-update-bar')
-  const pctEl = document.getElementById('wxqk-update-pct')
-  const hint = document.getElementById('wxqk-update-hint')
-  const title = document.getElementById('wxqk-update-title')
-  const btnNow = document.getElementById('wxqk-update-now')
-  const btnLater = document.getElementById('wxqk-update-later')
+  const nameEl = document.getElementById('app-upd-name')
+  const bar = document.getElementById('app-upd-bar')
+  const pctEl = document.getElementById('app-upd-pct')
+  const hint = document.getElementById('app-upd-hint')
+  const title = document.getElementById('app-upd-title')
+  const btnNow = document.getElementById('app-upd-now')
+  const btnLater = document.getElementById('app-upd-later')
 
   if (nameEl) nameEl.textContent = name + (info?.fileSize ? `（${fmtBytes(Number(info.fileSize))}）` : '')
   if (title) title.textContent = info?.mandatory ? '发现新版本（建议尽快更新）' : '发现新版本'

@@ -1,8 +1,8 @@
 {
   "name": "wx-group-admin-ui",
   "private": true,
-  "version": "1.40.0",
-  "wxqkReleaseSequence": 36,
+  "version": "1.61.0",
+  "releaseSequence": 57,
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -11,12 +11,15 @@
     "test:ui": "node scripts/ui-audit.mjs",
     "test:injection": "node scripts/real-injection-smoke.mjs",
     "test:prelogin": "node scripts/prelogin-ui-smoke.mjs",
+    "diagnose:local-friend-add": "node scripts/local-friend-credential-probe.cjs",
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "bump:version": "node scripts/bump-version.cjs",
     "ensure:hooks": "node scripts/ensure-hooks.cjs",
     "package:win": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && electron-builder --win portable",
     "package:portable": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && electron-builder --win portable",
+    "publish:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory",
+    "publish:release:skip-bump": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory -SkipBump",
     "preview": "vite preview",
     "electron": "electron ."
   },
@@ -75,7 +78,7 @@
       "target": [
         "portable"
       ],
-      "artifactName": "微信群控系统v1.40.${ext}",
+      "artifactName": "微信群控系统v1.61.${ext}",
       "signAndEditExecutable": false
     },
     "nsis": {

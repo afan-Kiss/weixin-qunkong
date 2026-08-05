@@ -12,14 +12,17 @@ test('QR account limit and cooldown are passed into execution', () => {
   assert.match(page, /limitPerAccount:\s*limitPerAccount\.value/)
   assert.match(page, /coolMinutes:\s*coolMinutes\.value/)
   assert.match(page, /applyText:\s*applyText\.value/)
+  assert.match(page, /你好，想加入群聊/)
+  assert.match(page, /需群主确认的群必须填写/)
   assert.match(page, /skipPersonal:\s*skipPersonal\.value/)
-  assert.match(page, /saveContact:\s*saveContact\.value/)
+  assert.match(main, /DEFAULT_QR_APPLY_TEXT/)
+  assert.match(main, /requestSent/)
   assert.match(main, /task\?\.config\?\.coolMinutes/)
   assert.match(main, /applyQrOptions\(record, task, item, decodedText, taskId\)/)
   assert.match(main, /reserveQrJoinDailyAttempt/)
 })
 
-test('group start, count and exclusion rules filter members before profile requests', () => {
+test('group start, count and exclusion rules filter members before task creation', () => {
   const page = read('src/pages/GroupsMembersPage.vue')
   assert.match(page, /function filterCandidates/)
   assert.match(page, /excludeText\.value\.split/)
@@ -28,16 +31,17 @@ test('group start, count and exclusion rules filter members before profile reque
   const body = page.slice(page.indexOf('async function createAddFriendTask'), page.indexOf('async function collectLatestMembers'))
   assert.match(body, /const candidates = filterCandidates/)
   assert.match(body, /for \(const member of candidates\)/)
-  assert.match(body, /resolveFriendCredentials\(instance, member\.wxid, member\.roomId\)/)
+  assert.match(body, /status: 'PROFILE_PENDING'/)
+  assert.doesNotMatch(body, /resolveFriendCredentials/)
 })
 
-test('scheduled and weighted broadcast options affect task creation and execution', () => {
+test('scheduled broadcast options and per-row sender binding affect task creation', () => {
   const page = read('src/pages/BroadcastPage.vue')
   const main = read('electron/main.cjs')
   assert.match(page, /v-model="scheduledAt" type="datetime"/)
-  assert.match(page, /eligible = available\.filter\(\(item\) => target\.sourceInstanceIds\.includes\(item\.id\)\)/)
-  assert.match(page, /allocationPool = eligible\.flatMap/)
-  assert.match(page, /accountWeights\.value\[item\.id\]/)
+  assert.match(page, /selectedInstanceIds/)
+  assert.match(page, /instanceId: String\(target\.sourceInstanceId\)/)
+  assert.doesNotMatch(page, /allocationPool|accountWeights|allocMode/)
   assert.match(main, /task\?\.config\?\.scheduledAt/)
   assert.match(main, /waitForTaskTime\(taskId, scheduledAt\)/)
 })
@@ -45,8 +49,8 @@ test('scheduled and weighted broadcast options affect task creation and executio
 test('send retry uses configured count and delay but stops on uncertain results', () => {
   const page = read('src/pages/BroadcastPage.vue')
   const main = read('electron/main.cjs')
-  assert.match(page, /retryMinutes: retryMinutes\.value/)
-  assert.match(page, /skipSame: skipSame\.value/)
+  assert.match(page, /retryMinutes: Number\(retryMinutes\.value\)/)
+  assert.match(page, /skipSame: Boolean\(skipSame\.value\)/)
   assert.match(main, /task\?\.config\?\.autoRetry/)
   assert.match(main, /task\.config\.retryTimes/)
   assert.match(main, /task\?\.config\?\.retryMinutes/)

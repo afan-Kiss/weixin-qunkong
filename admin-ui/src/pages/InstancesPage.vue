@@ -29,7 +29,7 @@ function instanceDisplayName(item: WechatInstance) {
   return '待登录微信'
 }
 
-const filteredInstances = computed(() => instances.value.filter((item) => (activeFilter.value === '全部' || statusLabel(item.status) === activeFilter.value) && (!keyword.value || `${item.nickname ?? ''} ${item.accountWxid ?? ''} ${item.id}`.toLowerCase().includes(keyword.value.toLowerCase()))))
+const filteredInstances = computed(() => instances.value.filter((item) => (activeFilter.value === '全部' || statusLabel(item.status) === activeFilter.value) && (!keyword.value || `${item.nickname ?? ''} ${item.alias ?? ''} ${item.accountWxid ?? ''} ${item.id}`.toLowerCase().includes(keyword.value.toLowerCase()))))
 const current = computed(() => instances.value.find((i) => i.id === selectedId.value) || instances.value[0])
 let timer: ReturnType<typeof setInterval> | undefined
 let polling = false
@@ -135,7 +135,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer) })
 
       <DetailPanel v-if="current" :title="`${instanceDisplayName(current)}详情`">
         <div class="field-grid">
-          <div class="field-item"><div class="label">微信账号</div><div class="value">{{ current.accountWxid || '登录后显示' }}</div></div>
+          <div class="field-item"><div class="label">微信号</div><div class="value">{{ current.alias || current.accountWxid || '登录后显示' }}</div></div>
           <div class="field-item"><div class="label">微信昵称</div><div class="value">{{ current.nickname || '登录后显示' }}</div></div>
           <div class="field-item"><div class="label">运行状态</div><div class="value">{{ statusLabel(current.status) }}</div></div>
         </div>

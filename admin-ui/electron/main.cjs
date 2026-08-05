@@ -12,11 +12,13 @@ const net = require('net')
 const http = require('http')
 const https = require('https')
 const path = require('path')
-const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, saveApiSample, saveEvent, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, hasQrContentHash } = require('./storage.cjs')
-const { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, hasFrequentEvidence, isVerifiedSuccess, evaluateFriendAddResult } = require('./protocol.cjs')
+const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms, markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, listBlockedChatrooms, hasQrContentHash } = require('./storage.cjs')
+const { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, hasFrequentEvidence, isVerifiedSuccess, buildAddFriendRequest, evaluateFriendAddResult, isRetryableFriendCredentialFailure } = require('./protocol.cjs')
 const { createSerialExecutor, parseInjectorOutput, decodeInjectorChunks, waitForInjectorClose } = require('./instance-runtime.cjs')
 const { rawErrorMessage, toUserErrorMessage } = require('./user-error.cjs')
 const { parseProfileCredentials, rawStructure } = require('./friend-profile.cjs')
+const { resolveFriendProfileCredentials } = require('./friend-credential-resolve.cjs')
+const { runFriendCredentialDiagnostic } = require('./friend-credential-diagnostic.cjs')
 const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
 const softwareAuth = require('./software-auth.cjs')
 const { safeFolderName, classifyQrText, qrTypeLabel, contentHash, messageTableName, rowsFromApi, valueOf, fieldString, existingImagePath, cdnDownloadRequest, downloadRequest, decodeNativeImages, accurateFileName, prepareHistoryMessageRow, yieldMain, normalizeQrText } = require('./qr-collector.cjs')
@@ -28,10 +30,14 @@ const {
   hasUsableInvitePreview,
   a8keyResponseUseful,
   evaluateEnterRoomResult,
+  confirmJoinedFromRoomList,
   formatInvitePreviewLine,
   findRoomId,
+  isJoinApplicationPending,
 } = require('./qr-join.cjs')
 const { mergeMonitorRooms, extractRoomsFromApiRaw } = require('./qr-monitor-rooms.cjs')
+const { extractSelfKickedEvent, resolveSelfStillInMembers, canCleanupKickedRoom, isImmediateKickEvidence, isLeaveCallbackEvidence, kickHitFromHistoryMessage } = require('./kicked-group-cleanup.cjs')
+const { scrubLegacyCachesOnStartup } = require('./startup-cache-scrub.cjs')
 
 /** 历史采集进行中标记，防止重复点击叠任务把主进程拖死 */
 let historyCollectRunning = false
@@ -71,6 +77,7 @@ const {
   ipcCheckClientUpdate,
   ipcApplyClientUpdate,
   markStartupUpdateDone,
+  resolvePortableExePath,
 } = require('./client-updater.cjs')
 const { safeCloneForIpc } = require('./ipc-safe.cjs')
 
@@ -131,6 +138,9 @@ const QR_MONITOR_SYNC_INTERVAL_MS = 45000
 let qrMonitorSyncTimer = undefined
 let qrMonitorSyncRunning = false
 const qrValidityCache = new Map()
+
+/** 被踢群清理：扫描历史并创建任务时防重入（真正退出在任务中心执行） */
+let kickedGroupCleanupPreparing = false
 
 /**
  * 重建监控群索引（开启/恢复配置时调用）。
@@ -234,6 +244,7 @@ async function syncQrMonitorRoomsFromWechat(reason = '同步群列表') {
           ...extractRoomsFromApiRaw(detailRes.response.ok ? detailRes.raw : null),
         ]
         for (const row of rows) {
+          if (isChatroomBlockedForInstance(record.id, row.roomId)) continue
           incoming.push({ instanceId: record.id, roomId: row.roomId, name: row.name })
         }
       } catch (error) {
@@ -383,7 +394,147 @@ function remoteAgentOptions(account, baseUrl = DEFAULT_BASE) {
       if (mainWindow && !mainWindow.isDestroyed()) await dialog.showMessageBox(mainWindow, { type: 'info', title: String(message?.title || '公告'), message: String(message?.text || '管理员发送了一条公告') })
     },
     getSyncSnapshot: () => remoteSyncSnapshot(),
+    onFriendCredentialDiagnostic: async (message) => {
+      await handleFriendCredentialDiagnosticCommand(message)
+    },
+    onCheckClientUpdate: async (message) => {
+      await handleRemoteCheckClientUpdate(message)
+    },
   }
+}
+
+const diagnosticIdempotency = new Set()
+
+async function postDiagnosticReport(baseUrl, report) {
+  const url = `${String(baseUrl || DEFAULT_BASE).replace(/\/$/, '')}/api/friend-diagnostic/report`
+  const body = JSON.stringify(report)
+  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal: AbortSignal.timeout(30000) })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok || data?.ok === false) throw new Error(data?.message || `diagnostic report HTTP ${response.status}`)
+  return data
+}
+
+async function handleFriendCredentialDiagnosticCommand(message) {
+  const payload = {
+    diagnosticId: String(message.diagnosticId || message.payload?.diagnosticId || randomUUID()),
+    targetClientId: String(message.targetClientId || message.payload?.targetClientId || ''),
+    targetInstanceId: String(message.targetInstanceId || message.payload?.targetInstanceId || ''),
+    targetAccountWxid: String(message.targetAccountWxid || message.payload?.targetAccountWxid || ''),
+    roomId: String(message.roomId || message.payload?.roomId || ''),
+    memberUserName: String(message.memberUserName || message.payload?.memberUserName || ''),
+    expectedNickname: String(message.expectedNickname || message.payload?.expectedNickname || ''),
+    dryRun: message.dryRun !== false && message.payload?.dryRun !== false,
+    allowSingleAddFriendAfterVerified: Boolean(message.allowSingleAddFriendAfterVerified || message.payload?.allowSingleAddFriendAfterVerified),
+    expiresAt: String(message.expiresAt || message.payload?.expiresAt || ''),
+    idempotencyKey: String(message.idempotencyKey || message.payload?.idempotencyKey || ''),
+  }
+  if (payload.idempotencyKey) {
+    if (diagnosticIdempotency.has(payload.idempotencyKey)) {
+      appLog('WARN', 'FRIEND_CREDENTIAL_DIAGNOSTIC 幂等跳过', { module: '凭证诊断', idempotencyKey: payload.idempotencyKey })
+      return
+    }
+    diagnosticIdempotency.add(payload.idempotencyKey)
+  }
+  const selfId = String(getRemoteAgentStatus()?.clientId || '')
+  if (payload.targetClientId && selfId && payload.targetClientId !== selfId) {
+    throw new Error('targetClientId 与本机不符')
+  }
+  const record = [...instances.values()].find((item) => item.id === payload.targetInstanceId)
+    || [...instances.values()].find((item) => String(item.accountWxid || '') === payload.targetAccountWxid && item.status === 'ONLINE')
+  let dllPath = ''
+  let dllSha256 = ''
+  try {
+    const hookDll = path.join(process.resourcesPath || '', 'hook', '4.1.8.27', 'libGLESv1.dll')
+    const candidates = [record?.dllPath, hookDll].filter(Boolean)
+    for (const candidate of candidates) {
+      if (candidate && existsSync(candidate)) {
+        dllPath = candidate
+        dllSha256 = createHash('sha256').update(readFileSync(candidate)).digest('hex')
+        break
+      }
+    }
+  } catch { /* ignore */ }
+  const wechatVersion = String(record?.weixinVersion || record?.wechatVersion || '')
+  const report = await runFriendCredentialDiagnostic({
+    requestApi,
+    record: record || { id: '', accountWxid: '', status: 'OFFLINE', apiPort: 0 },
+    payload,
+    clientMeta: {
+      clientId: selfId || payload.targetClientId,
+      clientVersion: VERSION,
+      wechatVersion,
+      dllPath,
+      dllSha256,
+    },
+  })
+  try {
+    const dir = path.join(app.getPath('userData'), 'friend-diagnostics')
+    mkdirSync(dir, { recursive: true })
+    const line = `${JSON.stringify({ t: new Date().toISOString(), ...report })}\n`
+    appendFileSync(path.join(dir, 'diagnostics.jsonl'), line, 'utf8')
+    writeFileSync(path.join(dir, `${report.diagnosticId || Date.now()}.json`), JSON.stringify(report, null, 2), 'utf8')
+  } catch (error) {
+    appLog('WARN', '诊断结果本地落盘失败', { module: '凭证诊断', error: rawErrorMessage(error) })
+  }
+  appLog('INFO', 'FRIEND_CREDENTIAL_DIAGNOSTIC 完成', {
+    module: '凭证诊断',
+    diagnosticId: report.diagnosticId,
+    finalClassification: report.finalClassification,
+    credentialSource: report.credentialSource,
+    elapsedMs: report.elapsedMs,
+    probeCount: Array.isArray(report.probes) ? report.probes.length : 0,
+  })
+  // 同步关键字段进 sqlite 日志，便于 wx_sync
+  for (const probe of report.probes || []) {
+    appLog('INFO', '凭证诊断探针', {
+      module: '凭证诊断',
+      operation: 'FRIEND_CREDENTIAL_DIAGNOSTIC',
+      diagnosticId: report.diagnosticId,
+      endpoint: probe.endpoint,
+      requestBodyWxid: probe.requestWxid,
+      requestBodyRoomId: probe.requestRoomId,
+      httpStatus: probe.httpStatus,
+      baseRet: probe.baseRet,
+      contactCount: probe.contactCount,
+      matchedContact: probe.matchedTarget,
+      hasV3: probe.hasV3,
+      v3Prefix: probe.v3Prefix,
+      v3Length: probe.v3Length,
+      hasV4: probe.hasV4,
+      v4Prefix: probe.v4Prefix,
+      v4Length: probe.v4Length,
+      rawPreview: probe.rawPreview,
+      elapsedMs: probe.elapsedMs,
+      parserVersion: 'friend-credential-diagnostic-v1',
+      accountWxid: report.accountWxid,
+      targetWxid: report.targetUserName,
+      roomId: report.roomId,
+      instanceId: report.instanceId,
+      instancePort: report.instancePort,
+      clientVersion: report.clientVersion,
+      wechatVersion: report.wechatVersion,
+      dllSha256: report.dllSha256,
+      finalClassification: report.finalClassification,
+    })
+  }
+  await postDiagnosticReport(DEFAULT_BASE, report)
+}
+
+async function handleRemoteCheckClientUpdate(message) {
+  const selfId = String(getRemoteAgentStatus()?.clientId || '')
+  appLog('INFO', '收到定向更新命令', { module: '软件更新', commandId: message?.commandId || message?.id, clientId: selfId })
+  const result = await ipcApplyClientUpdate({
+    app,
+    baseUrl: UPDATE_BASE,
+    currentBuild: BUILD_ID,
+    currentVersion: VERSION,
+    currentReleaseSequence: RELEASE_SEQUENCE,
+    clientId: selfId,
+    isPackaged: app.isPackaged,
+    allowRemoteForce: true,
+    onLog: (level, msg, details) => appLog(level, msg, details),
+  })
+  if (!result?.ok) throw new Error(result?.message || '定向更新未执行')
 }
 
 function requireRuntime() { if (!runtimeAllowed) throw new Error('管理员已暂停软件运行，请联系管理员') }
@@ -507,11 +658,14 @@ const apiOperationLabels = {
   '/api/send_text_msg': '发送文字消息', '/api/send_image_msg': '发送图片消息', '/api/add_friend': '添加好友',
   '/api/get_contact_list2': '读取好友列表', '/api/get_chatroom_list': '读取群聊列表', '/api/batch_getroom_cache': '读取群聊资料', '/api/get_all_room_detail': '读取全量群详情',
   '/api/get_room_members': '读取群成员', '/api/get_group_member_contact': '读取群成员资料', '/api/save_chatroom_to_contact': '保存群聊到通讯录',
+  '/api/remov_chatroom_to_contact': '取消群聊通讯录', '/api/quit_and_del_chat_room': '清除群聊会话',
   '/api/check_login': '检测微信登录状态', '/api/get_profile_cache': '读取微信资料',
-  '/api/qrscan': '识别二维码', '/api/get_db_handle': '读取消息库', '/api/sqlite3_exec': '读取群聊历史', '/api/download_img': '下载历史图片', '/api/cdn_download': '下载高清原图', '/api/get_a8key': '验证二维码有效期',
+  '/api/qrscan': '识别二维码', '/api/get_db_handle': '读取消息库', '/api/sqlite3_exec': '读取群聊历史', '/api/download_img': '下载历史图片', '/api/cdn_download': '下载高清原图', '/api/get_a8key': '验证二维码有效期', '/api/enter_room': '提交进群申请',
 }
 
 const DEFAULT_FRIEND_VERIFY_CONTENT = '你好，我是群里的朋友'
+/** 需群主确认的群二维码：申请理由为空时用此默认文案，避免空 msg 导致无法提交 */
+const DEFAULT_QR_APPLY_TEXT = '你好，想加入群聊'
 
 function apiOperationLabel(apiPath) {
   return apiOperationLabels[apiPath] || '执行微信功能'
@@ -852,6 +1006,10 @@ function handleChatAddFriendEvent(record, event) {
     }
     return { accepted: false, reason }
   }
+  if (isChatroomBlockedForInstance(record.id, matched.hit.roomId)
+    || (record.accountWxid && isChatroomBlocked(record.accountWxid, matched.hit.roomId))) {
+    return { accepted: false, reason: 'BLOCKED_KICKED_ROOM' }
+  }
   const saved = upsertChatAddCandidate({
     ...matched.hit,
     sourceInstancePort: record.apiPort,
@@ -871,6 +1029,707 @@ function handleChatAddFriendEvent(record, event) {
     }
   }
   return saved
+}
+
+
+/**
+ * 从本机通讯录缓存解析群昵称。
+ * @param {string} instanceId
+ * @param {string} roomId
+ * @param {string} [fallback]
+ */
+function resolveKickRoomLabel(instanceId, roomId, fallback = '') {
+  const raw = String(fallback || '').trim()
+  if (raw && raw !== '群聊' && raw !== '未命名群聊') return raw
+  try {
+    const hit = listOwnedChatrooms(instanceId).find((row) => String(row.roomId || '') === String(roomId || ''))
+    const name = String(hit?.name || '').trim()
+    if (name) return name
+  } catch { /* ignore */ }
+  return raw || '未命名群聊'
+}
+
+/**
+ * @param {string} evidence
+ */
+function kickEvidenceStatusLabel(evidence) {
+  const value = String(evidence || '')
+  if (value === 'SYSTEM_MSG_SELF_KICKED') return '已被踢（系统通知）'
+  if (value === 'LEAVE_CALLBACK_SELF') return '疑似被踢（退群回调）'
+  return '待确认被踢'
+}
+
+/**
+ * 统一被踢清理日志文案：群昵称 + 被踢状态 + 退出结果。
+ * @param {{ roomName?: string, evidence?: string, kickStatus?: string, result: string }} input
+ */
+function formatKickCleanupMessage(input) {
+  const roomName = String(input.roomName || '未命名群聊').trim() || '未命名群聊'
+  const kickStatus = String(input.kickStatus || kickEvidenceStatusLabel(input.evidence) || '待确认被踢').trim()
+  const result = String(input.result || '').trim() || '-'
+  return `群昵称：${roomName}｜被踢状态：${kickStatus}｜退出结果：${result}`
+}
+
+function notifyDirectoryBlockedChanged(instanceId, roomId, roomName) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    try {
+      win.webContents.send('directory:blocked-changed', {
+        instanceId, roomId, roomName: roomName || '',
+      })
+    } catch { /* ignore */ }
+  }
+}
+
+/**
+ * TCP 回调：系统消息「你被…移出群聊」或退群回调含本人 → 登记后走清理。
+ * 别人退群 / 普通聊天复读一律忽略。退群回调还会再核验成员列表，防止误退。
+ * @param {{ id: string, accountWxid?: string }} record
+ * @param {unknown} event
+ */
+function handleKickedGroupEvent(record, event) {
+  const hit = extractSelfKickedEvent(event, record.accountWxid || '')
+  if (!hit) return
+  const accountWxid = String(record.accountWxid || '').trim()
+  if (accountWxid && isChatroomBlocked(accountWxid, hit.roomId)) return
+  const roomName = resolveKickRoomLabel(record.id, hit.roomId, hit.roomName || '')
+  hit.roomName = roomName
+  upsertKickedGroupPending({
+    instanceId: record.id,
+    roomId: hit.roomId,
+    accountWxid,
+    roomName,
+    evidence: hit.evidence,
+    evidenceStrength: hit.strength,
+  })
+  appLog('INFO', formatKickCleanupMessage({
+    roomName,
+    evidence: hit.evidence,
+    result: '已登记待清理，请到「日志与设置」创建任务后在任务中心确认执行',
+  }), {
+    instanceId: record.id,
+    module: '被踢群清理',
+    operation: '登记',
+    roomId: hit.roomId,
+    roomName,
+    evidence: hit.evidence,
+    kickStatus: kickEvidenceStatusLabel(hit.evidence),
+    result: '已登记待清理',
+  })
+}
+
+/**
+ * 判断取消通讯录/清会话类接口是否业务成功。
+ * @param {boolean} httpOk
+ * @param {unknown} raw
+ */
+function isContactRoomMutationOk(httpOk, raw) {
+  if (!httpOk) return false
+  if (raw == null || typeof raw !== 'object') return true
+  const body = /** @type {Record<string, unknown>} */ (raw)
+  const code = Number(body.errCode ?? body.code ?? body.ret ?? body?.baseResponse?.ret)
+  if (Number.isFinite(code) && code !== 0 && code !== 1) return false
+  const msg = String(body.errMsg ?? body.message ?? body.msg ?? '').toLowerCase()
+  if (/fail|error|失败|无效|不存在/.test(msg) && !/成功|success/.test(msg)) return false
+  return true
+}
+
+
+/**
+ * 从本机已落库事件 + 微信群聊历史系统消息中发现被踢群，登记为 PENDING。
+ * @param {{ id: string, accountWxid?: string }} record
+ * @returns {Promise<{ localHits: number, historyHits: number, roomsScanned: number }>}
+ */
+async function discoverKickedGroupsFromHistory(record) {
+  const accountWxid = String(record.accountWxid || '').trim()
+  let localHits = 0
+  let historyHits = 0
+  let roomsScanned = 0
+  const seenRooms = new Set()
+
+  const registerHit = (hit, source) => {
+    if (!hit?.roomId || seenRooms.has(hit.roomId)) return false
+    if (accountWxid && isChatroomBlocked(accountWxid, hit.roomId)) return false
+    seenRooms.add(hit.roomId)
+    const roomName = resolveKickRoomLabel(record.id, hit.roomId, hit.roomName || '')
+    hit.roomName = roomName
+    upsertKickedGroupPending({
+      instanceId: record.id,
+      roomId: hit.roomId,
+      accountWxid,
+      roomName,
+      evidence: hit.evidence,
+      evidenceStrength: hit.strength || 'strong',
+    })
+    appLog('INFO', formatKickCleanupMessage({
+      roomName,
+      evidence: hit.evidence,
+      result: `历史扫描已登记（${source}）`,
+    }), {
+      instanceId: record.id,
+      module: '被踢群清理',
+      operation: '历史扫描',
+      roomId: hit.roomId,
+      roomName,
+      evidence: hit.evidence,
+      kickStatus: kickEvidenceStatusLabel(hit.evidence),
+      result: `已登记（${source}）`,
+    })
+    return true
+  }
+
+  // 1) 本软件已落库的 TCP 回调/消息事件（按实例过滤，避免串号）
+  try {
+    const rows = listMessageEventsForKickScan({ instanceId: record.id, limit: 8000 })
+    for (const row of rows) {
+      let event
+      try { event = JSON.parse(String(row.eventJson || '{}')) } catch { continue }
+      const hit = extractSelfKickedEvent(event, accountWxid)
+      if (hit && registerHit(hit, '本地事件')) localHits += 1
+    }
+  } catch (error) {
+    appLog('WARN', '扫描本地消息事件失败', {
+      instanceId: record.id, module: '被踢群清理', error: rawErrorMessage(error),
+    })
+  }
+
+  // 2) 微信消息库：只看每个群「最近 10 条」里的系统通知（10000/10002），不扫用户发言
+  const HISTORY_TAIL = 10
+  try {
+    const [listRes, detailRes] = await Promise.all([
+      requestApi(record, '/api/get_chatroom_list', {}, 30000),
+      requestApi(record, '/api/get_all_room_detail', {}, 90000),
+    ])
+    const roomMap = new Map()
+    for (const row of [
+      ...extractRoomsFromApiRaw(listRes.response.ok ? listRes.raw : null),
+      ...extractRoomsFromApiRaw(detailRes.response.ok ? detailRes.raw : null),
+    ]) {
+      if (row.roomId) roomMap.set(row.roomId, row)
+    }
+    for (const row of listOwnedChatrooms(record.id)) {
+      if (row.roomId && !roomMap.has(row.roomId)) {
+        roomMap.set(row.roomId, { roomId: row.roomId, name: row.name || '', saved: row.saved })
+      }
+    }
+    const rooms = [...roomMap.values()]
+    // 优先扫仍在通讯录/会话里的群（被踢残留更常见）
+    rooms.sort((a, b) => Number(b.saved || 0) - Number(a.saved || 0))
+
+    const context = { databaseNames: null, tables: new Map() }
+    const handleResult = await requestApi(record, '/api/get_db_handle', {}, 5000)
+    if (handleResult.response.ok) {
+      context.databaseNames = rowsFromApi(handleResult.raw)
+        .map((item) => String(item.name || ''))
+        .filter((name) => /^message_\d+\.db$/i.test(name))
+    }
+    if (!context.databaseNames?.length) {
+      return { localHits, historyHits, roomsScanned }
+    }
+
+    for (const room of rooms) {
+      const roomId = String(room.roomId || '')
+      if (!roomId.endsWith('@chatroom')) continue
+      if (accountWxid && isChatroomBlocked(accountWxid, roomId)) continue
+      roomsScanned += 1
+      const expectedTable = messageTableName(roomId)
+      let found = null
+      for (const databaseName of context.databaseNames) {
+        if (!context.tables.has(databaseName)) {
+          const schemaResult = await requestApi(record, '/api/sqlite3_exec', {
+            db_name: databaseName,
+            sql_fmt: "SELECT name FROM sqlite_master WHERE type='table'",
+          }, 8000)
+          context.tables.set(
+            databaseName,
+            schemaResult.response.ok
+              ? rowsFromApi(schemaResult.raw).map((row) => String(valueOf(row, ['name']) || '')).filter(Boolean)
+              : [],
+          )
+          await yieldMain()
+        }
+        const table = context.tables.get(databaseName)
+          .find((name) => name.toLowerCase() === expectedTable.toLowerCase())
+        if (!table) continue
+        const columnsResult = await requestApi(record, '/api/sqlite3_exec', {
+          db_name: databaseName,
+          sql_fmt: `PRAGMA table_info(${quoteSqlIdentifier(table)})`,
+        }, 8000)
+        await yieldMain()
+        const columns = rowsFromApi(columnsResult.raw).map((row) => String(valueOf(row, ['name']) || '')).filter(Boolean)
+        const typeColumn = columns.find((name) => ['local_type', 'type', 'message_type'].includes(name.toLowerCase()))
+        const orderColumn = columns.find((name) => ['create_time', 'sort_seq', 'local_id'].includes(name.toLowerCase()))
+        const contentColumn = columns.find((name) => ['message_content', 'content'].includes(name.toLowerCase()))
+        if (!typeColumn || !contentColumn || !orderColumn) continue
+        const selectCols = [contentColumn, typeColumn, orderColumn]
+          .filter((name, index, arr) => arr.findIndex((item) => String(item).toLowerCase() === String(name).toLowerCase()) === index)
+          .map((name) => quoteSqlIdentifier(name))
+        // 最近 N 条会话消息（含用户发言），再在应用层只认系统通知类型
+        const sql = `SELECT ${selectCols.join(', ')} FROM ${quoteSqlIdentifier(table)}`
+          + ` ORDER BY ${quoteSqlIdentifier(orderColumn)} DESC`
+          + ` LIMIT ${HISTORY_TAIL}`
+        const messagesResult = await requestApi(record, '/api/sqlite3_exec', {
+          db_name: databaseName, sql_fmt: sql,
+        }, 20000)
+        if (!messagesResult.response.ok) continue
+        for (const rawRow of rowsFromApi(messagesResult.raw)) {
+          const msgType = valueOf(rawRow, ['local_type', 'type', 'message_type'])
+          const typeNum = Number(msgType)
+          // 只处理系统通知，跳过普通用户发言等其它类型
+          if (typeNum !== 10000 && typeNum !== 10002) continue
+          const prepared = prepareHistoryMessageRow(rawRow)
+          const hit = kickHitFromHistoryMessage(
+            roomId,
+            prepared.message_content || prepared._decodedBlob || '',
+            typeNum,
+          )
+          if (hit) {
+            hit.roomName = String(room.name || room.roomName || '')
+            found = hit
+            break
+          }
+        }
+        if (found) break
+      }
+      if (found && registerHit(found, '群聊历史')) historyHits += 1
+      if (roomsScanned % 8 === 0) await yieldMain()
+    }
+  } catch (error) {
+    appLog('WARN', '扫描微信群聊历史失败', {
+      instanceId: record.id, module: '被踢群清理', error: rawErrorMessage(error),
+    })
+  }
+
+  return { localHits, historyHits, roomsScanned }
+}
+
+
+/**
+ * 拉取当前实例可见群 ID（退群回调核验用）。
+ * @param {{ id: string }} record
+ * @returns {Promise<Set<string>>}
+ */
+async function loadLiveRoomIdsForKickGate(record) {
+  try {
+    const [listRes, detailRes] = await Promise.all([
+      requestApi(record, '/api/get_chatroom_list', {}, 30000),
+      requestApi(record, '/api/get_all_room_detail', {}, 90000),
+    ])
+    const ids = []
+    if (listRes?.response?.ok) ids.push(...extractRoomsFromApiRaw(listRes.raw).map((row) => row.roomId))
+    if (detailRes?.response?.ok) ids.push(...extractRoomsFromApiRaw(detailRes.raw).map((row) => row.roomId))
+    if (ids.length) return new Set(ids.filter(Boolean))
+  } catch (error) {
+    appLog('WARN', '被踢群清理：拉取群列表失败', {
+      instanceId: record.id, module: '被踢群清理', error: rawErrorMessage(error),
+    })
+  }
+  return new Set()
+}
+
+/**
+ * 清理单个被踢群：取消通讯录 + 退出并清除会话 + 永久屏蔽。
+ * @param {{ id: string, accountWxid?: string }} record
+ * @param {Record<string, unknown>} row
+ * @param {{ reason?: string, liveIds?: Set<string>, taskId?: string }} [opts]
+ * @returns {Promise<{ outcome: 'COMPLETED'|'FAILED'|'SKIPPED', message: string, roomName: string, roomId: string, evidence: string, unsaveStatus?: string, deleteChatStatus?: string }>}
+ */
+async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
+  const reason = String(opts.reason || '任务执行')
+  const taskId = opts.taskId ? String(opts.taskId) : ''
+  const liveIds = opts.liveIds instanceof Set ? opts.liveIds : new Set()
+  const accountWxid = String(record.accountWxid || row.accountWxid || '').trim()
+  const roomId = String(row.roomId || row.room_id || '').trim()
+  const roomLabel = resolveKickRoomLabel(record.id, roomId, row.roomName || row.room_name || '')
+  const evidence = String(row.evidence || '')
+  const kickStatus = kickEvidenceStatusLabel(evidence)
+  const immediateKick = isImmediateKickEvidence(evidence)
+  const leaveCallback = isLeaveCallbackEvidence(evidence)
+  const base = { roomName: roomLabel, roomId, evidence, kickStatus }
+
+  const logKick = (level, result, extra = {}) => {
+    const message = formatKickCleanupMessage({ roomName: roomLabel, kickStatus, evidence, result })
+    appLog(level, message, {
+      instanceId: record.id,
+      module: '被踢群清理',
+      operation: reason,
+      taskId: taskId || undefined,
+      roomName: roomLabel,
+      roomId,
+      evidence,
+      kickStatus,
+      result,
+      ...extra,
+    })
+    return message
+  }
+
+  if (!roomId.endsWith('@chatroom')) {
+    updateKickedGroupCleanup(record.id, roomId || String(row.roomId || ''), {
+      status: 'CANCELLED',
+      lastError: 'INVALID_ROOM_ID',
+    })
+    const message = logKick('WARN', '已跳过：群标识无效')
+    return { ...base, outcome: 'SKIPPED', message }
+  }
+
+  if (accountWxid && isChatroomBlocked(accountWxid, roomId)) {
+    // 已屏蔽后若被重新拉回群，必须先核验本人是否仍在群，避免误退
+    let selfStillInMembers = null
+    try {
+      const mem = await requestApi(record, '/api/get_room_members', { room_id: roomId }, 15000)
+      selfStillInMembers = resolveSelfStillInMembers(mem.raw, accountWxid, {
+        httpOk: Boolean(mem.response?.ok),
+        strongEvidence: true,
+      })
+      if (selfStillInMembers === null) {
+        try {
+          const bySql = await requestApi(record, '/api/get_groupmember_bysql', {
+            roomId, room_id: roomId,
+          }, 15000)
+          const sqlHit = resolveSelfStillInMembers(bySql.raw, accountWxid, {
+            httpOk: Boolean(bySql.response?.ok),
+            strongEvidence: true,
+          })
+          if (sqlHit !== null) selfStillInMembers = sqlHit
+        } catch { /* ignore */ }
+      }
+    } catch { /* keep null */ }
+    if (selfStillInMembers === true) {
+      updateKickedGroupCleanup(record.id, roomId, {
+        status: 'CANCELLED',
+        lastError: 'REINVITED_SELF_STILL_MEMBER',
+      })
+      const message = logKick('WARN', '已跳过：疑似重新入群，成员列表仍含本人，未退出')
+      return { ...base, outcome: 'SKIPPED', message }
+    }
+    // 成员核验不确定时绝不继续退群（可能已重新入群）
+    if (selfStillInMembers !== false) {
+      updateKickedGroupCleanup(record.id, roomId, { lastError: 'BLOCKED_MEMBER_CHECK_INCONCLUSIVE' })
+      const message = logKick('WARN', '退出失败：已屏蔽群成员核验不确定，暂未退出')
+      return { ...base, outcome: 'FAILED', message }
+    }
+
+    let unsaveStatus = String(row.unsaveStatus || row.unsave_status || 'PENDING')
+    let deleteChatStatus = String(row.deleteChatStatus || row.delete_chat_status || 'PENDING')
+    if (unsaveStatus !== 'DONE') {
+      const unsave = await requestApi(record, '/api/remov_chatroom_to_contact', {
+        roomId, room_id: roomId, chatroomId: roomId,
+      }, 20000)
+      unsaveStatus = isContactRoomMutationOk(unsave.response.ok, unsave.raw) ? 'DONE' : 'FAILED'
+    }
+    if (deleteChatStatus !== 'DONE') {
+      const deleted = await requestApi(record, '/api/quit_and_del_chat_room', {
+        roomId, room_id: roomId, chatroomId: roomId,
+      }, 20000)
+      deleteChatStatus = isContactRoomMutationOk(deleted.response.ok, deleted.raw) ? 'DONE' : 'FAILED'
+    }
+    removeLocalChatroomOwnership(record.id, roomId)
+    const done = unsaveStatus === 'DONE' && deleteChatStatus === 'DONE'
+    updateKickedGroupCleanup(record.id, roomId, {
+      unsaveStatus,
+      deleteChatStatus,
+      status: done ? 'DONE' : 'PENDING',
+      lastError: done ? null : `RETRY_${unsaveStatus}_${deleteChatStatus}`,
+      roomName: roomLabel,
+    })
+    if (done) {
+      notifyDirectoryBlockedChanged(record.id, roomId, roomLabel)
+      const message = logKick('INFO', '退出成功：已取消通讯录并清除会话', { unsaveStatus, deleteChatStatus })
+      return { ...base, outcome: 'COMPLETED', message, unsaveStatus, deleteChatStatus }
+    }
+    const message = logKick('WARN', `退出失败：清理未完成（通讯录${unsaveStatus}，会话${deleteChatStatus}）`, { unsaveStatus, deleteChatStatus })
+    return { ...base, outcome: 'FAILED', message, unsaveStatus, deleteChatStatus }
+  }
+
+  let selfStillInMembers = null
+  let confirmCount = Math.max(Number(row.confirmCount || row.confirm_count) || 0, 0)
+  if (!immediateKick) {
+    if (leaveCallback && !accountWxid) {
+      updateKickedGroupCleanup(record.id, roomId, { lastError: 'MISSING_ACCOUNT_WXID' })
+      const message = logKick('WARN', '退出失败：缺少本机微信号，无法核验')
+      return { ...base, outcome: 'FAILED', message }
+    }
+    if (!liveIds.size && !leaveCallback) {
+      updateKickedGroupCleanup(record.id, roomId, { lastError: 'LIVE_LIST_EMPTY' })
+      const message = logKick('WARN', '退出失败：群列表为空，暂未清理')
+      return { ...base, outcome: 'FAILED', message }
+    }
+    const strongEvidence = leaveCallback
+      || String(row.evidenceStrength || row.evidence_strength || 'strong') === 'strong'
+      || evidence.includes('SELF')
+    try {
+      const mem = await requestApi(record, '/api/get_room_members', { room_id: roomId }, 15000)
+      selfStillInMembers = resolveSelfStillInMembers(mem.raw, accountWxid, {
+        httpOk: Boolean(mem.response?.ok),
+        strongEvidence,
+      })
+      if (selfStillInMembers === null) {
+        try {
+          const bySql = await requestApi(record, '/api/get_groupmember_bysql', {
+            roomId, room_id: roomId,
+          }, 15000)
+          const sqlHit = resolveSelfStillInMembers(bySql.raw, accountWxid, {
+            httpOk: Boolean(bySql.response?.ok),
+            strongEvidence,
+          })
+          if (sqlHit !== null) selfStillInMembers = sqlHit
+        } catch { /* ignore */ }
+      }
+    } catch { /* keep null */ }
+
+    if (selfStillInMembers === true) {
+      updateKickedGroupCleanup(record.id, roomId, {
+        confirmCount: 0,
+        status: 'CANCELLED',
+        lastError: 'SELF_STILL_MEMBER_ABORT',
+      })
+      const message = logKick('WARN', '已跳过：成员列表仍含本人，未退出以免误退')
+      return { ...base, outcome: 'SKIPPED', message }
+    }
+    if (selfStillInMembers !== false) {
+      updateKickedGroupCleanup(record.id, roomId, { lastError: 'MEMBER_CHECK_INCONCLUSIVE' })
+      const message = logKick('WARN', '退出失败：成员核验不确定，暂未退出')
+      return { ...base, outcome: 'FAILED', message }
+    }
+    confirmCount += 1
+    updateKickedGroupCleanup(record.id, roomId, {
+      confirmCount,
+      lastAbsentAt: new Date().toISOString(),
+      lastError: null,
+      roomName: roomLabel,
+    })
+  } else {
+    confirmCount = Math.max(confirmCount, 1)
+    updateKickedGroupCleanup(record.id, roomId, {
+      confirmCount,
+      lastAbsentAt: new Date().toISOString(),
+      lastError: null,
+      roomName: roomLabel,
+    })
+  }
+
+  const decision = canCleanupKickedRoom({
+    instanceId: record.id,
+    roomId,
+    owned: immediateKick || Boolean(accountWxid),
+    inLiveRoomList: liveIds.has(roomId),
+    liveRoomCount: liveIds.size || (immediateKick ? 1 : 0),
+    selfStillInMembers: immediateKick ? false : selfStillInMembers,
+    confirmCount,
+    evidenceStrength: row.evidenceStrength || row.evidence_strength || 'strong',
+    evidence,
+  })
+  if (!decision.ok) {
+    updateKickedGroupCleanup(record.id, roomId, { lastError: String(decision.reason || 'NOT_READY') })
+    const message = logKick('WARN', `退出失败：未满足清理条件（${decision.reason || 'NOT_READY'}）`)
+    return { ...base, outcome: 'FAILED', message }
+  }
+
+  let unsaveStatus = String(row.unsaveStatus || row.unsave_status || 'PENDING')
+  if (unsaveStatus !== 'DONE') {
+    const unsaveBody = { roomId, room_id: roomId, chatroomId: roomId }
+    const unsave = await requestApi(record, '/api/remov_chatroom_to_contact', unsaveBody, 20000)
+    saveApiSample({
+      instanceId: record.id, sourceId: 438557557, path: '/api/remov_chatroom_to_contact',
+      request: unsaveBody, response: unsave.raw, httpStatus: unsave.response.status, durationMs: 0,
+    })
+    if (!isContactRoomMutationOk(unsave.response.ok, unsave.raw)) {
+      unsaveStatus = 'FAILED'
+      updateKickedGroupCleanup(record.id, roomId, {
+        unsaveStatus,
+        lastError: `UNSAVE_FAILED_${unsave.response.status}`,
+      })
+      logKick('WARN', '取消通讯录失败', { status: unsave.response.status })
+    } else {
+      unsaveStatus = 'DONE'
+      updateKickedGroupCleanup(record.id, roomId, { unsaveStatus: 'DONE' })
+      logKick('INFO', '取消通讯录成功')
+    }
+  }
+
+  let deleteChatStatus = String(row.deleteChatStatus || row.delete_chat_status || 'PENDING')
+  if (deleteChatStatus !== 'DONE') {
+    const delBody = { roomId, room_id: roomId, chatroomId: roomId }
+    const deleted = await requestApi(record, '/api/quit_and_del_chat_room', delBody, 20000)
+    saveApiSample({
+      instanceId: record.id, sourceId: 438557540, path: '/api/quit_and_del_chat_room',
+      request: delBody, response: deleted.raw, httpStatus: deleted.response.status, durationMs: 0,
+    })
+    if (!isContactRoomMutationOk(deleted.response.ok, deleted.raw)) {
+      deleteChatStatus = 'FAILED'
+      updateKickedGroupCleanup(record.id, roomId, {
+        deleteChatStatus,
+        lastError: `DELETE_CHAT_FAILED_${deleted.response.status}`,
+      })
+      logKick('WARN', '退出/清除会话失败', { status: deleted.response.status })
+    } else {
+      deleteChatStatus = 'DONE'
+      updateKickedGroupCleanup(record.id, roomId, { deleteChatStatus: 'DONE' })
+      logKick('INFO', '退出并清除会话成功')
+    }
+  }
+
+  const fullyCleaned = unsaveStatus === 'DONE' && deleteChatStatus === 'DONE'
+  if (!fullyCleaned) {
+    updateKickedGroupCleanup(record.id, roomId, {
+      unsaveStatus,
+      deleteChatStatus,
+      status: 'PENDING',
+      lastError: `PARTIAL_${unsaveStatus}_${deleteChatStatus}`,
+    })
+    const message = logKick('WARN', `退出失败：清理未完成（通讯录${unsaveStatus}，会话${deleteChatStatus}）`, { unsaveStatus, deleteChatStatus })
+    return { ...base, outcome: 'FAILED', message, unsaveStatus, deleteChatStatus }
+  }
+
+  if (accountWxid) {
+    markChatroomBlocked({
+      accountWxid,
+      roomId,
+      roomName: roomLabel,
+      reason: 'KICKED',
+      evidence: evidence || '',
+      sourceInstanceId: record.id,
+    })
+  }
+  removeLocalChatroomOwnership(record.id, roomId)
+  updateKickedGroupCleanup(record.id, roomId, {
+    unsaveStatus,
+    deleteChatStatus,
+    status: 'DONE',
+    lastError: null,
+    roomName: roomLabel,
+  })
+  const message = logKick('INFO', '退出成功：已取消通讯录并清除会话，并永久屏蔽', {
+    unsaveStatus, deleteChatStatus, stillInSessionList: liveIds.has(roomId),
+  })
+  notifyDirectoryBlockedChanged(record.id, roomId, roomLabel)
+  return { ...base, outcome: 'COMPLETED', message, unsaveStatus, deleteChatStatus }
+}
+
+/**
+ * 扫描历史被踢 → 登记 PENDING → 创建「清理被踢群」任务（不自动执行）。
+ * @param {string} [reason]
+ */
+async function prepareKickedGroupCleanupTask(reason = '手动创建被踢群清理任务') {
+  if (kickedGroupCleanupPreparing) {
+    return { ok: false, queued: true, message: '正在扫描并创建任务，请稍候' }
+  }
+  kickedGroupCleanupPreparing = true
+  let reboundTotal = 0
+  let pendingTotal = 0
+  let onlineCount = 0
+  let historyDiscoveredTotal = 0
+  try {
+    const online = [...instances.values()].filter((item) => item.status === 'ONLINE')
+    onlineCount = online.length
+    if (!onlineCount) {
+      return { ok: false, online: 0, pending: 0, historyDiscovered: 0, message: '没有在线微信，无法创建清理任务' }
+    }
+    /** @type {Array<{ instanceId: string, targetKey: string, actionType: string, request: Record<string, unknown> }>} */
+    const items = []
+    const activeKeys = new Set(
+      listActiveKickedCleanupTargets().map((row) => `${row.instanceId}::${row.roomId}`),
+    )
+    let skippedActive = 0
+    for (const record of online) {
+      const accountWxid = String(record.accountWxid || '').trim()
+      if (accountWxid) {
+        try {
+          reboundTotal += Number(rebindKickedGroupPendingToInstance(record.id, accountWxid) || 0)
+        } catch (error) {
+          appLog('WARN', '被踢群待清理任务迁回当前实例失败', {
+            instanceId: record.id, module: '被踢群清理', operation: reason, error: rawErrorMessage(error),
+          })
+        }
+      }
+      try {
+        const discovered = await discoverKickedGroupsFromHistory(record)
+        const localHits = Number(discovered.localHits || 0)
+        const historyHits = Number(discovered.historyHits || 0)
+        historyDiscoveredTotal += localHits + historyHits
+        if (localHits || historyHits) {
+          appLog('INFO', `历史扫描登记被踢群：本地事件${localHits}，群聊历史${historyHits}，已扫群${discovered.roomsScanned || 0}`, {
+            instanceId: record.id, module: '被踢群清理', operation: reason,
+            localHits, historyHits, roomsScanned: discovered.roomsScanned || 0,
+          })
+        }
+      } catch (error) {
+        appLog('WARN', '被踢群历史扫描失败', {
+          instanceId: record.id, module: '被踢群清理', operation: reason, error: rawErrorMessage(error),
+        })
+      }
+      const pending = listKickedGroupPending({ instanceId: record.id, status: 'PENDING' })
+      for (const row of pending) {
+        const roomId = String(row.roomId || '').trim()
+        if (!roomId.endsWith('@chatroom')) continue
+        if (activeKeys.has(`${record.id}::${roomId}`)) { skippedActive += 1; continue }
+        const roomName = resolveKickRoomLabel(record.id, roomId, row.roomName || '')
+        if (roomName && roomName !== String(row.roomName || '').trim()) {
+          try { updateKickedGroupCleanup(record.id, roomId, { roomName }) } catch { /* ignore */ }
+        }
+        items.push({
+          instanceId: record.id,
+          // 多账号同群时 target_key 不能只靠 roomId，避免 UNIQUE 冲突
+          targetKey: `${record.id}::${roomId}`,
+          actionType: 'KICKED_GROUP_CLEANUP',
+          request: {
+            roomId,
+            roomName,
+            evidence: String(row.evidence || ''),
+            evidenceStrength: String(row.evidenceStrength || 'strong'),
+            accountWxid: String(row.accountWxid || accountWxid || ''),
+            unsaveStatus: String(row.unsaveStatus || 'PENDING'),
+            deleteChatStatus: String(row.deleteChatStatus || 'PENDING'),
+            confirmCount: Number(row.confirmCount) || 0,
+          },
+        })
+      }
+    }
+    pendingTotal = items.length
+    if (!pendingTotal) {
+      const message = skippedActive
+        ? `有 ${skippedActive} 个群已在任务中心排队/执行中，未重复创建`
+        : (historyDiscoveredTotal
+          ? `历史扫描发现 ${historyDiscoveredTotal} 条，但当前没有可清理的待处理项`
+          : '当前没有待清理的被踢群')
+      appLog('INFO', `被踢群清理任务未创建：${message}`, {
+        module: '被踢群清理', operation: reason, online: onlineCount, rebound: reboundTotal,
+        historyDiscovered: historyDiscoveredTotal, skippedActive,
+      })
+      return {
+        ok: true, online: onlineCount, rebound: reboundTotal, pending: 0, skippedActive,
+        historyDiscovered: historyDiscoveredTotal, message,
+      }
+    }
+    const created = createLocalTask({
+      name: `清理被踢群 ${new Date().toLocaleString()}`,
+      type: 'KICKED_GROUP_CLEANUP',
+      config: {},
+      items,
+    })
+    const taskId = String(created?.id || '')
+    appLog('INFO', `已创建被踢群清理任务：${pendingTotal} 个群（历史发现${historyDiscoveredTotal}，迁回${reboundTotal}）`, {
+      module: '被踢群清理', operation: reason, taskId, online: onlineCount,
+      rebound: reboundTotal, pending: pendingTotal, historyDiscovered: historyDiscoveredTotal,
+    })
+    return {
+      ok: true,
+      taskId,
+      online: onlineCount,
+      rebound: reboundTotal,
+      pending: pendingTotal,
+      historyDiscovered: historyDiscoveredTotal,
+      message: `已创建清理任务：${pendingTotal} 个群（历史扫描发现 ${historyDiscoveredTotal}）。请到任务中心确认执行。`,
+    }
+  } catch (error) {
+    const message = toUserErrorMessage(error, '创建被踢群清理任务失败')
+    appLog('ERROR', message, {
+      module: '被踢群清理', operation: reason, error: rawErrorMessage(error),
+    })
+    throw new Error(message)
+  } finally {
+    kickedGroupCleanupPreparing = false
+  }
 }
 
 /**
@@ -970,6 +1829,7 @@ async function handleQrMonitorEvent(record, event) {
   if (!qrMonitorConfig.enabled) return
   // 先用字段 O(1) 匹配；普通文字绝不深遍历，150+ 群时避免拖死主进程
   let room = resolveQrMonitorRoom(record, event, { allowDeep: false })
+  if (room && isChatroomBlockedForInstance(record.id, room.roomId)) return
   const type = Number(valueOf(event, ['type', 'local_type', 'message_type', 'msgType']))
   const maybeImage = looksLikeImageEvent(event)
   if (!room) {
@@ -1104,6 +1964,7 @@ function startTcpReceiver(record) {
         }
         void handleQrMonitorEvent(record, event)
         try { handleChatAddFriendEvent(record, event) } catch (error) { appLog('ERROR', '群聊发言加好友处理失败', { instanceId: record.id, error: error.message }) }
+        try { handleKickedGroupEvent(record, event) } catch (error) { appLog('ERROR', '被踢群检测失败', { instanceId: record.id, error: error.message }) }
         }
       } catch (error) {
         appLog('ERROR', 'TCP 回调超过 10 MB，连接已关闭', { instanceId: record.id, error: error.message })
@@ -1160,7 +2021,7 @@ async function probeInstance(record) {
       markInstanceIdentityMismatch(record)
       return false
     }
-    if (loggedIn && (record.requireIdentityVerification || !wasOnline || !record.accountWxid || !record.nickname)) {
+    if (loggedIn && (record.requireIdentityVerification || !wasOnline || !record.accountWxid || !record.nickname || record.alias == null)) {
       const profile = await requestApi(record, '/api/get_profile_cache', {}, 5000)
       if (!profile.response.ok) throw new Error('无法读取当前登录微信资料')
       const info = profile.raw?.userInfo ?? {}
@@ -1172,6 +2033,7 @@ async function probeInstance(record) {
         return false
       }
       record.nickname = text(info.nickName) || record.nickname
+      record.alias = text(info.alias) || ''
       record.avatar = profile.raw?.userInfoExt?.bigHeadImgUrl || profile.raw?.userInfoExt?.smallHeadImgUrl || record.avatar
       record.accountWxid = profileAccountWxid
       record.requireIdentityVerification = false
@@ -1199,23 +2061,39 @@ async function probeInstance(record) {
 }
 
 const runningTasks = new Set()
-async function waitForTaskTime(taskId, timestamp) {
+/**
+ * 等待到指定时间；暂停/取消时返回 false。
+ * earlyContinueStatuses：冷却等待中若用户点「继续」把状态改成这些值，则立刻返回 true 继续执行。
+ */
+async function waitForTaskTime(taskId, timestamp, options = {}) {
+  const earlyContinueStatuses = Array.isArray(options.earlyContinueStatuses)
+    ? options.earlyContinueStatuses.map((item) => String(item || ''))
+    : []
   while (Date.now() < timestamp) {
     if (!runtimeAllowed) return false
     const task = listTasks().find((item) => item.id === taskId)
     if (!task || ['PAUSED', 'CANCELLED'].includes(task.status)) return false
+    if (earlyContinueStatuses.length && earlyContinueStatuses.includes(String(task.status || ''))) return true
     await new Promise((resolve) => setTimeout(resolve, Math.min(timestamp - Date.now(), 1000)))
   }
   return true
 }
+const deliveryImageHashCache = new Map()
 function deliveryContentHash(actionType, request) {
+  if (actionType === 'SEND_IMAGE') {
+    const file = String(request?.filepath || '')
+    if (file && existsSync(file)) {
+      const cacheKey = `${actionType}\0${file}`
+      const cached = deliveryImageHashCache.get(cacheKey)
+      if (cached) return cached
+      const digest = createHash('sha256').update(`${actionType}\0`).update(readFileSync(file)).digest('hex')
+      deliveryImageHashCache.set(cacheKey, digest)
+      return digest
+    }
+  }
   const hash = createHash('sha256').update(`${actionType}\0`)
   if (actionType === 'SEND_TEXT') hash.update(String(request?.msg || ''))
-  else if (actionType === 'SEND_IMAGE') {
-    const file = String(request?.filepath || '')
-    if (file && existsSync(file)) hash.update(readFileSync(file))
-    else hash.update(file)
-  }
+  else if (actionType === 'SEND_IMAGE') hash.update(String(request?.filepath || ''))
   return hash.digest('hex')
 }
 /**
@@ -1405,24 +2283,158 @@ async function readWechatRoomIds(record) {
   }
 }
 
+/**
+ * 读取当前微信群列表（含群名），用于进群后回填任务明细目标列。
+ * @param {{ id: string }} record
+ * @returns {Promise<Array<{ roomId: string, name: string }>>}
+ */
+async function readWechatRooms(record) {
+  try {
+    const [listRes, detailRes] = await Promise.all([
+      requestApi(record, '/api/get_chatroom_list', {}, 15000),
+      requestApi(record, '/api/get_all_room_detail', {}, 60000),
+    ])
+    const map = new Map()
+    for (const room of [
+      ...extractRoomsFromApiRaw(listRes?.response?.ok ? listRes.raw : null),
+      ...extractRoomsFromApiRaw(detailRes?.response?.ok ? detailRes.raw : null),
+    ]) {
+      if (!room?.roomId) continue
+      const prev = map.get(room.roomId)
+      if (!prev || (room.name && room.name !== '群聊' && prev.name === '群聊')) map.set(room.roomId, room)
+    }
+    return [...map.values()]
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 可读群名（排除占位文案）。
+ * @param {unknown} value
+ * @returns {string}
+ */
+function usableQrRoomName(value) {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  if (text === '未知群名' || /^二维码/.test(text) || /@chatroom$/i.test(text)) return ''
+  if (/^未知群名/.test(text)) return ''
+  return text
+}
+
+/**
+ * 把可读群名写回任务项，任务中心「目标」列不再显示「二维码目标」。
+ * @param {string} itemId
+ * @param {{ roomName?: string, label?: string, memberCount?: number, roomId?: string } | null | undefined} preview
+ */
+function persistQrTaskDisplay(itemId, preview) {
+  if (!itemId || !preview) return
+  const roomName = usableQrRoomName(preview.roomName)
+  const memberCount = Number(preview.memberCount) || 0
+  const roomId = String(preview.roomId || '').trim()
+  const label = roomName
+    ? formatInvitePreviewLine({ roomName, memberCount, roomId })
+    : ''
+  if (!roomName && !roomId) return
+  try {
+    patchTaskItemRequest(itemId, {
+      ...(roomName ? { roomName, label } : {}),
+      ...(memberCount > 0 ? { memberCount } : {}),
+      ...(roomId.endsWith('@chatroom') ? { resolvedRoomId: roomId } : {}),
+    })
+  } catch { /* ignore */ }
+}
+
+/**
+ * 任务执行时解析二维码类型：优先用手改/入库类型，避免自动分类覆盖人工纠正。
+ * @param {{ request_json?: string, target_key?: string, id?: string }} item
+ * @param {Record<string, unknown>} request
+ * @param {string} decodedText
+ * @returns {string}
+ */
+function resolveTaskQrType(item, request, decodedText) {
+  const allowed = new Set(['GROUP_LINK', 'PERSONAL_LINK', 'QQ_GROUP_LINK', 'UNKNOWN', 'INVALID'])
+  const fromRequest = String(request?.qrType || '').trim()
+  if (allowed.has(fromRequest)) return fromRequest
+  const key = String(item?.target_key || item?.id || '').trim()
+  if (key) {
+    try {
+      const stored = listQrItems().find((row) => row.sha256 === key || row.id === key)
+      const fromStore = String(stored?.qrType || '').trim()
+      if (allowed.has(fromStore)) return fromStore
+    } catch { /* ignore */ }
+  }
+  return classifyQrText(decodedText)
+}
+
+/**
+ * 邀请页没解析出群名时，用已进群的 roomId 从微信群列表反查名称。
+ * @param {{ id: string }} record
+ * @param {Record<string, unknown>} preview
+ * @param {string} [roomIdHint]
+ */
+async function enrichPreviewRoomName(record, preview, roomIdHint = '') {
+  const source = preview && typeof preview === 'object' ? { ...preview } : {}
+  const existingName = usableQrRoomName(source.roomName)
+  if (existingName) {
+    source.roomName = existingName
+    source.label = formatInvitePreviewLine(source)
+    return source
+  }
+  const roomId = String(roomIdHint || source.roomId || '').trim()
+  if (roomId.endsWith('@chatroom')) {
+    const rooms = await readWechatRooms(record)
+    const hit = rooms.find((row) => row.roomId === roomId)
+    const lookedUp = usableQrRoomName(hit?.name)
+    if (lookedUp) {
+      source.roomName = lookedUp
+      source.roomId = roomId
+    } else if (!source.roomId) {
+      source.roomId = roomId
+    }
+  }
+  source.label = formatInvitePreviewLine(source)
+  return source
+}
+
 async function verifyJoinedRoom(record, beforeRoomIds, expectedRoomId = '') {
-  for (let attempt = 0; attempt < 8; attempt += 1) {
+  const target = String(expectedRoomId || '').trim()
+  const before = beforeRoomIds instanceof Set ? beforeRoomIds : new Set(beforeRoomIds || [])
+  if (target.endsWith('@chatroom') && before.has(target)) {
+    return { status: 'ALREADY_IN', roomId: target, reason: '进群前已在该群中，不算本次进群成功' }
+  }
+  // 加长轮询：真进群后 get_chatroom_list 常有延迟；短链无 roomId 时靠「唯一新群」确认
+  for (let attempt = 0; attempt < 12; attempt += 1) {
     if (attempt) await new Promise((resolve) => setTimeout(resolve, 1500))
     const current = await readWechatRoomIds(record)
-    if (expectedRoomId && current.has(expectedRoomId)) return expectedRoomId
-    for (const roomId of current) if (!beforeRoomIds.has(roomId)) return roomId
+    const verdict = confirmJoinedFromRoomList(before, current, target)
+    if (verdict.status === 'JOINED' || verdict.status === 'ALREADY_IN' || verdict.status === 'MISSING_TARGET') {
+      return verdict
+    }
   }
-  return ''
+  if (!target.endsWith('@chatroom')) {
+    return {
+      status: 'MISSING_TARGET',
+      roomId: '',
+      reason: '无法确认目标群（短链缺少群标识，且轮询期间未观察到唯一新群）',
+    }
+  }
+  return { status: 'NOT_YET', roomId: target, reason: '群列表未出现目标群，未能确认进群成功' }
 }
 
 async function applyQrOptions(record, task, item, decodedText, taskId) {
   const text = String(decodedText || '')
-  const type = classifyQrText(text)
+  let requestMeta = {}
+  try { requestMeta = JSON.parse(item.request_json || '{}') } catch { requestMeta = {} }
+  const type = resolveTaskQrType(item, requestMeta, text)
   if (type === 'PERSONAL_LINK' && task?.config?.skipPersonal) {
-    appLog('INFO', '已跳过个人二维码', { instanceId: record.id, taskId })
+    appLog('INFO', '已跳过个人二维码', { instanceId: record.id, taskId, qrType: type })
     return { skippedPersonal: true }
   }
-  if (type !== 'GROUP_LINK') return { scannedOnly: true }
+  if (type === 'QQ_GROUP_LINK') {
+    return { scannedOnly: true, reason: 'QQ群链接不支持微信进群，已跳过', qrType: type }
+  }
+  if (type !== 'GROUP_LINK') return { scannedOnly: true, qrType: type }
   const reservation = reserveQrJoinDailyAttempt(record.accountWxid, item.id, item.target_key, task?.config?.limitPerAccount)
   if (!reservation.accepted) {
     const reason = reservation.reason === 'ACCOUNT_REQUIRED' ? '未读取到登录微信号，已跳过进群申请' : '已达到本微信今日进群上限'
@@ -1430,27 +2442,70 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
     return { skippedLimit: true, reason }
   }
 
-  const preview = await fetchInvitePreview(record, text)
+  let preview = await fetchInvitePreview(record, text)
+  // 创建任务时已写入的群名优先保留，避免执行期邀请页再解析失败后目标列变回「群聊」
+  const priorName = usableQrRoomName(requestMeta.roomName)
+  if (priorName && !usableQrRoomName(preview.roomName)) {
+    preview = {
+      ...preview,
+      roomName: priorName,
+      memberCount: Number(preview.memberCount) || Number(requestMeta.memberCount) || 0,
+      roomId: String(preview.roomId || requestMeta.resolvedRoomId || '').trim(),
+    }
+    preview.label = formatInvitePreviewLine(preview)
+  }
+  // 尽早回填群名，任务明细/日志不再显示「二维码目标」
+  persistQrTaskDisplay(item.id, preview)
   appLog('INFO', `进群前群资料：${preview.label}`, {
     instanceId: record.id, taskId, module: '二维码进群',
-    roomName: preview.roomName, memberCount: preview.memberCount, roomId: preview.roomId,
+    roomName: preview.roomName, memberCount: preview.memberCount, label: preview.label,
   })
   if (preview.expired) {
     return { joinSubmitted: false, joinOk: false, reason: '邀请已过期或无效', preview, joinResponse: null }
   }
 
-  const applyText = String(task?.config?.applyText || '').replaceAll('{昵称}', record.nickname || record.accountWxid || '微信用户')
+  const configuredApply = String(task?.config?.applyText || '').trim()
+  const applyText = (configuredApply || DEFAULT_QR_APPLY_TEXT)
+    .replaceAll('{昵称}', record.nickname || record.accountWxid || '微信用户')
+    .trim() || DEFAULT_QR_APPLY_TEXT
   // 短链 weixin.qq.com/g/ 直接 enter_room 常返回空成功；优先用 a8key 解析出的完整邀请 URL
   const joinUrl = String(preview.fullUrl || text).trim() || text
   const joinRequest = {
     url: joinUrl,
     link: joinUrl,
     inviteUrl: joinUrl,
+    // 多字段兼容：需申请理由的群依赖 msg/verifyContent
     msg: applyText,
     verifyContent: applyText,
     applyText,
+    reason: applyText,
+  }
+  if (preview.needApply) {
+    appLog('INFO', `该群需申请理由进群，已提交验证文案（${applyText.length}字）`, {
+      instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '',
+    })
   }
   const beforeRoomIds = await readWechatRoomIds(record)
+  const expectedFromPreview = String(preview.roomId || '').trim()
+  if (expectedFromPreview.endsWith('@chatroom') && beforeRoomIds.has(expectedFromPreview)) {
+    preview = await enrichPreviewRoomName(record, preview, expectedFromPreview)
+    persistQrTaskDisplay(item.id, preview)
+    appLog('INFO', `进群前已在该群中：${preview.roomName || preview.label}`, {
+      instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '', label: preview.label,
+    })
+    return {
+      joinSubmitted: false,
+      joinOk: false,
+      alreadyIn: true,
+      reason: '进群前已在该群中，不算本次进群成功',
+      roomId: expectedFromPreview,
+      preview,
+      roomName: preview.roomName || '',
+      label: preview.label,
+      joinResponse: null,
+    }
+  }
+
   const startedAt = Date.now()
   let { response, raw } = await requestApi(record, '/api/enter_room', joinRequest)
   saveApiSample({ instanceId: record.id, sourceId: 438557545, path: '/api/enter_room', request: joinRequest, response: raw, httpStatus: response.status, durationMs: Date.now() - startedAt })
@@ -1458,54 +2513,192 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
     appLog('ERROR', '进群检测到明确频繁状态', { instanceId: record.id, taskId, status: response.status })
     return { frequent: true, joinResponse: raw, preview }
   }
-  let verdict = evaluateEnterRoomResult(response.ok, raw)
-  if (!verdict.ok) {
-    let verifiedRoomId = await verifyJoinedRoom(record, beforeRoomIds, preview.roomId)
-    if (!verifiedRoomId && response.ok) {
-      const retryStartedAt = Date.now()
-      const retry = await requestApi(record, '/api/enter_room', { url: joinUrl })
-      response = retry.response
-      raw = retry.raw
-      saveApiSample({ instanceId: record.id, sourceId: 438557545, path: '/api/enter_room', request: { url: joinUrl }, response: raw, httpStatus: response.status, durationMs: Date.now() - retryStartedAt })
-      if (hasFrequentEvidence(raw)) {
-        appLog('ERROR', '进群重试检测到明确频繁状态', { instanceId: record.id, taskId, status: response.status })
-        return { frequent: true, joinResponse: raw, preview }
-      }
-      verdict = evaluateEnterRoomResult(response.ok, raw)
-      if (!verdict.ok) verifiedRoomId = await verifyJoinedRoom(record, beforeRoomIds, preview.roomId)
+
+  let apiVerdict = evaluateEnterRoomResult(response.ok, raw)
+  // 硬失败（过期/负错误码等）不再重试；其余一律以群列表核验为准
+  if (apiVerdict.hardFail) {
+    appLog('ERROR', `进群失败：${apiVerdict.reason}`, {
+      instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群并核验群列表',
+      sourceId: 438557545, path: '/api/enter_room', status: response.status,
+      roomName: preview.roomName, reason: apiVerdict.reason,
+    })
+    return {
+      joinSubmitted: true,
+      joinResponse: raw,
+      joinOk: false,
+      reason: apiVerdict.reason,
+      roomId: apiVerdict.roomId || preview.roomId || '',
+      preview,
     }
-    if (verifiedRoomId) verdict = { ok: true, reason: '已从群列表确认进群', roomId: verifiedRoomId }
   }
-  appLog(verdict.ok ? 'INFO' : 'ERROR', verdict.ok ? `进群成功：${preview.label}` : `进群未确认：${verdict.reason}`, {
-    instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群并核验群列表',
-    sourceId: 438557545, path: '/api/enter_room', status: response.status, roomId: verdict.roomId, targetKey: item.target_key,
-  })
-  if (verdict.ok && task?.config?.saveContact) {
-    const roomId = verdict.roomId || preview.roomId || findRoomId(raw)
-    if (roomId) {
+
+  // 接口已明确「申请待确认」：群列表不会立刻出现，记为申请已提交
+  if (apiVerdict.pendingApply || (preview.needApply && isJoinApplicationPending(raw))) {
+    const pendingReason = '进群申请已提交，等待群主确认'
+    persistQrTaskDisplay(item.id, preview)
+    appLog('INFO', pendingReason, {
+      instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群申请',
+      sourceId: 438557545, path: '/api/enter_room', status: response.status,
+      roomName: preview.roomName || '', reason: pendingReason,
+    })
+    return {
+      joinSubmitted: true,
+      joinOk: false,
+      requestSent: true,
+      reason: pendingReason,
+      roomId: apiVerdict.roomId || preview.roomId || '',
+      preview,
+      roomName: preview.roomName || '',
+      label: preview.label,
+      joinResponse: raw,
+    }
+  }
+
+  let expectedRoomId = String(preview.roomId || apiVerdict.roomId || '').trim()
+  let listVerdict = await verifyJoinedRoom(record, beforeRoomIds, expectedRoomId)
+
+  // 列表未确认且首次接口非硬失败时，再 enter_room 一次后复验（必须带申请理由）
+  if (listVerdict.status === 'NOT_YET' && response.ok) {
+    const retryStartedAt = Date.now()
+    const retry = await requestApi(record, '/api/enter_room', joinRequest)
+    response = retry.response
+    raw = retry.raw
+    saveApiSample({ instanceId: record.id, sourceId: 438557545, path: '/api/enter_room', request: joinRequest, response: raw, httpStatus: response.status, durationMs: Date.now() - retryStartedAt })
+    if (hasFrequentEvidence(raw)) {
+      appLog('ERROR', '进群重试检测到明确频繁状态', { instanceId: record.id, taskId, status: response.status })
+      return { frequent: true, joinResponse: raw, preview }
+    }
+    apiVerdict = evaluateEnterRoomResult(response.ok, raw)
+    if (apiVerdict.hardFail) {
+      return {
+        joinSubmitted: true,
+        joinResponse: raw,
+        joinOk: false,
+        reason: apiVerdict.reason,
+        roomId: apiVerdict.roomId || expectedRoomId || '',
+        preview,
+      }
+    }
+    if (apiVerdict.pendingApply || (preview.needApply && isJoinApplicationPending(raw))) {
+      const pendingReason = '进群申请已提交，等待群主确认'
+      persistQrTaskDisplay(item.id, preview)
+      appLog('INFO', pendingReason, {
+        instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群申请',
+        sourceId: 438557545, path: '/api/enter_room', status: response.status,
+        roomName: preview.roomName || '', reason: pendingReason,
+      })
+      return {
+        joinSubmitted: true,
+        joinOk: false,
+        requestSent: true,
+        reason: pendingReason,
+        roomId: apiVerdict.roomId || expectedRoomId || '',
+        preview,
+        roomName: preview.roomName || '',
+        label: preview.label,
+        joinResponse: raw,
+      }
+    }
+    expectedRoomId = String(preview.roomId || apiVerdict.roomId || expectedRoomId || '').trim()
+    listVerdict = await verifyJoinedRoom(record, beforeRoomIds, expectedRoomId)
+  }
+
+  if (listVerdict.status === 'JOINED') {
+    const roomId = listVerdict.roomId
+    preview = await enrichPreviewRoomName(record, preview, roomId)
+    persistQrTaskDisplay(item.id, preview)
+    appLog('INFO', `进群成功：${preview.roomName || preview.label}`, {
+      instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群并核验群列表',
+      sourceId: 438557545, path: '/api/enter_room', status: response.status,
+      roomName: preview.roomName || '', label: preview.label, reason: listVerdict.reason,
+    })
+    if (task?.config?.saveContact && roomId) {
       const saved = await requestApi(record, '/api/save_chatroom_to_contact', { roomId })
       saveApiSample({ instanceId: record.id, sourceId: 438557556, path: '/api/save_chatroom_to_contact', request: { roomId }, response: saved.raw, httpStatus: saved.response.status, durationMs: 0 })
-      appLog(saved.response.ok ? 'INFO' : 'ERROR', saved.response.ok ? '群聊已保存到通讯录' : '群聊保存到通讯录失败', { instanceId: record.id, taskId, roomId })
-    } else appLog('INFO', '进群结果尚未返回群标识，暂时无法保存到通讯录', { instanceId: record.id, taskId })
-  }
-  // 监控开启且「全部群含新进群」时：进群成功立刻并入监控列表
-  if (verdict.ok && qrMonitorConfig.enabled && qrMonitorConfig.watchAll) {
-    const roomId = String(verdict.roomId || preview.roomId || findRoomId(raw) || '').trim()
-    if (roomId.endsWith('@chatroom')) {
+      appLog(saved.response.ok ? 'INFO' : 'ERROR', saved.response.ok ? `群聊已保存到通讯录：${preview.roomName || preview.label}` : `群聊保存到通讯录失败：${preview.roomName || preview.label}`, { instanceId: record.id, taskId, roomName: preview.roomName || '' })
+    }
+    if (qrMonitorConfig.enabled && qrMonitorConfig.watchAll && roomId.endsWith('@chatroom')) {
       addQrMonitorRooms([{
         instanceId: record.id,
         roomId,
         name: preview.roomName || '群聊',
       }], { reason: '二维码进群成功' })
     }
+    return {
+      joinSubmitted: true,
+      joinResponse: raw,
+      joinOk: true,
+      reason: `已进群：${preview.roomName || preview.label}`,
+      roomId,
+      preview,
+      roomName: preview.roomName || '',
+      label: preview.label,
+    }
   }
+
+  if (listVerdict.status === 'ALREADY_IN') {
+    preview = await enrichPreviewRoomName(record, preview, listVerdict.roomId)
+    persistQrTaskDisplay(item.id, preview)
+    appLog('INFO', `进群前已在该群中：${preview.roomName || preview.label}`, {
+      instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '', label: preview.label,
+    })
+    return {
+      joinSubmitted: true,
+      joinResponse: raw,
+      joinOk: false,
+      alreadyIn: true,
+      reason: listVerdict.reason,
+      roomId: listVerdict.roomId,
+      preview,
+      roomName: preview.roomName || '',
+      label: preview.label,
+    }
+  }
+
+  const failReason = listVerdict.reason
+    || apiVerdict.reason
+    || '群列表未出现目标群，未能确认进群成功'
+  if (expectedRoomId || listVerdict.roomId) {
+    preview = await enrichPreviewRoomName(record, preview, expectedRoomId || listVerdict.roomId)
+    persistQrTaskDisplay(item.id, preview)
+  }
+  // 需申请进群的群：提交后群列表不会立刻出现，按「申请已提交」处理，避免误报失败
+  const treatAsRequestSent = Boolean(preview.needApply)
+    || apiVerdict.pendingApply
+    || isJoinApplicationPending(raw)
+  if (treatAsRequestSent && listVerdict.status !== 'JOINED') {
+    const pendingReason = '进群申请已提交，等待群主确认'
+    appLog('INFO', pendingReason, {
+      instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群申请',
+      sourceId: 438557545, path: '/api/enter_room', status: response.status,
+      roomName: preview.roomName || '', label: preview.label, reason: pendingReason,
+    })
+    return {
+      joinSubmitted: true,
+      joinResponse: raw,
+      joinOk: false,
+      requestSent: true,
+      reason: pendingReason,
+      roomId: expectedRoomId || listVerdict.roomId || '',
+      preview,
+      roomName: preview.roomName || '',
+      label: preview.label,
+    }
+  }
+  appLog('ERROR', `进群未确认：${failReason}`, {
+    instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群并核验群列表',
+    sourceId: 438557545, path: '/api/enter_room', status: response.status,
+    roomName: preview.roomName || '', label: preview.label, reason: failReason,
+  })
   return {
     joinSubmitted: true,
     joinResponse: raw,
-    joinOk: verdict.ok,
-    reason: verdict.ok ? `已进群：${preview.label}` : verdict.reason,
-    roomId: verdict.roomId,
+    joinOk: false,
+    reason: failReason,
+    roomId: expectedRoomId || listVerdict.roomId || '',
     preview,
+    roomName: preview.roomName || '',
+    label: preview.label,
   }
 }
 
@@ -1531,19 +2724,23 @@ async function resolvePendingFriendProfile(record, request, taskId) {
   const sourceRoomId = String(request.sourceRoomId || '')
   const sourceRoomName = String(request.sourceRoomName || '')
   const sourceInstanceId = String(request.sourceInstanceId || record.id)
-  const sourceInstancePort = Number(request.sourceInstancePort)
-  const profilePort = sourceInstancePort > 0 ? sourceInstancePort : record.apiPort
+  // 同源实例一律用当前在线端口；候选里缓存的 sourceInstancePort 会在重启后失效
+  const profilePort = Number(record.apiPort)
   const requestUrl = `http://127.0.0.1:${profilePort}/api/get_group_member_contact`
   appLog('INFO', 'MESSAGE_CANDIDATE -> PROFILE_RESOLUTION', {
     module: '群聊加好友', operation: 'PROFILE_RESOLUTION', taskId,
     accountWxid: String(request.accountWxid || record.accountWxid || ''), targetWxid,
     sourceRoomId, sourceRoomName, sourceInstanceId, sourceInstancePort: profilePort,
+    cachedSourcePort: Number(request.sourceInstancePort) || 0,
     instanceId: record.id, instancePort: profilePort, requestUrl,
   })
   if (!targetWxid || !sourceRoomId || sourceInstanceId !== record.id) {
     return { ok: false, missing: ['source'], diagnostics: [], reason: '候选来源实例或群标识无效' }
   }
-  const profileRecord = profilePort === record.apiPort ? record : { ...record, apiPort: profilePort, apiQueue: Promise.resolve(), apiBusy: false }
+  if (!sourceRoomId.endsWith('@chatroom')) {
+    return { ok: false, missing: ['sourceRoomId'], diagnostics: [], reason: '群标识无效，无法按群场景加好友' }
+  }
+  const profileRecord = record
   const diagnostics = []
   const fetchProfile = async (endpoint, body, sourceId, attempt) => {
     const startedAt = Date.now()
@@ -1552,7 +2749,7 @@ async function resolvePendingFriendProfile(record, request, taskId) {
     const parsed = parseProfileCredentials(raw, targetWxid, sourceRoomId)
     const diagnostic = {
       endpoint, requestUrl: url, requestBodyWxid: String(body.wxid || ''), requestBodyRoomId: String(body.roomId || ''),
-      httpStatus: response.status, ...rawStructure(raw), parserVersion: 'profile-resolution-v2',
+      httpStatus: response.status, ...rawStructure(raw), parserVersion: 'profile-resolution-v3',
       baseRet: parsed.baseRet, contactCount: parsed.contactCount, contactListLength: parsed.contactListLength,
       matchedContact: parsed.matchedContact, matchedTicket: parsed.matchedTicket,
       hasV3: Boolean(parsed.v3), hasV4: Boolean(parsed.v4), missing: parsed.missing.join(','),
@@ -1566,16 +2763,13 @@ async function resolvePendingFriendProfile(record, request, taskId) {
     })
     return { response, parsed }
   }
-  const group = await fetchProfile('/api/get_group_member_contact', { wxid: targetWxid, roomId: sourceRoomId }, 438557510, 1)
-  let v3 = /^v3_/i.test(String(request.senderV3 || '')) ? String(request.senderV3) : group.parsed.v3
-  let v4 = group.parsed.v4
-  if (!v3 || !v4) {
-    const contact = await fetchProfile('/api/get_contact', { wxid: targetWxid }, 438557509, 2)
-    v3 ||= contact.parsed.v3
-    v4 ||= contact.parsed.v4
-  }
-  const missing = [v3 ? '' : 'v3', v4 ? '' : 'v4'].filter(Boolean)
-  return { ok: !missing.length, v3, v4, missing, diagnostics, reason: missing.length ? `凭证解析失败：缺少 ${missing.join('、')}` : '' }
+  // 不信任消息内 senderV3：会跳过 update_single_profile，并与群票 V4 拼出 Invalid argument。
+  const resolved = await resolveFriendProfileCredentials({
+    targetWxid,
+    sourceRoomId,
+    fetchProfile,
+  })
+  return { ...resolved, diagnostics }
 }
 async function runTask(taskId) {
   if (runningTasks.has(taskId)) return
@@ -1589,7 +2783,11 @@ async function runTask(taskId) {
     const scheduledAt = Date.parse(String(task?.config?.scheduledAt || ''))
     if (Number.isFinite(scheduledAt) && scheduledAt > Date.now() && !await waitForTaskTime(taskId, scheduledAt)) return
     setTaskStatus(taskId, 'RUNNING')
+    /** @type {Map<string, Set<string>>} */
+    const kickLiveRoomIdsByInstance = new Map()
     const taskItems = getTaskItems(taskId)
+    // REQUEST_SENT/UNSAFE_RESUME 也必须跳过，否则恢复加好友/不确定项会重复提交
+    const doneItemStatuses = new Set(['COMPLETED', 'SKIPPED', 'FAILED', 'SUBMITTED', 'REQUEST_SENT', 'FREQUENT', 'RESOLUTION_FAILED', 'CANCELLED', 'UNSAFE_RESUME'])
     for (const [itemIndex, item] of taskItems.entries()) {
       if (!runtimeAllowed) {
         setTaskStatus(taskId, 'PAUSED')
@@ -1597,9 +2795,99 @@ async function runTask(taskId) {
       }
       const latest = listTasks().find((candidate) => candidate.id === taskId)
       if (!latest || ['PAUSED', 'CANCELLED'].includes(latest.status)) break
+      // 恢复已暂停任务时跳过已结束项，避免对已成功目标重复发送
+      if (doneItemStatuses.has(String(item.status || ''))) continue
+      // 中断时停在 RUNNING 的项结果不确定，禁止自动重放
+      if (String(item.status || '') === 'RUNNING') {
+        setTaskItemResult(item.id, 'UNSAFE_RESUME', null, '暂停或中断时该项结果不确定，为避免重复操作已跳过')
+        continue
+      }
       const record = instances.get(item.instance_id)
       if (!record) { setTaskItemResult(item.id, 'FAILED', null, '实例不在线'); continue }
-      if (record.status !== 'ONLINE' && item.action_type !== 'QR_SCAN') { setTaskItemResult(item.id, 'FAILED', null, '微信尚未登录'); continue }
+      if (record.status !== 'ONLINE') { setTaskItemResult(item.id, 'FAILED', null, '微信尚未登录'); continue }
+      if (item.action_type === 'KICKED_GROUP_CLEANUP') {
+        let request
+        try { request = JSON.parse(item.request_json || '{}') } catch { request = {} }
+        const roomId = String(request.roomId || '').trim()
+          || (String(item.target_key || '').includes('::')
+            ? String(item.target_key).slice(String(item.target_key).indexOf('::') + 2)
+            : String(item.target_key || '')).trim()
+        const dbRow = getKickedGroupCleanup(record.id, roomId) || {}
+        const evidence = String(dbRow.evidence || request.evidence || '')
+        const roomName = resolveKickRoomLabel(record.id, roomId, dbRow.roomName || request.roomName || '')
+        const kickStatus = kickEvidenceStatusLabel(evidence)
+        const dbStatus = String(dbRow.status || '')
+        if (dbStatus === 'DONE') {
+          const message = formatKickCleanupMessage({
+            roomName, kickStatus, evidence, result: '已跳过：该群此前已清理完成',
+          })
+          setTaskItemResult(item.id, 'SKIPPED', dbRow, message)
+          appLog('INFO', message, {
+            instanceId: record.id, taskId, module: '被踢群清理', operation: '任务执行',
+            roomId, roomName, evidence, kickStatus, result: '已跳过（已完成）',
+          })
+          continue
+        }
+        if (dbStatus === 'CANCELLED') {
+          const message = formatKickCleanupMessage({
+            roomName, kickStatus, evidence, result: `已跳过：清理已取消（${dbRow.lastError || 'CANCELLED'}）`,
+          })
+          setTaskItemResult(item.id, 'SKIPPED', dbRow, message)
+          appLog('INFO', message, {
+            instanceId: record.id, taskId, module: '被踢群清理', operation: '任务执行',
+            roomId, roomName, evidence, kickStatus, result: '已跳过（已取消）',
+          })
+          continue
+        }
+        setTaskItemStarted(item.id)
+        appLog('INFO', formatKickCleanupMessage({
+          roomName, kickStatus, evidence, result: '开始清理（排队执行中）',
+        }), {
+          instanceId: record.id, taskId, module: '被踢群清理', operation: '任务执行',
+          roomId, roomName, evidence, kickStatus, result: '开始清理',
+        })
+        try {
+          const needsGate = !isImmediateKickEvidence(evidence)
+          let liveIds = kickLiveRoomIdsByInstance.get(record.id)
+          if (needsGate && !liveIds) {
+            liveIds = await loadLiveRoomIdsForKickGate(record)
+            kickLiveRoomIdsByInstance.set(record.id, liveIds)
+          }
+          if (!liveIds) liveIds = new Set()
+          const result = await cleanupOneKickedGroupRoom(record, {
+            roomId,
+            roomName,
+            evidence,
+            evidenceStrength: dbRow.evidenceStrength || request.evidenceStrength || 'strong',
+            accountWxid: dbRow.accountWxid || request.accountWxid || record.accountWxid || '',
+            unsaveStatus: dbRow.unsaveStatus || request.unsaveStatus || 'PENDING',
+            deleteChatStatus: dbRow.deleteChatStatus || request.deleteChatStatus || 'PENDING',
+            confirmCount: Number(dbRow.confirmCount ?? request.confirmCount) || 0,
+          }, { reason: '任务执行', liveIds, taskId })
+          setTaskItemResult(item.id, result.outcome, result, result.message)
+        } catch (error) {
+          const message = formatKickCleanupMessage({
+            roomName, kickStatus, evidence,
+            result: toUserErrorMessage(error, '退出失败'),
+          })
+          appLog('ERROR', message, {
+            instanceId: record.id, taskId, module: '被踢群清理', operation: '任务执行',
+            roomId, roomName, evidence, kickStatus, result: '退出失败', error: rawErrorMessage(error),
+          })
+          setTaskItemResult(item.id, 'FAILED', null, message)
+        }
+        if (itemIndex < taskItems.length - 1) {
+          const settings = generalSettings()
+          const min = Math.max(Number(settings.intervalMin) || 1, 1)
+          const max = Math.max(Number(settings.intervalMax) || min, min)
+          const waitMs = (min + Math.random() * (max - min)) * 1000
+          if (!await waitForTaskTime(taskId, Date.now() + waitMs)) {
+            if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
+            break
+          }
+        }
+        continue
+      }
       let request
       try { request = JSON.parse(item.request_json || '{}') } catch { request = {} }
       let apiPath = ''
@@ -1609,40 +2897,94 @@ async function runTask(taskId) {
       else if (item.action_type === 'QR_SCAN') { apiPath = '/api/qrscan'; sourceId = 438557574 }
       else if (item.action_type === 'ADD_FRIEND') { apiPath = '/api/add_friend'; sourceId = 438557515 }
       else { setTaskItemResult(item.id, 'SKIPPED', null, '接口未验证'); continue }
+      let friendRequestMeta = null
       if (item.action_type === 'ADD_FRIEND') {
-        if (!request.v3 || !request.v4) {
-          const resolution = await resolvePendingFriendProfile(record, request, taskId)
-          if (!resolution.ok) {
-            setTaskItemResult(item.id, 'RESOLUTION_FAILED', { diagnostics: resolution.diagnostics, missing: resolution.missing }, resolution.reason)
-            appLog('ERROR', '群成员资料解析最终失败', {
-              module: '群聊加好友', operation: 'PROFILE_RESOLUTION', taskId, instanceId: record.id,
-              accountWxid: String(request.accountWxid || record.accountWxid || ''), targetWxid: String(request.targetWxid || item.target_key),
-              sourceRoomId: String(request.sourceRoomId || ''), sourceRoomName: String(request.sourceRoomName || ''),
-              missing: resolution.missing.join(','), parserVersion: 'profile-resolution-v2',
-            })
-            continue
-          }
-          request.v3 = resolution.v3
-          request.v4 = resolution.v4
-          setTaskItemStatus(item.id, 'CREDENTIALS_READY')
+        // 执行前一律现取凭证：预缓存的 V4 会过期；消息 senderV3 不可信。
+        friendRequestMeta = { ...request }
+        const sourceRoomId = String(friendRequestMeta.sourceRoomId || '')
+        if (sourceRoomId.endsWith('@chatroom') && isChatroomBlockedForInstance(record.id, sourceRoomId)) {
+          setTaskItemResult(item.id, 'SKIPPED', null, '来源群已被确认为被踢群并永久屏蔽，已跳过')
+          continue
         }
-        const scene = String(request.scence ?? request.scene ?? '3')
-        const verifyContent = String(request.verifyContent ?? request.msg ?? '').trim() || DEFAULT_FRIEND_VERIFY_CONTENT
-        request = {
-          v3: String(request.v3 ?? ''),
-          v4: String(request.v4 ?? ''),
-          scence: scene,
-          friendFlg: String(request.friendFlg ?? '0'),
-          verifyContent,
+        const resolution = await resolvePendingFriendProfile(record, friendRequestMeta, taskId)
+        if (!resolution.ok) {
+          const resolveReason = resolution.reason || `凭证解析失败：缺少 ${(resolution.missing || []).join('、') || '资料'}`
+          setTaskItemResult(item.id, 'RESOLUTION_FAILED', { diagnostics: resolution.diagnostics, missing: resolution.missing }, resolveReason)
+          appLog('ERROR', `加好友失败：${resolveReason}`, {
+            module: '群聊加好友', operation: 'PROFILE_RESOLUTION', taskId, instanceId: record.id,
+            accountWxid: String(friendRequestMeta.accountWxid || record.accountWxid || ''), targetWxid: String(friendRequestMeta.targetWxid || item.target_key),
+            sourceRoomId: String(friendRequestMeta.sourceRoomId || ''), sourceRoomName: String(friendRequestMeta.sourceRoomName || ''),
+            missing: (resolution.missing || []).join(','), parserVersion: 'profile-resolution-v3',
+            reason: resolveReason, result: 'RESOLUTION_FAILED',
+          })
+          continue
         }
+        friendRequestMeta.v3 = resolution.v3
+        friendRequestMeta.v4 = resolution.v4
+        friendRequestMeta.credentialSource = resolution.credentialSource || ''
+        if (!/^v3_/i.test(String(friendRequestMeta.v3 || '')) || !/^v4_/i.test(String(friendRequestMeta.v4 || ''))) {
+          setTaskItemResult(item.id, 'RESOLUTION_FAILED', { missing: ['v3', 'v4'].filter((key) => key === 'v3' ? !/^v3_/i.test(String(friendRequestMeta.v3 || '')) : !/^v4_/i.test(String(friendRequestMeta.v4 || ''))) }, '凭证格式无效')
+          continue
+        }
+        if (!String(friendRequestMeta.sourceRoomId || '').endsWith('@chatroom')) {
+          setTaskItemResult(item.id, 'RESOLUTION_FAILED', null, '缺少群标识，无法按群场景加好友')
+          continue
+        }
+        setTaskItemStatus(item.id, 'CREDENTIALS_READY')
+        appLog('INFO', '加好友凭证已就绪', {
+          module: '群聊加好友', operation: 'CREDENTIALS_READY', taskId, instanceId: record.id,
+          accountWxid: String(friendRequestMeta.accountWxid || record.accountWxid || ''),
+          targetWxid: String(friendRequestMeta.targetWxid || item.target_key),
+          sourceRoomId: String(friendRequestMeta.sourceRoomId || ''),
+          credentialSource: resolution.credentialSource || '',
+          hasV3: Boolean(resolution.v3), hasV4: Boolean(resolution.v4),
+        })
+        request = buildAddFriendRequest({
+          v3: friendRequestMeta.v3,
+          v4: friendRequestMeta.v4,
+          scence: friendRequestMeta.scence,
+          scene: friendRequestMeta.scene,
+          friendFlg: friendRequestMeta.friendFlg,
+          verifyContent: friendRequestMeta.verifyContent ?? friendRequestMeta.msg,
+          sourceRoomId: friendRequestMeta.sourceRoomId,
+          targetWxid: friendRequestMeta.targetWxid || item.target_key,
+          defaultVerifyContent: DEFAULT_FRIEND_VERIFY_CONTENT,
+        })
       }
       let contentHash = ''
       try {
         const settings = generalSettings()
         if (item.action_type === 'SEND_TEXT' || item.action_type === 'SEND_IMAGE') {
           const isGroup = String(task?.type || '').endsWith('_TO_GROUP')
+          const targetIsGroup = String(item.target_key || '').endsWith('@chatroom')
+          if (isGroup !== targetIsGroup) {
+            setTaskItemResult(item.id, 'SKIPPED', null, isGroup ? '群聊群发任务中出现了好友对象，已跳过' : '好友群发任务中出现了群聊对象，已跳过')
+            continue
+          }
+          // 执行前强制对齐目标，避免 request.wxid 与 target_key 不一致发错人
+          request = {
+            ...(request && typeof request === 'object' ? request : {}),
+            wxid: String(item.target_key || ''),
+          }
+          if (item.action_type === 'SEND_TEXT' && !String(request.msg || '').trim()) {
+            setTaskItemResult(item.id, 'FAILED', null, '文字内容为空')
+            continue
+          }
+          if (item.action_type === 'SEND_IMAGE') {
+            const filepath = String(request.filepath || '').trim()
+            if (!filepath) {
+              setTaskItemResult(item.id, 'FAILED', null, '图片路径为空')
+              continue
+            }
+            if (!existsSync(filepath)) {
+              setTaskItemResult(item.id, 'FAILED', null, '图片文件不存在或已被移动，请重新选择图片后创建任务')
+              continue
+            }
+            request.filepath = filepath
+          }
           if (!hasDirectoryOwnership(item.instance_id, item.target_key, isGroup)) {
-            setTaskItemResult(item.id, 'SKIPPED', null, '该微信当前已不包含这个接收对象，任务已停止')
+            const blocked = isGroup && isChatroomBlockedForInstance(item.instance_id, item.target_key)
+            setTaskItemResult(item.id, 'SKIPPED', null, blocked ? '该群已被确认为被踢群并永久屏蔽，已跳过' : '该微信当前已不包含这个接收对象，已跳过')
             continue
           }
         }
@@ -1661,8 +3003,13 @@ async function runTask(taskId) {
         }
         setTaskItemStarted(item.id)
         const isSend = item.action_type === 'SEND_TEXT' || item.action_type === 'SEND_IMAGE'
-        const retryCount = isSend && task?.config?.autoRetry ? Math.max(Number(task.config.retryTimes) || 0, 0) : 0
-        const retryWaitMs = Math.max(Number(task?.config?.retryMinutes) || 1, 1) * 60000
+        // 加好友：凭证偶发失效时自动刷新重试 1 次（不依赖用户手动重跑）
+        const retryCount = isSend && task?.config?.autoRetry
+          ? Math.max(Number(task.config.retryTimes) || 0, 0)
+          : (item.action_type === 'ADD_FRIEND' ? 1 : 0)
+        const retryWaitMs = item.action_type === 'ADD_FRIEND'
+          ? 800
+          : Math.max(Number(task?.config?.retryMinutes) || 1, 1) * 60000
         // 链接进群：无需本地图片扫码，直接走 enter_room
         if (item.action_type === 'QR_SCAN' && (request.url || request.link || request.decodedText)) {
           const linkText = String(request.url || request.link || request.decodedText || '')
@@ -1671,20 +3018,27 @@ async function runTask(taskId) {
             setTaskItemResult(item.id, 'FREQUENT', joinResult.joinResponse, '已经频繁')
             setTaskStatus(taskId, 'COOLING_DOWN')
             const coolUntil = Date.now() + Math.max(Number(task?.config?.coolMinutes) || 30, 1) * 60000
-            if (!await waitForTaskTime(taskId, coolUntil)) {
+            if (!await waitForTaskTime(taskId, coolUntil, { earlyContinueStatuses: ['QUEUED', 'RUNNING'] })) {
               if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
               return
             }
             const cooled = listTasks().find((candidate) => candidate.id === taskId)
             if (!cooled || ['PAUSED', 'CANCELLED'].includes(cooled.status)) return
-            if (cooled.status === 'COOLING_DOWN') setTaskStatus(taskId, 'RUNNING')
+            if (['COOLING_DOWN', 'QUEUED'].includes(String(cooled.status || ''))) setTaskStatus(taskId, 'RUNNING')
           } else if (joinResult.skippedPersonal) {
             setTaskItemResult(item.id, 'SKIPPED', joinResult, '已跳过个人二维码')
           } else if (joinResult.skippedLimit) {
             setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '已达到今日进群上限')
+          } else if (joinResult.alreadyIn) {
+            setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '进群前已在该群中')
+          } else if (joinResult.requestSent) {
+            setTaskItemResult(item.id, 'REQUEST_SENT', joinResult, joinResult.reason || '进群申请已提交，等待群主确认')
+            appLog('INFO', joinResult.reason || '进群申请已提交', {
+              instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群申请',
+            })
           } else if (joinResult.scannedOnly || !joinResult.joinSubmitted) {
             // 非微信群链接（个人码未跳过配置、QQ 群等）不得记为进群成功
-            const linkType = classifyQrText(linkText)
+            const linkType = resolveTaskQrType(item, request, linkText)
             const reason = joinResult.reason || (linkType === 'QQ_GROUP_LINK'
               ? 'QQ群链接不支持微信进群，已跳过'
               : linkType === 'PERSONAL_LINK'
@@ -1695,15 +3049,19 @@ async function runTask(taskId) {
             const ok = joinResult.joinOk === true
             const detail = ok
               ? (joinResult.reason || '进群成功')
-              : (joinResult.reason || '进群未确认成功（接口空结果不能算完成）')
-            setTaskItemResult(item.id, ok ? 'COMPLETED' : 'FAILED', joinResult.joinResponse ?? joinResult, ok ? detail : detail)
+              : (joinResult.reason || '群列表未出现目标群，未能确认进群成功')
+            // 存完整 joinResult（含 preview.roomName），任务目标列可显示群名
+            setTaskItemResult(item.id, ok ? 'COMPLETED' : 'FAILED', joinResult, detail)
           }
           if (itemIndex < taskItems.length - 1) {
             const settings = generalSettings()
             const min = Math.max(Number(settings.intervalMin) || 1, 1)
             const max = Math.max(Number(settings.intervalMax) || min, min)
             const waitMs = (min + Math.random() * (max - min)) * 1000
-            await new Promise((resolve) => setTimeout(resolve, waitMs))
+            if (!await waitForTaskTime(taskId, Date.now() + waitMs)) {
+              if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
+              break
+            }
           }
           continue
         }
@@ -1719,25 +3077,84 @@ async function runTask(taskId) {
             setTaskStatus(taskId, 'COOLING_DOWN')
             appLog('ERROR', '任务因频繁状态冷却中', { instanceId: record.id, taskId, sourceId, evidence: raw })
             const coolUntil = Date.now() + Math.max(Number(task?.config?.coolMinutes) || 30, 1) * 60000
-            if (!await waitForTaskTime(taskId, coolUntil)) {
+            if (!await waitForTaskTime(taskId, coolUntil, { earlyContinueStatuses: ['QUEUED', 'RUNNING'] })) {
               if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
               return
             }
             const cooled = listTasks().find((candidate) => candidate.id === taskId)
             if (!cooled || ['PAUSED', 'CANCELLED'].includes(cooled.status)) return
-            if (cooled.status === 'COOLING_DOWN') setTaskStatus(taskId, 'RUNNING')
+            if (['COOLING_DOWN', 'QUEUED'].includes(String(cooled.status || ''))) setTaskStatus(taskId, 'RUNNING')
             break
           }
           if (item.action_type === 'ADD_FRIEND') {
             const verdict = evaluateFriendAddResult(response.ok, raw)
+            const targetLabel = String(request.wxid || item.target_key || '')
+            const friendNick = String(friendRequestMeta?.nickname || request.nickname || item.targetLabel || '').trim()
+            const friendRoomName = String(friendRequestMeta?.sourceRoomName || request.sourceRoomName || '').trim()
+            const businessCode = raw?.baseResponse?.ret ?? raw?.code ?? raw?.errCode ?? raw?.data?.code ?? null
+            if (!verdict.accepted && attempt < retryCount && friendRequestMeta
+              && isRetryableFriendCredentialFailure(response.ok, raw, verdict)) {
+              appLog('WARN', `加好友凭证类失败，刷新凭证后自动重试：${verdict.reason}`, {
+                instanceId: record.id, module: '群聊加好友', operation: 'ADD_FRIEND_RETRY', taskId,
+                businessCode, targetWxid: targetLabel, nickname: friendNick, roomName: friendRoomName,
+                accountWxid: String(record.accountWxid || ''),
+                attempt: attempt + 2, reason: verdict.reason,
+              })
+              await new Promise((resolve) => setTimeout(resolve, retryWaitMs))
+              const refreshed = await resolvePendingFriendProfile(record, friendRequestMeta, taskId)
+              if (!refreshed.ok) {
+                setTaskItemResult(item.id, 'RESOLUTION_FAILED', { diagnostics: refreshed.diagnostics, missing: refreshed.missing, previous: raw }, refreshed.reason || verdict.reason)
+                break
+              }
+              friendRequestMeta.v3 = refreshed.v3
+              friendRequestMeta.v4 = refreshed.v4
+              friendRequestMeta.credentialSource = refreshed.credentialSource || ''
+              request = buildAddFriendRequest({
+                v3: friendRequestMeta.v3,
+                v4: friendRequestMeta.v4,
+                scence: friendRequestMeta.scence,
+                scene: friendRequestMeta.scene,
+                friendFlg: friendRequestMeta.friendFlg,
+                verifyContent: friendRequestMeta.verifyContent ?? friendRequestMeta.msg,
+                sourceRoomId: friendRequestMeta.sourceRoomId,
+                targetWxid: friendRequestMeta.targetWxid || item.target_key,
+                defaultVerifyContent: DEFAULT_FRIEND_VERIFY_CONTENT,
+              })
+              continue
+            }
             if (!verdict.accepted) {
-              appLog('ERROR', '添加好友业务请求被拒绝', {
+              appLog('ERROR', `加好友失败：${friendNick || '好友'}${verdict.reason ? `：${verdict.reason}` : ''}`, {
                 instanceId: record.id,
+                module: '群聊加好友',
+                operation: 'ADD_FRIEND_RESULT',
                 taskId,
                 sourceId,
+                path: apiPath,
                 status: response.status,
-                businessCode: raw?.code ?? raw?.errCode ?? raw?.data?.code ?? null,
+                businessCode,
+                targetWxid: targetLabel,
+                nickname: friendNick,
+                roomName: friendRoomName,
+                accountWxid: String(record.accountWxid || ''),
                 reason: verdict.reason,
+                result: 'FAILED',
+              })
+            } else {
+              appLog('INFO', `加好友成功：${friendNick || verdict.reason || '申请已提交'}`, {
+                instanceId: record.id,
+                module: '群聊加好友',
+                operation: 'ADD_FRIEND_RESULT',
+                taskId,
+                sourceId,
+                path: apiPath,
+                status: response.status,
+                businessCode: businessCode ?? 0,
+                targetWxid: targetLabel,
+                nickname: friendNick,
+                roomName: friendRoomName,
+                accountWxid: String(record.accountWxid || ''),
+                reason: verdict.reason,
+                result: 'REQUEST_SENT',
               })
             }
             setTaskItemResult(item.id, verdict.accepted ? 'REQUEST_SENT' : 'FAILED', raw, verdict.reason)
@@ -1766,13 +3183,13 @@ async function runTask(taskId) {
                 setTaskItemResult(item.id, 'FREQUENT', joinResult.joinResponse, '已经频繁')
                 setTaskStatus(taskId, 'COOLING_DOWN')
                 const coolUntil = Date.now() + Math.max(Number(task?.config?.coolMinutes) || 30, 1) * 60000
-                if (!await waitForTaskTime(taskId, coolUntil)) {
+                if (!await waitForTaskTime(taskId, coolUntil, { earlyContinueStatuses: ['QUEUED', 'RUNNING'] })) {
                   if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
                   return
                 }
                 const cooled = listTasks().find((candidate) => candidate.id === taskId)
                 if (!cooled || ['PAUSED', 'CANCELLED'].includes(cooled.status)) return
-                if (cooled.status === 'COOLING_DOWN') setTaskStatus(taskId, 'RUNNING')
+                if (['COOLING_DOWN', 'QUEUED'].includes(String(cooled.status || ''))) setTaskStatus(taskId, 'RUNNING')
                 break
               }
               if (joinResult.skippedPersonal) {
@@ -1783,8 +3200,19 @@ async function runTask(taskId) {
                 setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '已达到今日进群上限')
                 break
               }
+              if (joinResult.alreadyIn) {
+                setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '进群前已在该群中')
+                break
+              }
+              if (joinResult.requestSent) {
+                setTaskItemResult(item.id, 'REQUEST_SENT', joinResult, joinResult.reason || '进群申请已提交，等待群主确认')
+                appLog('INFO', joinResult.reason || '进群申请已提交', {
+                  instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群申请',
+                })
+                break
+              }
               if (joinResult.scannedOnly || !joinResult.joinSubmitted) {
-                const linkType = classifyQrText(effectiveDecodedText)
+                const linkType = resolveTaskQrType(item, request, effectiveDecodedText)
                 const reason = joinResult.reason || (linkType === 'QQ_GROUP_LINK'
                   ? 'QQ群链接不支持微信进群，已跳过'
                   : linkType === 'PERSONAL_LINK'
@@ -1797,8 +3225,8 @@ async function runTask(taskId) {
                 const ok = joinResult.joinOk === true
                 const detail = ok
                   ? (joinResult.reason || '进群成功')
-                  : (joinResult.reason || '进群未确认成功（接口空结果不能算完成）')
-                setTaskItemResult(item.id, ok ? 'COMPLETED' : 'FAILED', joinResult.joinResponse ?? joinResult, detail)
+                  : (joinResult.reason || '群列表未出现目标群，未能确认进群成功')
+                setTaskItemResult(item.id, ok ? 'COMPLETED' : 'FAILED', joinResult, detail)
               }
               break
             }
@@ -1824,35 +3252,128 @@ async function runTask(taskId) {
         const min = Math.max(Number(settings.intervalMin) || 1, 1)
         const max = Math.max(Number(settings.intervalMax) || min, min)
         const waitMs = (min + Math.random() * (max - min)) * 1000
-        await new Promise((resolve) => setTimeout(resolve, waitMs))
+        if (!await waitForTaskTime(taskId, Date.now() + waitMs)) {
+          if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
+          break
+        }
       }
     }
     const finalTask = listTasks().find((item) => item.id === taskId)
     if (finalTask?.status === 'RUNNING') setTaskStatus(taskId, finalTask.failed > 0 ? 'PARTIAL_FAILED' : 'COMPLETED')
-  } finally { runningTasks.delete(taskId) }
+  } finally {
+    runningTasks.delete(taskId)
+    // 暂停退出与「继续」竞态时可能停在 QUEUED 且无执行体，这里补拉一次
+    const leftover = listTasks().find((item) => item.id === taskId)
+    if (leftover && leftover.status === 'QUEUED' && runtimeAllowed) {
+      setImmediate(() => runTask(taskId))
+    }
+  }
 }
 
 function createLocalTask(payload) {
-  const allowed = new Set(['SEND_TEXT_TO_FRIEND', 'SEND_TEXT_TO_GROUP', 'SEND_IMAGE_TO_FRIEND', 'SEND_IMAGE_TO_GROUP', 'SEND_MIXED_TO_FRIEND', 'SEND_MIXED_TO_GROUP', 'QR_SCAN', 'ADD_FRIEND'])
-  if (!payload || !allowed.has(payload.type)) throw new Error('不支持的任务类型')
-  if (!Array.isArray(payload.items) || !payload.items.length) throw new Error('任务没有目标')
-  const task = { id: randomUUID(), name: String(payload.name || payload.type), type: payload.type, status: 'WAITING_CONFIRMATION', config: payload.config ?? {} }
-  const items = payload.items.map((item) => {
-    const defaultAction = payload.type === 'QR_SCAN' ? 'QR_SCAN' : payload.type === 'ADD_FRIEND' ? 'ADD_FRIEND' : payload.type.startsWith('SEND_IMAGE') ? 'SEND_IMAGE' : 'SEND_TEXT'
-    const actionType = String(item.actionType || defaultAction)
-    if (!['SEND_TEXT', 'SEND_IMAGE', 'QR_SCAN', 'ADD_FRIEND'].includes(actionType)) throw new Error('任务包含不支持的发送内容')
-    const instanceId = String(item.instanceId)
-    const targetKey = String(item.targetKey)
-    if (actionType === 'SEND_TEXT' || actionType === 'SEND_IMAGE') {
-      const isGroup = payload.type.endsWith('_TO_GROUP')
-      if (!hasDirectoryOwnership(instanceId, targetKey, isGroup)) throw new Error('所选微信不包含这个接收对象，请刷新通讯录后重试')
+  try {
+    if (payload == null) throw new Error('任务数据无法传输（可能勾选对象过多），请减少数量或重启软件后重试')
+    const allowed = new Set(['SEND_TEXT_TO_FRIEND', 'SEND_TEXT_TO_GROUP', 'SEND_IMAGE_TO_FRIEND', 'SEND_IMAGE_TO_GROUP', 'SEND_MIXED_TO_FRIEND', 'SEND_MIXED_TO_GROUP', 'QR_SCAN', 'ADD_FRIEND', 'KICKED_GROUP_CLEANUP'])
+    if (!payload || !allowed.has(payload.type)) throw new Error('不支持的任务类型')
+    if (!Array.isArray(payload.items) || !payload.items.length) throw new Error('任务没有目标')
+    const taskType = String(payload.type || '')
+    const isSendTask = taskType.startsWith('SEND_')
+    const isGroupTask = taskType.endsWith('_TO_GROUP')
+    const task = {
+      id: randomUUID(),
+      name: String(payload.name || payload.type),
+      type: payload.type,
+      status: 'WAITING_CONFIRMATION',
+      config: payload.config && typeof payload.config === 'object' ? payload.config : {},
     }
-    const itemStatus = actionType === 'ADD_FRIEND' && item.status === 'PROFILE_PENDING' ? 'PROFILE_PENDING' : 'QUEUED'
-    return { id: randomUUID(), instanceId, targetKey, actionType, status: itemStatus, request: item.request }
-  })
-  const created = createTask(task, items)
-  if (!created.inserted) throw new Error('这些成员已经创建过加好友任务，本次没有重复添加')
-  return { ...listTasks().find((item) => item.id === task.id), deduplicated: created.duplicates }
+    // 两千级目标时避免逐条 SQL 校验归属；按实例预加载通讯录集合
+    const ownershipCache = new Map()
+    const ownedKeysOf = (instanceId) => {
+      const key = String(instanceId || '')
+      if (ownershipCache.has(key)) return ownershipCache.get(key)
+      const set = loadDirectoryOwnershipSet(key, isGroupTask)
+      ownershipCache.set(key, set)
+      return set
+    }
+    const defaultActionOf = () => {
+      if (taskType === 'QR_SCAN') return 'QR_SCAN'
+      if (taskType === 'ADD_FRIEND') return 'ADD_FRIEND'
+      if (taskType === 'KICKED_GROUP_CLEANUP') return 'KICKED_GROUP_CLEANUP'
+      // SEND_MIXED 必须显式带 actionType；纯图片任务才默认 SEND_IMAGE
+      if (taskType.startsWith('SEND_IMAGE') && !taskType.includes('MIXED')) return 'SEND_IMAGE'
+      return 'SEND_TEXT'
+    }
+    const items = payload.items.map((item, index) => {
+      const actionType = String(item.actionType || defaultActionOf())
+      if (isSendTask && !['SEND_TEXT', 'SEND_IMAGE'].includes(actionType)) {
+        throw new Error(`群发任务第 ${index + 1} 项内容类型无效`)
+      }
+      if (!['SEND_TEXT', 'SEND_IMAGE', 'QR_SCAN', 'ADD_FRIEND', 'KICKED_GROUP_CLEANUP'].includes(actionType)) throw new Error('任务包含不支持的发送内容')
+      if (taskType.includes('MIXED') && !item.actionType) {
+        throw new Error('图文混发必须标明每条是文字还是图片')
+      }
+      const instanceId = String(item.instanceId || '')
+      const targetKey = String(item.targetKey || '').trim()
+      if (!instanceId || !targetKey) throw new Error('任务目标缺少微信号或接收对象')
+      const targetIsGroup = targetKey.endsWith('@chatroom')
+      if (actionType === 'SEND_TEXT' || actionType === 'SEND_IMAGE') {
+        if (isGroupTask && !targetIsGroup) throw new Error('群聊群发只能选择群聊对象')
+        if (!isGroupTask && targetIsGroup) throw new Error('好友群发不能选择群聊对象')
+        if (!ownedKeysOf(instanceId).has(targetKey)) {
+          if (isGroupTask && isChatroomBlockedForInstance(instanceId, targetKey)) {
+            throw new Error('所选群包含已确认被踢并屏蔽的群，请刷新通讯录后重选')
+          }
+          throw new Error('所选微信不包含这个接收对象，请刷新通讯录后重试')
+        }
+      }
+      let request = null
+      if (actionType === 'SEND_TEXT') {
+        const msg = String(item.request?.msg || '').trim()
+        if (!msg) throw new Error('文字内容不能为空')
+        request = {
+          wxid: targetKey,
+          msg,
+          nickname: String(item.request?.nickname || '').trim(),
+        }
+      } else if (actionType === 'SEND_IMAGE') {
+        const filepath = String(item.request?.filepath || '').trim()
+        if (!filepath) throw new Error('图片路径不能为空')
+        if (!existsSync(filepath)) throw new Error('图片文件不存在，请重新选择图片')
+        request = {
+          wxid: targetKey,
+          filepath,
+          nickname: String(item.request?.nickname || '').trim(),
+        }
+      } else if (item.request && typeof item.request === 'object') {
+        request = item.request
+      }
+      const itemStatus = actionType === 'ADD_FRIEND' && item.status === 'PROFILE_PENDING' ? 'PROFILE_PENDING' : 'QUEUED'
+      return { id: randomUUID(), instanceId, targetKey, actionType, status: itemStatus, request }
+    })
+    if (isSendTask) {
+      const hasText = items.some((item) => item.actionType === 'SEND_TEXT')
+      const hasImage = items.some((item) => item.actionType === 'SEND_IMAGE')
+      if (taskType.includes('MIXED') && !(hasText && hasImage)) throw new Error('图文混发任务必须同时包含文字和图片步骤')
+      if (taskType.startsWith('SEND_TEXT') && hasImage) throw new Error('文字群发任务不能包含图片步骤')
+      if (taskType.startsWith('SEND_IMAGE') && !taskType.includes('MIXED') && hasText) throw new Error('图片群发任务不能包含文字步骤')
+    }
+    const created = createTask(task, items)
+    if (!created.inserted) throw new Error('任务没有可写入的目标')
+    const row = listTasks().find((item) => item.id === task.id)
+    return safeCloneForIpc({ ...(row || { id: task.id, name: task.name, type: task.type, status: task.status }), deduplicated: created.duplicates }, { id: task.id, deduplicated: created.duplicates })
+  } catch (error) {
+    const message = toUserErrorMessage(error, '创建任务失败')
+    appLog('ERROR', '创建任务失败', {
+      module: '任务中心',
+      operation: 'CREATE_TASK',
+      error: rawErrorMessage(error),
+      message,
+      itemCount: Array.isArray(payload?.items) ? payload.items.length : 0,
+      type: String(payload?.type || ''),
+    })
+    // SqliteError 等不可 structured-clone，统一转成普通 Error，避免界面只看到「数据传输失败」
+    throw new Error(message)
+  }
 }
 
 function portAvailable(port) {
@@ -1897,7 +3418,7 @@ async function killVerifiedProcessTree(pid, expectedExecutables) {
 }
 
 function publicInstance(value) {
-  return { id: value.id, apiPort: value.apiPort, tcpPort: value.tcpPort, pid: value.child?.pid ?? value.pid ?? null, accountWxid: value.accountWxid, nickname: value.nickname, avatar: value.avatar, status: value.status, managed: Boolean(value.managed), error: value.error, lastCallbackAt: value.lastCallbackAt, lastProbeAt: value.lastProbeAt }
+  return { id: value.id, apiPort: value.apiPort, tcpPort: value.tcpPort, pid: value.child?.pid ?? value.pid ?? null, accountWxid: value.accountWxid, nickname: value.nickname, alias: value.alias, avatar: value.avatar, status: value.status, managed: Boolean(value.managed), error: value.error, lastCallbackAt: value.lastCallbackAt, lastProbeAt: value.lastProbeAt }
 }
 
 function markInstanceStopped(record, reason = '微信已关闭') {
@@ -2140,11 +3661,22 @@ function registerIpc() {
   ipcMain.handle('chatAdd:listCandidates', (_event, filters) => listChatAddCandidates(filters || {}))
   ipcMain.handle('chatAdd:clearCandidates', (_event, filters) => { requireRuntime(); return clearChatAddCandidates(filters || {}) })
   ipcMain.handle('chatAdd:markTasked', (_event, ids) => { requireRuntime(); return markChatAddCandidatesTasked(Array.isArray(ids) ? ids : []) })
-  ipcMain.handle('tasks:list', () => listTasks())
-  ipcMain.handle('tasks:items', (_event, id) => getTaskItems(id))
-  ipcMain.handle('tasks:create', (_event, payload) => { requireRuntime(); return createLocalTask(payload) })
+  ipcMain.handle('tasks:list', () => safeCloneForIpc(listTasks(), []))
+  ipcMain.handle('tasks:items', (_event, id) => safeCloneForIpc(getTaskItems(id), []))
+  ipcMain.handle('tasks:create', (_event, payload) => { requireRuntime(); return createLocalTask(payload) }) // createLocalTask 内部已 safeClone + 普通 Error
   ipcMain.handle('tasks:confirm', (_event, id) => { requireRuntime(); const task = listTasks().find((item) => item.id === id); if (!task) throw new Error('任务不存在'); if (task.status !== 'WAITING_CONFIRMATION') throw new Error('任务当前不可确认'); setTaskStatus(id, 'QUEUED'); setImmediate(() => runTask(id)); return true })
   ipcMain.handle('tasks:pause', (_event, id) => { setTaskStatus(id, 'PAUSED'); return true })
+  ipcMain.handle('tasks:resume', (_event, id) => {
+    requireRuntime()
+    const task = listTasks().find((item) => item.id === id)
+    if (!task) throw new Error('任务不存在')
+    if (!['PAUSED', 'COOLING_DOWN'].includes(String(task.status || ''))) throw new Error('当前状态不可继续，仅已暂停/冷却中的任务可继续')
+    setTaskStatus(id, 'QUEUED')
+    // 冷却等待中 runTask 仍占着 runningTasks：只改状态，让现有循环提前结束冷却并继续
+    if (runningTasks.has(id)) return true
+    setImmediate(() => runTask(id))
+    return true
+  })
   ipcMain.handle('tasks:cancel', (_event, id) => { requireRuntime(); return cancelTask(id) })
   ipcMain.handle('settings:get', () => {
     const settings = getSettings()
@@ -2174,6 +3706,10 @@ function registerIpc() {
       weixinAutoDetected: Boolean(isWeixinExe(normalized.weixinExe)),
     }
   })
+  ipcMain.handle('kicked-groups:cleanup', async () => {
+    requireRuntime()
+    return prepareKickedGroupCleanupTask('手动创建被踢群清理任务')
+  })
   ipcMain.handle('weixin:detect', () => {
     requireRuntime()
     const result = ensureWeixinPathConfigured({ force: true })
@@ -2194,6 +3730,7 @@ function registerIpc() {
     currentVersion: VERSION,
     currentReleaseSequence: RELEASE_SEQUENCE,
     isPackaged: app.isPackaged,
+    clientId: String(getRemoteAgentStatus()?.clientId || ''),
   }))
   ipcMain.handle('update:apply', async (event) => {
     const sendProgress = (payload) => {
@@ -2210,6 +3747,7 @@ function registerIpc() {
       currentVersion: VERSION,
       currentReleaseSequence: RELEASE_SEQUENCE,
       isPackaged: app.isPackaged,
+      clientId: String(getRemoteAgentStatus()?.clientId || ''),
       onLog: (level, message, details) => appLog(level, message, details),
       onProgress: (downloaded, total) => {
         const percent = total > 0 ? (downloaded * 100) / total : 0
@@ -2222,6 +3760,14 @@ function registerIpc() {
   })
   ipcMain.handle('update:mark-done', () => { markStartupUpdateDone(); return true })
   ipcMain.handle('directory:sync', (_event, payload) => { syncDirectorySnapshot(payload); return true })
+  ipcMain.handle('directory:list-blocked', () => listBlockedChatrooms())
+  ipcMain.handle('directory:blocked-room-ids', (_event, instanceIds) => {
+    const ids = Array.isArray(instanceIds) ? instanceIds.map(String).filter(Boolean) : []
+    /** @type {Record<string, string[]>} */
+    const out = {}
+    for (const id of ids) out[id] = [...loadBlockedRoomIdSetForInstance(id)]
+    return out
+  })
   ipcMain.handle('qr:list', () => listQrItems())
   ipcMain.handle('qr:import-files', async () => {
     const result = await dialog.showOpenDialog({ defaultPath: generalSettings().qrDir || undefined, properties: ['openFile', 'multiSelections'], filters: [{ name: '二维码图片', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp'] }] })
@@ -2248,7 +3794,18 @@ function registerIpc() {
   })
   ipcMain.handle('qr:import-links', (_event, text) => {
     const links = String(text || '').split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
-    for (const link of links) saveQrItem({ id: randomUUID(), sha256: createHash('sha256').update(link).digest('hex').toUpperCase(), source: '链接导入', decodedText: link, qrType: classifyQrText(link), status: 'REFERENCE_ONLY' })
+    for (const link of links) {
+      const decodedText = normalizeQrText(link) || link
+      const hash = contentHash(decodedText)
+      saveQrItem({
+        id: randomUUID(),
+        sha256: hash,
+        source: '链接导入',
+        decodedText,
+        qrType: classifyQrText(decodedText),
+        status: 'REFERENCE_ONLY',
+      })
+    }
     return listQrItems()
   })
   ipcMain.handle('qr:collect-history', async (event, payload) => {
@@ -2335,7 +3892,8 @@ function registerIpc() {
     const record = instances.get(instanceId)
     if (!record || record.status !== 'ONLINE') throw new Error('没有可用的在线微信，无法解析群资料')
     if (!urls.length) return []
-    const limited = urls.slice(0, 15)
+    // 与多账号容量对齐，避免确认弹窗只预览前几条
+    const limited = urls.slice(0, 100)
     const rows = []
     for (const url of limited) {
       const type = classifyQrText(url)
@@ -2408,6 +3966,12 @@ function registerIpc() {
     }
   })
   ipcMain.handle('qr:delete', (_event, ids) => { deleteQrItems(Array.isArray(ids) ? ids : []); return listQrItems() })
+  ipcMain.handle('qr:update-type', (_event, payload) => {
+    const id = payload && typeof payload === 'object' ? String(payload.id || '') : ''
+    const qrType = payload && typeof payload === 'object' ? String(payload.qrType || '') : ''
+    const ok = updateQrItemType(id, qrType)
+    return { ok, items: listQrItems() }
+  })
   ipcMain.handle('files:select-image', async () => {
     const result = await dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp'] }] })
     return result.canceled ? '' : result.filePaths[0]
@@ -2430,22 +3994,23 @@ function registerIpc() {
   })
   /** 在资源管理器中打开文件所在目录并选中；路径仅目录时则打开该目录。 */
   ipcMain.handle('files:reveal-in-folder', async (_event, targetPath) => {
-    const raw = typeof targetPath === 'string' ? targetPath.trim() : ''
+    const raw = typeof targetPath === 'string' ? targetPath.trim().replace(/^["']|["']$/g, '') : ''
     if (!raw || raw === '-') return { ok: false, message: '该记录没有保存路径' }
     try {
-      if (existsSync(raw)) {
-        const st = statSync(raw)
+      const normalized = path.normalize(raw)
+      if (existsSync(normalized)) {
+        const st = statSync(normalized)
         if (st.isDirectory()) {
-          const err = await shell.openPath(raw)
+          const err = await shell.openPath(normalized)
           return err ? { ok: false, message: err } : { ok: true }
         }
-        shell.showItemInFolder(raw)
+        shell.showItemInFolder(normalized)
         return { ok: true }
       }
-      const dir = path.dirname(raw)
+      const dir = path.dirname(normalized)
       if (dir && existsSync(dir)) {
         const err = await shell.openPath(dir)
-        return err ? { ok: false, message: err } : { ok: true }
+        return err ? { ok: false, message: err } : { ok: true, message: '图片文件已不存在，已打开所在文件夹' }
       }
       return { ok: false, message: '文件或目录不存在' }
     } catch (error) {
@@ -2512,6 +4077,38 @@ function closeSplashWindow() {
   if (win && !win.isDestroyed()) win.destroy()
 }
 
+/**
+ * 与便携包/桌面快捷方式同一套图标（electron-builder win.icon）。
+ * @returns {string}
+ */
+function resolveAppIconPath() {
+  const candidates = [
+    path.join(__dirname, 'app-icon.ico'),
+    path.join(process.resourcesPath || '', 'app-icon.ico'),
+    path.join(__dirname, 'tray-icon.png'),
+  ]
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate
+  }
+  return path.join(__dirname, 'app-icon.ico')
+}
+
+/**
+ * @param {{ width?: number, height?: number }} [size]
+ * @returns {import('electron').NativeImage}
+ */
+function resolveAppNativeImage(size = {}) {
+  const iconPath = resolveAppIconPath()
+  let icon = nativeImage.createFromPath(iconPath)
+  if (icon.isEmpty()) {
+    icon = nativeImage.createFromDataURL('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==')
+  }
+  const width = Number(size.width) || 0
+  const height = Number(size.height) || 0
+  if (width > 0 && height > 0 && !icon.isEmpty()) return icon.resize({ width, height })
+  return icon
+}
+
 function createSplashWindow() {
   if (splashWindow && !splashWindow.isDestroyed()) return splashWindow
   const win = new BrowserWindow({
@@ -2524,6 +4121,7 @@ function createSplashWindow() {
     center: true,
     alwaysOnTop: true,
     skipTaskbar: true,
+    icon: resolveAppIconPath(),
     backgroundColor: '#ffffff',
     webPreferences: {
       contextIsolation: true,
@@ -2546,11 +4144,13 @@ function createSplashWindow() {
 function createWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) return mainWindow
   const bounds = fitWindowBounds()
+  const appIconPath = resolveAppIconPath()
   const win = new BrowserWindow({
     ...bounds,
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#F4F5F7',
+    icon: appIconPath,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -2558,6 +4158,7 @@ function createWindow() {
     },
   })
   mainWindow = win
+  try { win.setIcon(appIconPath) } catch { /* 部分环境 setIcon 不可用 */ }
   win.setMenu(null)
   win.on('close', (event) => {
     if (quitting) return
@@ -2637,14 +4238,8 @@ function restartApp() {
 function createTray() {
   if (tray) return tray
   try {
-    let icon = nativeImage.createFromPath(path.join(__dirname, 'app-icon.ico'))
-    if (icon.isEmpty()) icon = nativeImage.createFromPath(path.join(__dirname, 'tray-icon.png'))
-    if (icon.isEmpty()) {
-      // 1x1 占位，避免部分机器因图标为空直接抛错导致启动中断
-      icon = nativeImage.createFromDataURL('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==')
-    } else {
-      icon = icon.resize({ width: 16, height: 16 })
-    }
+    // 托盘也用桌面同款图标，避免任务栏/托盘两套图不一致
+    const icon = resolveAppNativeImage({ width: 16, height: 16 })
     tray = new Tray(icon)
     tray.setToolTip('微信群控管理平台')
     const displayVersion = String(app.getVersion() || '').replace(/^(\d+\.\d+).*$/, '$1')
@@ -2668,6 +4263,24 @@ app.whenReady().then(async () => {
   try {
     initStorage(app.getPath('userData'))
     softwareAuth.initSoftwareAuth(app.getPath('userData'))
+    // 新版首次启动：清旧缓存/诊断落盘，保留设置、任务、登录态与设备身份
+    try {
+      const scrub = scrubLegacyCachesOnStartup({
+        userDataDir: app.getPath('userData'),
+        version: VERSION,
+        portableExePath: resolvePortableExePath(),
+        storage: { clearApiSamplesOnly },
+      })
+      if (!scrub.skipped) {
+        appLog('INFO', '已清理旧版缓存目录', {
+          module: '启动清理',
+          removed: scrub.removed.length,
+          dbRows: scrub.dbRows,
+        })
+      }
+    } catch (error) {
+      appLog('WARN', '启动缓存清理未完成', { module: '启动清理', error: rawErrorMessage(error) })
+    }
     saveSetting('general', normalizeSettings(getSettings().general))
     const storedQrMonitor = getSettings().qrMonitor
     if (storedQrMonitor && typeof storedQrMonitor === 'object') {

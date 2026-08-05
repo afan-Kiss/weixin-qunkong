@@ -52,7 +52,14 @@ def _valid_uploaded_parts(parts: Path, expected: int, chunk_size: int) -> list[i
     return uploaded
 
 
-def begin_chunked_upload(data_dir: Path, build_id: str, file_name: str, file_size: int) -> dict[str, Any]:
+def begin_chunked_upload(
+    data_dir: Path,
+    build_id: str,
+    file_name: str,
+    file_size: int,
+    chunk_size: int | None = None,
+) -> dict[str, Any]:
+    """Start (or resume) a parts upload. Optional chunk_size up to 4MB for faster uplinks."""
     bid = _safe_build_id(build_id)
     if not bid:
         return {"ok": False, "message": "buildId 无效"}
@@ -67,6 +74,11 @@ def begin_chunked_upload(data_dir: Path, build_id: str, file_name: str, file_siz
     name = Path(str(file_name or (bid + ".exe"))).name
     if not name.lower().endswith(".exe"):
         name = bid + ".exe"
+    try:
+        requested = int(chunk_size) if chunk_size is not None else PART_CHUNK_SIZE
+    except Exception:
+        requested = PART_CHUNK_SIZE
+    cs = max(64 * 1024, min(MAX_PART_CHUNK_SIZE, requested or PART_CHUNK_SIZE))
     root = _root(data_dir) / "packages"
     tmp = root / (bid + ".exe.partial")
     dest = root / (bid + ".exe")
@@ -80,14 +92,15 @@ def begin_chunked_upload(data_dir: Path, build_id: str, file_name: str, file_siz
                 row = json.loads(sess.read_text(encoding="utf-8"))
             except Exception:
                 row = {}
+            row_cs = int(row.get("chunkSize") or PART_CHUNK_SIZE) if isinstance(row, dict) else PART_CHUNK_SIZE
             if (
                 isinstance(row, dict)
                 and str(row.get("mode") or "") == "parts"
                 and int(row.get("fileSize") or 0) == n
                 and str(row.get("fileName") or "") == name
-                and int(row.get("chunkSize") or 0) == PART_CHUNK_SIZE
+                and row_cs == cs
             ):
-                uploaded = _valid_uploaded_parts(parts, n, PART_CHUNK_SIZE)
+                uploaded = _valid_uploaded_parts(parts, n, cs)
                 row["parts"] = len(uploaded)
                 sess.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
                 return {
@@ -95,7 +108,7 @@ def begin_chunked_upload(data_dir: Path, build_id: str, file_name: str, file_siz
                     "buildId": bid,
                     "fileName": name,
                     "fileSize": n,
-                    "chunkHint": PART_CHUNK_SIZE,
+                    "chunkHint": cs,
                     "mode": "parts",
                     "resumed": True,
                     "uploadedParts": uploaded,
@@ -134,7 +147,7 @@ def begin_chunked_upload(data_dir: Path, build_id: str, file_name: str, file_siz
                     "fileSize": n,
                     "received": 0,
                     "mode": "parts",
-                    "chunkSize": PART_CHUNK_SIZE,
+                    "chunkSize": cs,
                 },
                 ensure_ascii=False,
             ),
@@ -146,7 +159,7 @@ def begin_chunked_upload(data_dir: Path, build_id: str, file_name: str, file_siz
         "fileName": name,
         "fileSize": n,
         "received": 0,
-        "chunkHint": PART_CHUNK_SIZE,
+        "chunkHint": cs,
         "mode": "parts",
     }
 

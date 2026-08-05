@@ -1,8 +1,9 @@
 const { safeStorage } = require('electron')
 const { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } = require('fs')
 const path = require('path')
+const { getServiceBase } = require('./secure-config.cjs')
 
-const DEFAULT_AUTH_BASE = 'https://xiangyuzhubao.xyz/wxqk'
+const DEFAULT_AUTH_BASE = getServiceBase()
 let token = ''
 let file = ''
 

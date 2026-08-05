@@ -9,7 +9,6 @@ import PageHeader from '../components/app/PageHeader.vue'
 import StatusTag from '../components/app/StatusTag.vue'
 import { statusLabel } from '../utils/status'
 import { groups, instances, loadMembers, loading, members, refreshDirectory, refreshInstances, type MemberRow } from '../stores/wechatData'
-import { resolveFriendCredentials } from '../services/wechat'
 import { filterSelectOptions, SELECT_OPTION_LIMIT_SEARCH, useSelectSearchQuery } from '../utils/searchableSelect'
 
 const router = useRouter()
@@ -176,12 +175,16 @@ function hasFrequentMark(error?: string, status?: string) {
  * @param taskStatus 所属任务状态（仅辅助；频繁必须以项级证据为准）
  */
 function resolveAddStatus(status?: string, error?: string, _taskStatus?: string) {
+  const reason = String(error || '').trim()
   // 频繁必须以该项自身证据为准，避免任务冷却时把排队中的其他人误标为「已经频繁」
-  if (hasFrequentMark(error, status)) return '已经频繁'
-  if (status === 'SUBMITTED' || status === 'COMPLETED') return '已添加'
-  if (status === 'SKIPPED') return '已过滤'
-  if (status === 'FAILED' || status === 'PARTIAL_FAILED') return '失败'
-  if (status === 'QUEUED' || status === 'RUNNING') return '待执行'
+  if (hasFrequentMark(error, status)) return reason ? `已经频繁：${reason}` : '已经频繁'
+  if (status === 'REQUEST_SENT' || status === 'SUBMITTED' || status === 'COMPLETED') {
+    return reason || '申请已提交'
+  }
+  if (status === 'RESOLUTION_FAILED') return reason ? `资料失败：${reason}` : '资料解析失败'
+  if (status === 'SKIPPED') return reason ? `已过滤：${reason}` : '已过滤'
+  if (status === 'FAILED' || status === 'PARTIAL_FAILED') return reason ? `失败：${reason}` : '失败'
+  if (status === 'QUEUED' || status === 'RUNNING' || status === 'CREDENTIALS_READY' || status === 'PROFILE_PENDING') return '待执行'
   return '未添加'
 }
 
@@ -274,7 +277,7 @@ const groupProgress = computed(() => {
 })
 
 const groupRuleText = {
-  once: '添加好友前会先检查成员资料；资料不完整时不会发送好友申请。同一微信号对同一成员默认只加一次。',
+  once: '创建任务后由任务中心执行；执行时现取加好友凭证，避免过期。任务完成后可再次对同一成员创建加好友任务。',
   tips: [
     '最新入群来源：进群回调实时记录，或“重新采集/采集最新成员”时与上次成员快照对比的新增成员。',
     '首次采集某群只会建立基线，不会把全员当成最新入群。',
@@ -282,8 +285,6 @@ const groupRuleText = {
     '所有批量操作必须先勾选目标；也可直接使用“添加最新入群成员”。',
   ],
 }
-const MEMBER_PROFILE_REQUEST_INTERVAL_MS = 200
-const wait = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
 
 let stopEvent: (() => void) | undefined
 let progressTimer: ReturnType<typeof setInterval> | undefined
@@ -419,7 +420,7 @@ async function createAddFriendTask(sourceMembers = selectedMembers.value, taskNa
   let prompt: { value: string }
   try {
     prompt = await ElMessageBox.prompt('添加好友验证内容', '创建加好友任务', { inputPlaceholder: `可不填，默认：${DEFAULT_FRIEND_VERIFY_CONTENT}` })
-    await ElMessageBox.confirm(`筛选后将检查 ${candidates.length} 名成员的好友资料，只有资料完整的成员会进入任务。`, '确认检查成员资料', { type: 'warning' })
+    await ElMessageBox.confirm(`筛选后将对 ${candidates.length} 名成员创建加好友任务；凭证在执行时现取，避免过期。创建后请到任务中心确认执行。`, '确认创建', { type: 'warning' })
   } catch {
     return
   }
@@ -427,40 +428,44 @@ async function createAddFriendTask(sourceMembers = selectedMembers.value, taskNa
   const items: Array<Record<string, unknown>> = []
   let skippedSelf = 0
   let unavailable = 0
-  let profileRequestCount = 0
   try {
     for (const member of candidates) {
       const instance = instances.value.find((item) => item.id === member.sourceInstanceId)
       if (!instance) { unavailable += 1; continue }
       if (instance.accountWxid && member.wxid === instance.accountWxid) { skippedSelf += 1; continue }
-      if (profileRequestCount > 0) await wait(MEMBER_PROFILE_REQUEST_INTERVAL_MS)
-      profileRequestCount += 1
-      const credentials = await resolveFriendCredentials(instance, member.wxid, member.roomId)
-      const { v3, v4 } = credentials
-      if (!v3 || !v4) {
-        unavailable += 1
-        void window.wxControl?.reportError?.('群成员加好友资料仍不完整', {
-          module: '群成员加好友', operation: '解析加好友凭证', instanceId: instance.id,
-          accountWxid: instance.accountWxid, targetWxid: member.wxid, roomId: member.roomId, missing: credentials.missing.join(','), attempts: credentials.attempts.join('、'),
-          ...(credentials.diagnostics.at(-1) || {}),
-        })
-        continue
-      }
-      items.push({ instanceId: instance.id, targetKey: member.wxid, request: { v3, v4, scence: '3', friendFlg: '0', verifyContent: String(prompt.value || '').trim() || DEFAULT_FRIEND_VERIFY_CONTENT } })
+      items.push({
+        instanceId: instance.id,
+        targetKey: member.wxid,
+        status: 'PROFILE_PENDING',
+        request: {
+          targetWxid: member.wxid,
+          nickname: member.nickname || '',
+          sourceRoomId: member.roomId,
+          sourceRoomName: groups.value.find((group) => group.roomId === member.roomId && group.sourceInstanceId === member.sourceInstanceId)?.name
+            || groups.value.find((group) => group.roomId === member.roomId)?.name
+            || '',
+          sourceInstanceId: member.sourceInstanceId,
+          sourceInstancePort: instance.apiPort,
+          accountWxid: instance.accountWxid,
+          // 群成员加好友：scene/scence 均用 14；执行端现取 V3/V4 并补齐 DLL 字段
+          scence: '14',
+          scene: '14',
+          friendFlg: '0',
+          verifyContent: String(prompt.value || '').trim() || DEFAULT_FRIEND_VERIFY_CONTENT,
+        },
+      })
     }
     if (!items.length) {
       const reasons = [skippedSelf ? `已排除本人 ${skippedSelf} 人` : '', unavailable ? `暂时无法取得资料 ${unavailable} 人` : ''].filter(Boolean).join('，')
       return ElMessage.warning(`没有可创建任务的成员${reasons ? `：${reasons}` : ''}`)
     }
     const created = await window.wxControl?.createTask({ name: taskName, type: 'ADD_FRIEND', config: { coolMinutes: 30 }, items }) as Record<string, unknown> | undefined
-    const deduplicated = Number(created?.deduplicated || 0)
     const skipped = [skippedSelf ? `排除本人 ${skippedSelf} 人` : '', unavailable ? `资料暂不可用 ${unavailable} 人` : ''].filter(Boolean).join('，')
-    const duplicateText = deduplicated ? `，已跳过 ${deduplicated} 名曾处理成员` : ''
     activeTaskId.value = String(created?.id || '')
     taskStartedAt.value = Date.now()
     await refreshTaskProgress()
     const total = Number(created?.total || items.length) || items.length
-    await promptGoToTaskCenter(router, `已创建 ${total} 项加好友任务${duplicateText}${skipped ? `，${skipped}` : ''}`)
+    await promptGoToTaskCenter(router, `已创建 ${total} 项加好友任务${skipped ? `，${skipped}` : ''}`)
   } catch (error) {
     ElMessage.error(userErrorMessage(error, '创建加好友任务失败'))
   } finally {
@@ -681,7 +686,7 @@ onBeforeUnmount(() => {
             <el-table-column prop="joinTime" label="入群时间" min-width="150" show-overflow-tooltip />
             <el-table-column prop="fromGroup" label="来源群聊" min-width="120" show-overflow-tooltip />
             <el-table-column prop="activity" label="来源" width="100" />
-            <el-table-column label="添加状态" width="110">
+            <el-table-column label="添加状态" min-width="220" show-overflow-tooltip>
               <template #default="{ row }"><StatusTag :text="row.addStatus" /></template>
             </el-table-column>
           </el-table>
@@ -691,7 +696,7 @@ onBeforeUnmount(() => {
       <aside class="app-card block side-panel panel-scroll">
         <h3 class="section-title">规则说明</h3>
         <div class="side-block">
-          <h4>只加一次规则说明</h4>
+          <h4>加好友规则说明</h4>
           <p>{{ groupRuleText.once }}</p>
         </div>
 

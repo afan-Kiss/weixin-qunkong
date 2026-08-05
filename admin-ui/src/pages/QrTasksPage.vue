@@ -15,8 +15,8 @@ const router = useRouter()
 const activeTab = ref('链接导入')
 const qrTabs = ['链接导入', '图片采集', '识别结果']
 const importText = ref('')
-const qrFormatTip = '每行一条链接；导入后勾选群链接可创建进群任务。个人码可按配置跳过；本地图片仍可识别后进群。'
-const applyText = ref('')
+const qrFormatTip = '每行一条群邀请链接；导入后勾选可创建进群任务。个人码无法通过本流程进群（会跳过）；本地图片仍可识别后进群。'
+const applyText = ref('你好，想加入群聊')
 const skipPersonal = ref(true)
 const saveContact = ref(true)
 const creating = ref(false)
@@ -66,21 +66,46 @@ function formatCacheTime(value: unknown) {
   return `${month}-${day} ${hour}:${minute}`
 }
 
-const qrRecords = computed(() => rawRecords.value.map((row) => {
-  const dedupe = dedupeDisplay(row)
-  return {
-    ...row,
-    thumb: row.localPath ? '图' : '链',
-    cacheTime: formatCacheTime(row.createdAt),
-    source: row.source,
-    result: row.decodedText || '-',
-    type: statusLabel(row.qrType),
-    dedupe: dedupe.text,
-    dedupeClass: dedupe.className,
-    path: row.localPath || '-',
-    status: statusLabel(row.status),
+/** 记录表类型筛选（统一筛选，不是逐行改类型） */
+const typeFilter = ref('全部')
+const qrTypeFilterChips = [
+  { value: '全部', label: '全部' },
+  { value: 'GROUP_LINK', label: '群二维码' },
+  { value: 'PERSONAL_LINK', label: '个人二维码' },
+  { value: 'QQ_GROUP_LINK', label: 'QQ群二维码' },
+  { value: 'UNKNOWN', label: '未知/其他' },
+]
+
+const qrRecords = computed(() => {
+  const mapped = rawRecords.value.map((row) => {
+    const dedupe = dedupeDisplay(row)
+    const qrType = String(row.qrType || 'UNKNOWN')
+    return {
+      ...row,
+      thumb: row.localPath ? '图' : '链',
+      cacheTime: formatCacheTime(row.createdAt),
+      source: row.source,
+      result: row.decodedText || '-',
+      qrType,
+      type: statusLabel(qrType),
+      dedupe: dedupe.text,
+      dedupeClass: dedupe.className,
+      path: row.localPath || '-',
+      status: statusLabel(row.status),
+    }
+  })
+  if (typeFilter.value === '全部') return mapped
+  if (typeFilter.value === 'UNKNOWN') {
+    return mapped.filter((row) => !['GROUP_LINK', 'PERSONAL_LINK', 'QQ_GROUP_LINK'].includes(String(row.qrType)))
   }
-}))
+  return mapped.filter((row) => String(row.qrType) === typeFilter.value)
+})
+
+/** 切换类型筛选时清空勾选，避免选中已隐藏行。 */
+function setTypeFilter(value: string) {
+  typeFilter.value = value
+  selected.value = []
+}
 const qrOverview = computed(() => [{ title: '全部', value: String(rawRecords.value.length) }, { title: '待识别', value: String(rawRecords.value.filter((item) => item.status === 'WAITING_SCAN').length) }, { title: '链接归档', value: String(rawRecords.value.filter((item) => item.status === 'REFERENCE_ONLY').length) }, { title: '可执行图片', value: String(rawRecords.value.filter((item) => item.localPath).length) }])
 const historyGroupOptions = computed(() => groups.value.map((item) => ({ label: `${item.name}（${instances.value.find((instance) => instance.id === item.sourceInstanceId)?.nickname || '所属微信'}）`, value: item.id })))
 /** 当前勾选的群名，便于确认实时监控目标。 */
@@ -150,14 +175,21 @@ async function importLinks() { if (!importText.value.trim()) return ElMessage.wa
 async function importFiles() { rawRecords.value = (await window.wxControl?.importQrFiles() ?? []) as Array<Record<string, unknown>> }
 async function chooseOutputDir() { outputDir.value = await window.wxControl?.selectDirectory(outputDir.value) || outputDir.value }
 /**
- * 双击记录行：打开图片所在目录（资源管理器中定位文件）。
+ * 双击识别结果 / 记录行：在资源管理器中定位并选中该二维码图片。
  * @param row 表格行
  */
-async function openRecordFolder(row: Record<string, unknown>) {
+async function revealQrImage(row: Record<string, unknown>) {
   const target = String(row.localPath || row.path || '').trim()
-  if (!target || target === '-') return ElMessage.info('该记录没有本地保存路径')
-  const result = await window.wxControl?.revealInFolder?.(target)
-  if (!result?.ok) ElMessage.warning(result?.message || '无法打开目录')
+  if (!target || target === '-') {
+    ElMessage.info('该记录没有本地二维码图片（链接导入项无图片文件）')
+    return
+  }
+  try {
+    const result = await window.wxControl?.revealInFolder?.(target)
+    if (!result?.ok) ElMessage.warning(result?.message || '无法在资源管理器中定位该图片')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '定位图片失败')
+  }
 }
 /**
  * 采集勾选群的历史图片二维码；按队列逐群下载，不限制群数量。
@@ -361,12 +393,22 @@ async function createScanTask(rows = selected.value) {
   creating.value = true
   try {
     let previewBlock = ''
+    const previewByUrl = new Map<string, { roomName?: string; label?: string; memberCount?: number }>()
     if (linkRows.length) {
       ElMessage.info('正在解析群资料（群名/人数）…')
       const previews = await window.wxControl?.previewQrInvites?.({
         instanceId: availableInstances[0].id,
         urls: linkRows.map((item) => String(item.decodedText)),
       }) ?? []
+      // 按请求顺序对齐，并同时用源链 / 回写 url / fullUrl 建索引，避免字符串细微差异导致丢群名
+      linkRows.forEach((row, index) => {
+        const preview = previews[index]
+        if (!preview) return
+        for (const key of [row.decodedText, preview.url, preview.fullUrl]) {
+          const url = String(key || '').trim()
+          if (url) previewByUrl.set(url, preview)
+        }
+      })
       const escapeHtml = (value: string) => String(value)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
@@ -374,13 +416,12 @@ async function createScanTask(rows = selected.value) {
         .replace(/"/g, '&quot;')
       const invalid = previews.filter((item) => item.expired || item.error)
       const invalidSet = new Set(invalid)
-      const resolved = previews.filter((item) => !invalidSet.has(item) && (item.roomName || item.roomId || Number(item.memberCount) > 0))
+      const resolved = previews.filter((item) => !invalidSet.has(item) && (item.roomName || Number(item.memberCount) > 0))
       const pendingPreviewCount = previews.length - resolved.length - invalid.length
       const lines = resolved.slice(0, 20).map((item, index) => {
         const name = item.roomName || '未知群名'
         const count = Number(item.memberCount) > 0 ? `${item.memberCount} 人` : '人数未知'
-        const id = item.roomId ? `<br/>&nbsp;&nbsp;&nbsp;ID：${escapeHtml(item.roomId)}` : ''
-        return `${index + 1}. <b>${escapeHtml(name)}</b>（${escapeHtml(count)}）${id}`
+        return `${index + 1}. <b>${escapeHtml(name)}</b>（${escapeHtml(count)}）`
       })
       if (resolved.length > 20) lines.push(`另有 ${resolved.length - 20} 个已解析群邀请`)
       if (pendingPreviewCount > 0) lines.push(`<b>${pendingPreviewCount} 个群邀请</b>暂时无法读取群名和人数，执行任务时仍会逐个尝试`)
@@ -392,8 +433,11 @@ async function createScanTask(rows = selected.value) {
     if (imageOnly > 0) {
       previewBlock += `另有 ${imageOnly} 张本地图片将在任务中识别后再进群。<br/><br/>`
     }
+    const personalNote = skipPersonal.value
+      ? '个人码将自动跳过'
+      : '个人码无法进群，执行时也会跳过'
     await ElMessageBox.confirm(
-      `${previewBlock}共 ${accepted.length} 条；个人码${skipPersonal.value ? '将跳过' : '也会处理'}；进群后${saveContact.value ? '会保存到通讯录' : '不会自动保存到通讯录'}。<br/>确认后到任务中心执行。`,
+      `${previewBlock}共 ${accepted.length} 条；${personalNote}；进群后${saveContact.value ? '会保存到通讯录' : '不会自动保存到通讯录'}。<br/>确认后到任务中心执行。`,
       '确认进群目标',
       {
         type: 'warning',
@@ -417,8 +461,38 @@ async function createScanTask(rows = selected.value) {
       items: accepted.map((item, index) => {
         const instanceId = availableInstances[index % availableInstances.length].id
         const targetKey = String(item.sha256 || item.id)
-        if (item.decodedText) return { instanceId, targetKey, request: { url: String(item.decodedText) } }
-        return { instanceId, targetKey, request: { path: item.localPath } }
+        const localPath = String(item.localPath || '').trim()
+        if (item.decodedText) {
+          const url = String(item.decodedText)
+          const preview = previewByUrl.get(url.trim()) || previewByUrl.get(url)
+          const roomName = String(preview?.roomName || '').trim()
+          const usableName = roomName && roomName !== '未知群名' ? roomName : ''
+          const labelRaw = String(preview?.label || '').trim()
+          const label = usableName && labelRaw && !/未知群名|二维码目标/.test(labelRaw) ? labelRaw : ''
+          const memberCount = Number(preview?.memberCount) || 0
+          const qrType = String(item.qrType || '').trim()
+          return {
+            instanceId,
+            targetKey,
+            request: {
+              url,
+              ...(localPath ? { path: localPath, localPath } : {}),
+              ...(qrType ? { qrType } : {}),
+              ...(usableName ? { roomName: usableName } : {}),
+              ...(label ? { label } : {}),
+              ...(memberCount > 0 ? { memberCount } : {}),
+            },
+          }
+        }
+        return {
+          instanceId,
+          targetKey,
+          request: {
+            path: localPath || item.localPath,
+            ...(localPath ? { localPath } : {}),
+            ...(item.qrType ? { qrType: String(item.qrType) } : {}),
+          },
+        }
       }),
     })
     if (accepted.length < executable.length) ElMessage.warning(`受每账号上限影响，已跳过 ${executable.length - accepted.length} 条`)
@@ -534,8 +608,21 @@ onBeforeUnmount(() => {
     <div v-if="activeTab === '识别结果' || activeTab === '链接导入' || activeTab === '图片采集'" class="mid-split">
       <section class="app-card block">
         <h3 class="section-title">二维码记录表<span class="muted" style="margin-left:8px;font-weight:400">勾选后创建任务</span></h3>
+        <div class="chip-row qr-type-filter" style="margin: 0 0 10px">
+          <button
+            v-for="item in qrTypeFilterChips"
+            :key="item.value"
+            class="chip"
+            :class="{ 'is-active': typeFilter === item.value }"
+            type="button"
+            @click="setTypeFilter(item.value)"
+          >
+            {{ item.label }}
+          </button>
+          <span class="muted" style="margin-left:4px;font-size:12px">当前 {{ qrRecords.length }} 条</span>
+        </div>
         <div class="table-wrap">
-          <el-table :data="qrRecords" stripe height="320" style="width: 100%" @selection-change="selected = $event" @row-dblclick="openRecordFolder">
+          <el-table :data="qrRecords" stripe height="320" style="width: 100%" @selection-change="selected = $event" @row-dblclick="(row: Record<string, unknown>) => revealQrImage(row)">
             <el-table-column type="selection" width="48" />
             <el-table-column label="缩略图" width="80">
               <template #default="{ row }">
@@ -544,8 +631,16 @@ onBeforeUnmount(() => {
             </el-table-column>
             <el-table-column prop="cacheTime" label="缓存时间" width="100" show-overflow-tooltip />
             <el-table-column prop="source" label="来源" min-width="110" show-overflow-tooltip />
-            <el-table-column prop="result" label="识别结果" min-width="180" show-overflow-tooltip />
-            <el-table-column prop="type" label="类型" width="100" />
+            <el-table-column label="识别结果" min-width="180" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span
+                  class="qr-result-cell"
+                  :title="row.localPath ? '双击在资源管理器中定位并选中该二维码图片' : '无本地图片可定位'"
+                  @dblclick.stop="revealQrImage(row)"
+                >{{ row.result }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="type" label="类型" width="110" show-overflow-tooltip />
             <el-table-column label="去重状态" min-width="110" show-overflow-tooltip>
               <template #default="{ row }">
                 <span :class="row.dedupeClass">{{ row.dedupe }}</span>
@@ -569,17 +664,19 @@ onBeforeUnmount(() => {
         <div class="form-stack">
           <div>
             <label>进群申请文案</label>
-            <el-input v-model="applyText" type="textarea" :rows="4" />
+            <el-input v-model="applyText" type="textarea" :rows="4" placeholder="需群主确认的群必须填写；留空则使用默认「你好，想加入群聊」" />
             <el-button style="margin-top: 8px" size="small" @click="applyText += '{昵称}'">插入变量</el-button>
+            <p class="tip muted">开启「群聊邀请确认」的群会把这段文字作为申请理由提交；群主同意后才会真正进群。</p>
           </div>
           <div>
             <label>随机间隔（秒）</label>
             <div class="muted">使用系统设置中的全局随机间隔</div>
           </div>
           <div class="switch-row">
-            <span>遇到个人码自动跳过</span>
+            <span>遇到个人码自动跳过（推荐）</span>
             <el-switch v-model="skipPersonal" />
           </div>
+          <p class="tip muted">个人码无法通过本流程进群；关闭开关时仍会跳过，只是任务说明不同。</p>
           <div class="switch-row">
             <span>加入后保存到通讯录（推荐开启）</span>
             <el-switch v-model="saveContact" />
@@ -665,6 +762,21 @@ onBeforeUnmount(() => {
   display: grid;
   place-items: center;
   font-weight: 700;
+}
+
+.qr-result-cell {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  color: var(--app-primary-hover, #0f766e);
+}
+
+.qr-type-filter {
+  flex-wrap: wrap;
+  align-items: center;
 }
 
 .dedupe-ok {

@@ -1,6 +1,6 @@
 /**
- * 微信群控静默更新客户端（对齐开云：启动检查 → 有新版直接下载/进度条 → 替换 → 重启）。
- * 产品要求：不依赖发布密钥；清单签名缺失/失败不阻断更新。
+ * 静默更新客户端：启动检查 → 下载/进度 → 替换 → 重启。
+ * 生产环境强制校验清单 Ed25519 签名。
  */
 const { createHash, createPublicKey, verify } = require('crypto')
 const { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, unlinkSync, statSync, writeFileSync, rmSync, readdirSync } = require('fs')
@@ -8,13 +8,25 @@ const http = require('http')
 const https = require('https')
 const path = require('path')
 const { spawn } = require('child_process')
+const {
+  getServiceBase,
+  getAllowedHosts,
+  getPublishPublicKeyB64,
+  getLegacyManifestDefaults,
+  getUpdateTrashDirName,
+  getUpdateWorkDirName,
+  getLegacyTrashDirNames,
+  isLegacyBrandDownloadUrl,
+  isLegacyBrandFileName,
+} = require('./secure-config.cjs')
 
-const DEFAULT_BASE = 'https://xiangyuzhubao.xyz/wxqk'
-/** 与开云共用发布密钥时的内嵌公钥；生产环境需与服务器 publish_ed25519.priv 配对 */
-const BUILTIN_PUBLISH_PUBLIC_KEY_B64 = '3aN2fjDlRZlq7clIOJ7X4qPVNTzIR9QPP03mjEUSacc='
-const ALLOWED_DOWNLOAD_HOSTS = new Set(['xiangyuzhubao.xyz', 'www.xiangyuzhubao.xyz'])
-const UPDATE_TRASH_DIR = '.wxqk-update-trash'
-const UPDATE_OLD_TRASH_ENV = 'WXQK_UPDATE_OLD_TRASH'
+const DEFAULT_BASE = getServiceBase()
+const BUILTIN_PUBLISH_PUBLIC_KEY_B64 = getPublishPublicKeyB64()
+const ALLOWED_DOWNLOAD_HOSTS = getAllowedHosts()
+const UPDATE_TRASH_DIR = getUpdateTrashDirName()
+const UPDATE_OLD_TRASH_ENV = 'APP_UPDATE_OLD_TRASH'
+/** 旧版客户端写入的环境变量，升级到本版后仍需能删掉旧 exe */
+const LEGACY_UPDATE_OLD_TRASH_ENV = 'WXQK_UPDATE_OLD_TRASH'
 
 let allowUnsignedForTest = false
 let startupApplyAllowed = true
@@ -52,14 +64,15 @@ function resolvePortableExePath() {
  * @returns {Buffer}
  */
 function canonicalManifestBytes(man) {
+  const legacy = getLegacyManifestDefaults()
   const wire = {
     version: String(man.version || ''),
     buildId: String(man.buildId || ''),
     gitCommit: String(man.gitCommit || ''),
-    protocolVersion: String(man.protocolVersion || 'facai888-v1'),
-    securityProtocolVersion: String(man.securityProtocolVersion || 'security-v1'),
-    desktopProtocolVersion: String(man.desktopProtocolVersion || 'desktop-webrtc-v1'),
-    updaterProtocolVersion: String(man.updaterProtocolVersion || 'updater-v1'),
+    protocolVersion: String(man.protocolVersion || legacy.protocolVersion),
+    securityProtocolVersion: String(man.securityProtocolVersion || legacy.securityProtocolVersion),
+    desktopProtocolVersion: String(man.desktopProtocolVersion || legacy.desktopProtocolVersion),
+    updaterProtocolVersion: String(man.updaterProtocolVersion || legacy.updaterProtocolVersion),
     mandatory: Boolean(man.mandatory ?? true),
     publishedAt: String(man.publishedAt || ''),
     minimumSupportedBuild: String(man.minimumSupportedBuild || ''),
@@ -67,7 +80,7 @@ function canonicalManifestBytes(man) {
     fileName: String(man.fileName || ''),
     fileSize: Number(man.fileSize || 0) || 0,
     sha256: String(man.sha256 || ''),
-    signingKeyId: String(man.signingKeyId || 'facai888-v1'),
+    signingKeyId: String(man.signingKeyId || legacy.signingKeyId),
     authenticodePublisher: String(man.authenticodePublisher || ''),
   }
   return Buffer.from(JSON.stringify(wire), 'utf8')
@@ -130,8 +143,23 @@ function isRemoteVersionNewer(remoteVersion, localVersion) {
  * @param {string} [currentVersion]
  * @returns {boolean}
  */
-function needsUpgrade(man, currentSeq, currentBuild, currentVersion = '') {
+/**
+ * 定向发布：manifest.targetClientIds 非空时，仅名单内 clientId 视为需要升级。
+ * @param {Record<string, unknown>} man
+ * @param {string} [clientId]
+ * @returns {boolean}
+ */
+function isManifestTargetedToClient(man, clientId = '') {
+  const targets = Array.isArray(man?.targetClientIds) ? man.targetClientIds.map((x) => String(x || '').trim()).filter(Boolean) : []
+  if (!targets.length) return true
+  const cid = String(clientId || '').trim()
+  if (!cid) return false
+  return targets.includes(cid)
+}
+
+function needsUpgrade(man, currentSeq, currentBuild, currentVersion = '', clientId = '') {
   if (!man) return false
+  if (!isManifestTargetedToClient(man, clientId)) return false
   const minSeq = Number(man.minimumReleaseSequence || 0) || 0
   const latest = Number(man.releaseSequence || 0) || 0
   const cur = Number(currentSeq || 0) || 0
@@ -233,17 +261,23 @@ function httpGet(url, options = {}) {
  * @param {string} baseUrl
  * @returns {Promise<{ manifest: Record<string, unknown>, signature: string }>}
  */
-async function fetchManifest(baseUrl) {
-  const url = `${String(baseUrl || DEFAULT_BASE).replace(/\/$/, '')}/api/update/manifest`
-  const res = await httpGet(url, { timeoutMs: 20000 })
+async function fetchManifest(baseUrl, clientId = '') {
+  const cid = String(clientId || '').trim()
+  const qs = cid ? `?clientId=${encodeURIComponent(cid)}` : ''
+  const url = `${String(baseUrl || DEFAULT_BASE).replace(/\/$/, '')}/api/update/manifest${qs}`
+  const headers = cid ? { 'X-Client-Id': cid } : {}
+  const res = await httpGet(url, { timeoutMs: 20000, headers })
   if (res.status >= 300) throw new Error(`manifest http ${res.status}`)
   const wrap = JSON.parse(res.body.toString('utf8') || '{}')
   if (!wrap || wrap.ok === false) throw new Error(wrap?.message || 'MANIFEST_FETCH_FAILED')
   const man = wrap.manifest && typeof wrap.manifest === 'object' ? wrap.manifest : wrap
   const signature = String(wrap.signature || '')
-  // 不依赖密钥：有签名也只作旁路校验，失败不阻断
-  if (signature && !verifyManifestSignature(man, signature)) {
-    /* ignore UPDATE_SIGNATURE_INVALID */
+  if (allowUnsignedForTest) {
+    // 单测可跳过验签
+  } else if (!signature) {
+    throw new Error('UPDATE_SIGNATURE_MISSING')
+  } else if (!verifyManifestSignature(man, signature)) {
+    throw new Error('UPDATE_SIGNATURE_INVALID')
   }
   if (!String(man.buildId || '').trim() && !String(man.version || '').trim()) {
     throw new Error('missing buildId')
@@ -259,17 +293,16 @@ async function fetchManifest(baseUrl) {
 async function checkForUpdate(options) {
   const currentSeq = Number(options.currentReleaseSequence || 0) || 0
   const currentBuild = String(options.currentBuild || '')
-  const { manifest } = await fetchManifest(options.baseUrl || DEFAULT_BASE)
+  const clientId = String(options.clientId || '')
+  const { manifest } = await fetchManifest(options.baseUrl || DEFAULT_BASE, clientId)
   const portablePath = options.portablePath || resolvePortableExePath()
   if (await packageFileMatchesManifest(portablePath, manifest)) {
     return { needUpdate: false, mandatory: false, manifest, code: 'CURRENT_PACKAGE_MATCH' }
   }
-  if (needsUpgrade(manifest, currentSeq, currentBuild, options.currentVersion)) {
-    const minSeq = Number(manifest.minimumReleaseSequence || 0) || 0
-    const latest = Number(manifest.releaseSequence || 0) || 0
+  if (needsUpgrade(manifest, currentSeq, currentBuild, options.currentVersion, clientId)) {
     // 是否强制更新只服从发布清单。releaseSequence 和版本号只用于判断
     // 是否存在新版，不能把后台发布的非强制更新擅自升级为强制更新。
-    const mandatory = Boolean(manifest.mandatory)
+    const mandatory = Boolean(manifest.mandatory) || (Array.isArray(manifest.targetClientIds) && manifest.targetClientIds.length > 0)
     return {
       needUpdate: true,
       mandatory,
@@ -437,7 +470,7 @@ function schedulePortableReplacement({ currentExe, finalPath, downloadPath, expe
     "  if ($actual -ne $ExpectedSha256.ToLowerInvariant()) { throw 'SHA256 mismatch after install' }",
     '  $env:PORTABLE_EXECUTABLE_FILE = $FinalPath',
     '  $env:PORTABLE_EXECUTABLE_DIR = Split-Path -Parent $FinalPath',
-    '  $env:WXQK_UPDATE_OLD_TRASH = $CurrentExe',
+    '  $env:APP_UPDATE_OLD_TRASH = $CurrentExe',
     "  Start-Process -FilePath $FinalPath -ArgumentList '--after-update' -WorkingDirectory (Split-Path -Parent $FinalPath) -ErrorAction Stop",
     '  Log "新版启动命令成功"',
     '  Remove-Item -LiteralPath $DownloadPath -Force -ErrorAction SilentlyContinue',
@@ -478,14 +511,14 @@ async function applyUpdate(options) {
     currentReleaseSequence: options.currentReleaseSequence,
   }
   try {
-    const check = await checkForUpdate({ ...options, baseUrl })
+    const check = await checkForUpdate({ ...options, baseUrl, clientId: options.clientId })
     if (!check.needUpdate || !check.manifest) return { ok: false, message: '无需更新' }
     const man = check.manifest
     const currentExe = resolvePortableExePath()
     const installDir = path.dirname(currentExe)
     let destName = path.basename(String(man.fileName || `${man.buildId}.exe`))
-    // 远端若仍写着旧品牌文件名，落盘时改回微信群控命名，避免覆盖成错名
-    if (!/微信群控/.test(destName) || /开云|发财888|投注软件/i.test(destName)) {
+    // 远端若仍写着旧品牌文件名，落盘时改回产品命名
+    if (!/微信群控/.test(destName) || isLegacyBrandFileName(destName)) {
       const ver = String(man.version || '').replace(/^v/i, '') || 'update'
       destName = `微信群控系统v${ver}.exe`
     }
@@ -494,15 +527,15 @@ async function applyUpdate(options) {
 
     let url = String(man.downloadURL || '').trim()
     const packageUrl = `${baseUrl.replace(/\/$/, '')}/api/update/package/${man.buildId}`
-    // 清单若误写成 /发财888/ 等旧前缀，强制回退到当前客户端的 /wxqk 基址
-    if (!url || /\/发财888\//i.test(url) || (/xiangyuzhubao\.xyz\//i.test(url) && !/\/wxqk\//i.test(url))) {
+    // 清单若仍指向旧品牌路径，强制回退到当前服务基址
+    if (!url || isLegacyBrandDownloadUrl(url)) {
       url = packageUrl
     }
     const urlGate = validateDownloadURL(url)
     if (!urlGate.ok) throw new Error(urlGate.code || 'UPDATE_URL_INVALID')
 
     probeDirWritable(installDir)
-    const workDir = path.join(require('os').tmpdir(), 'wxqk-update')
+    const workDir = path.join(require('os').tmpdir(), getUpdateWorkDirName())
     mkdirSync(workDir, { recursive: true })
     const downloadPath = path.join(workDir, destName)
 
@@ -545,14 +578,21 @@ async function applyUpdate(options) {
  */
 function cleanupUpdateTrashBestEffort() {
   try {
-    const trash = String(process.env[UPDATE_OLD_TRASH_ENV] || '').trim()
-    if (trash && existsSync(trash)) unlinkSync(trash)
+    const candidates = [
+      String(process.env[UPDATE_OLD_TRASH_ENV] || '').trim(),
+      String(process.env[LEGACY_UPDATE_OLD_TRASH_ENV] || '').trim(),
+    ].filter(Boolean)
+    for (const trash of candidates) {
+      try { if (existsSync(trash)) unlinkSync(trash) } catch { /* ignore */ }
+    }
     const dir = path.dirname(resolvePortableExePath())
-    const trashDir = path.join(dir, UPDATE_TRASH_DIR)
-    if (existsSync(trashDir)) {
+    const trashDirs = [UPDATE_TRASH_DIR, ...getLegacyTrashDirNames()]
+    for (const name of trashDirs) {
+      const trashDir = path.join(dir, name)
+      if (!existsSync(trashDir)) continue
       try {
         if (!readdirSync(trashDir).length) rmSync(trashDir, { recursive: true, force: true })
-      } catch {}
+      } catch { /* ignore */ }
     }
   } catch { /* ignore */ }
 }
@@ -616,6 +656,7 @@ async function ipcCheckClientUpdate(options) {
       currentBuild: options.currentBuild,
       currentVersion: options.currentVersion,
       currentReleaseSequence: options.currentReleaseSequence,
+      clientId: options.clientId,
     })
     if (!result.needUpdate) {
       await reportUpdate(options.baseUrl || DEFAULT_BASE, 'NO_UPDATE', meta, { code: result.code })
@@ -661,23 +702,33 @@ async function ipcCheckClientUpdate(options) {
  */
 async function ipcApplyClientUpdate(options) {
   const log = options.onLog || (() => {})
-  if (!startupApplyAllowed) {
+  const allowRemote = Boolean(options.allowRemoteForce)
+  if (!startupApplyAllowed && !allowRemote) {
     return { ok: false, deferred: true, message: '运行中禁止因更新关闭软件，请完全退出后重新打开再更新' }
   }
   if (!options.isPackaged || !process.env.PORTABLE_EXECUTABLE_FILE) {
-    markStartupUpdateDone()
+    if (!allowRemote) markStartupUpdateDone()
     return { ok: false, message: '开发/非便携环境不自动替换安装包' }
   }
-  log('INFO', '开始下载更新包', { module: '软件更新' })
+  log('INFO', '开始下载更新包', { module: '软件更新', remoteForce: allowRemote })
   try {
-    const applied = await applyUpdate({
-      app: options.app,
-      baseUrl: options.baseUrl || DEFAULT_BASE,
-      currentBuild: options.currentBuild,
-      currentVersion: options.currentVersion,
-      currentReleaseSequence: options.currentReleaseSequence,
-      onProgress: options.onProgress,
-    })
+    // 远程强制更新临时打开启动窗口门闩，避免 applyUpdate 入口拦截
+    const prev = startupApplyAllowed
+    if (allowRemote) startupApplyAllowed = true
+    let applied
+    try {
+      applied = await applyUpdate({
+        app: options.app,
+        baseUrl: options.baseUrl || DEFAULT_BASE,
+        currentBuild: options.currentBuild,
+        currentVersion: options.currentVersion,
+        currentReleaseSequence: options.currentReleaseSequence,
+        clientId: options.clientId,
+        onProgress: options.onProgress,
+      })
+    } finally {
+      if (allowRemote) startupApplyAllowed = prev
+    }
     if (applied.ok) {
       log('INFO', applied.message || '更新成功，即将退出旧进程', { module: '软件更新' })
       setTimeout(() => {
@@ -685,10 +736,10 @@ async function ipcApplyClientUpdate(options) {
       }, 250)
       return applied
     }
-    markStartupUpdateDone()
+    if (!allowRemote) markStartupUpdateDone()
     return applied
   } catch (error) {
-    markStartupUpdateDone()
+    if (!allowRemote) markStartupUpdateDone()
     log('ERROR', `更新失败：${error.message || error}`, { module: '软件更新' })
     return { ok: false, message: String(error?.message || error) }
   }
@@ -707,6 +758,7 @@ module.exports = {
   canonicalManifestBytes,
   verifyManifestSignature,
   needsUpgrade,
+  isManifestTargetedToClient,
   parseVersionParts,
   isRemoteVersionNewer,
   validateDownloadURL,

@@ -45,6 +45,26 @@ let directoryRefreshedAt = 0
 export const friends = computed(() => contacts.value.filter((item) => !item.isGroup))
 export const savedGroups = computed(() => contacts.value.filter((item) => item.isGroup))
 
+/**
+ * 被踢群清理完成后立刻从内存通讯录移除，避免仍显示「已保存」。
+ */
+export function applyBlockedRoomRemoved(payload: { instanceId?: string; roomId?: string }) {
+  const instanceId = String(payload?.instanceId || '')
+  const roomId = String(payload?.roomId || '')
+  if (!instanceId || !roomId.endsWith('@chatroom')) return
+  contacts.value = contacts.value.filter((item) => !(item.sourceInstanceId === instanceId && item.wxid === roomId))
+  groups.value = groups.value.filter((item) => !(item.sourceInstanceId === instanceId && item.roomId === roomId))
+  members.value = members.value.filter((item) => !(item.sourceInstanceId === instanceId && item.roomId === roomId))
+}
+
+let stopBlockedListener: (() => void) | undefined
+export function ensureBlockedDirectoryListener() {
+  if (stopBlockedListener || typeof window === 'undefined') return
+  stopBlockedListener = window.wxControl?.onBlockedDirectoryChanged?.((payload) => {
+    applyBlockedRoomRemoved(payload)
+  })
+}
+
 function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
@@ -215,7 +235,8 @@ function upsertGroupRow(
       || stringOf(raw, ['big_head_url', 'small_head_url', 'bigHeadImgUrl', 'smallHeadImgUrl'])
       || previous?.avatar
       || '',
-    saved: contactMap.has(key) || Boolean(previous?.saved),
+    // saved 仅看通讯录；勿用 previous.saved 粘滞，否则取消保存后合并阶段会一直显示已保存
+    saved: contactMap.has(key),
     sourceInstanceId: instance.id,
     raw: mergedRaw,
   })
@@ -226,20 +247,29 @@ export async function refreshInstances() {
   return instances.value
 }
 
-export async function refreshDirectory(instanceIds?: string[]) {
+export async function refreshDirectory(instanceIds?: string[], options?: { force?: boolean }) {
+  const force = Boolean(options?.force)
   const refreshKey = [...(instanceIds ?? [])].sort().join(',') || 'ALL'
-  if (directoryRefreshPromise) return directoryRefreshPromise
-  if (refreshKey === directoryRefreshKey && Date.now() - directoryRefreshedAt < 5000) return { contacts: contacts.value, groups: groups.value }
+  // 取消保存等写操作后必须强制重拉；否则 5 秒缓存 / 进行中的旧刷新会让 UI 仍显示「已保存」
+  if (!force && directoryRefreshPromise) return directoryRefreshPromise
+  if (!force && refreshKey === directoryRefreshKey && Date.now() - directoryRefreshedAt < 5000) {
+    return { contacts: contacts.value, groups: groups.value }
+  }
+  if (force && directoryRefreshPromise) {
+    try { await directoryRefreshPromise } catch { /* 旧刷新失败不阻断强制刷新 */ }
+  }
   loading.value = true
   directoryRefreshPromise = (async () => {
     await refreshInstances()
     const selected = instances.value.filter((item) => item.status === 'ONLINE' && (!instanceIds?.length || instanceIds.includes(item.id)))
+    const blockedByInstance = await window.wxControl?.listBlockedRoomIds?.(selected.map((item) => item.id)) ?? {}
     const contactMap = new Map(contacts.value.map((item) => [ownershipKey(item.sourceInstanceId, item.wxid), item]))
     const groupMap = new Map(groups.value.map((item) => [ownershipKey(item.sourceInstanceId, item.roomId), item]))
     const refreshedContactInstances: string[] = []
     const refreshedGroupInstances: string[] = []
     const refreshFailures: string[] = []
     for (const instance of selected) {
+      const blockedRooms = new Set(blockedByInstance[instance.id] || [])
       // 群聊列表接口常不完整：需合并群列表、群缓存、通讯录群、全量群详情
       const [contactResponse, groupResponse, groupCacheResponse, allRoomResponse] = await Promise.all([
         callWechat(instance, '/api/get_contact_list2', {}, 438557598),
@@ -265,6 +295,7 @@ export async function refreshDirectory(instanceIds?: string[]) {
         for (const raw of findArray(contactResponse.raw, ['friend_list', 'contacts', 'data'])) {
           const wxid = stringOf(raw, ['wxid', 'userName', 'UserName'])
           if (!wxid) continue
+          if (wxid.endsWith('@chatroom') && blockedRooms.has(wxid)) continue
           contactMap.set(ownershipKey(instance.id, wxid), {
             wxid,
             nickname: stringOf(raw, ['nick_name', 'nickName', 'nickname']),
@@ -279,11 +310,11 @@ export async function refreshDirectory(instanceIds?: string[]) {
       const cachedGroups = new Map<string, Record<string, unknown>>()
       for (const raw of collectChatroomRows(groupCacheResponse.ok ? groupCacheResponse.raw : null)) {
         const roomId = stringOf(raw, ['roomId', 'room_id', 'chatroomId', 'userName', 'username', 'wxid', 'UserName'])
-        if (roomId.endsWith('@chatroom')) cachedGroups.set(roomId, raw)
+        if (roomId.endsWith('@chatroom') && !blockedRooms.has(roomId)) cachedGroups.set(roomId, raw)
       }
       for (const raw of collectChatroomRows(allRoomResponse.ok ? allRoomResponse.raw : null)) {
         const roomId = stringOf(raw, ['roomId', 'room_id', 'chatroomId', 'userName', 'username', 'wxid', 'UserName'])
-        if (!roomId.endsWith('@chatroom')) continue
+        if (!roomId.endsWith('@chatroom') || blockedRooms.has(roomId)) continue
         cachedGroups.set(roomId, { ...(cachedGroups.get(roomId) || {}), ...raw })
       }
       const listRows = collectChatroomRows(groupResponse.ok ? groupResponse.raw : null)
@@ -295,12 +326,13 @@ export async function refreshDirectory(instanceIds?: string[]) {
       let mergedCount = 0
       for (const raw of listRows) {
         const roomId = stringOf(raw, ['roomId', 'room_id', 'chatroomId', 'userName', 'username', 'wxid', 'UserName'])
-        if (!roomId) continue
+        if (!roomId || blockedRooms.has(roomId)) continue
         upsertGroupRow(groupMap, instance, contactMap, roomId, raw, cachedGroups.get(roomId) || {})
         mergedCount += 1
       }
       // 群缓存 / 全量详情中有、但群列表未返回的群，一并补齐
       for (const [roomId, cached] of cachedGroups) {
+        if (blockedRooms.has(roomId)) continue
         if (groupMap.has(ownershipKey(instance.id, roomId))) continue
         upsertGroupRow(groupMap, instance, contactMap, roomId, cached, {})
         mergedCount += 1
@@ -308,6 +340,7 @@ export async function refreshDirectory(instanceIds?: string[]) {
       // 通讯录里保存的群（get_chatroom_list 经常漏掉未会话群）
       for (const contact of contactMap.values()) {
         if (contact.sourceInstanceId !== instance.id || !contact.isGroup) continue
+        if (blockedRooms.has(contact.wxid)) continue
         if (groupMap.has(ownershipKey(instance.id, contact.wxid))) continue
         upsertGroupRow(groupMap, instance, contactMap, contact.wxid, {
           username: contact.wxid,
@@ -317,6 +350,11 @@ export async function refreshDirectory(instanceIds?: string[]) {
           small_head_url: contact.avatar,
         }, cachedGroups.get(contact.wxid) || {})
         mergedCount += 1
+      }
+      // 已屏蔽被踢群：确保不会残留在内存目录
+      for (const roomId of blockedRooms) {
+        contactMap.delete(ownershipKey(instance.id, roomId))
+        groupMap.delete(ownershipKey(instance.id, roomId))
       }
       if (!hasAuthoritativeGroupSource && mergedCount > 0 && !refreshedGroupInstances.includes(instance.id)) {
         refreshedGroupInstances.push(instance.id)
@@ -345,6 +383,8 @@ export async function refreshDirectory(instanceIds?: string[]) {
 export async function loadMembers(instanceId: string, roomId: string) {
   const instance = instances.value.find((item) => item.id === instanceId) ?? (await refreshInstances()).find((item) => item.id === instanceId)
   if (!instance) throw new Error('找不到所选微信，请刷新后重试')
+  const blocked = await window.wxControl?.listBlockedRoomIds?.([instanceId]) ?? {}
+  if ((blocked[instanceId] || []).includes(roomId)) throw new Error('该群已被确认为被踢群并永久屏蔽，不再加载成员')
   loading.value = true
   const response = await callWechat(instance, '/api/get_room_members', { room_id: roomId }, 438557503)
   if (!response.ok) { loading.value = false; throw new Error(response.error || '获取群成员失败') }

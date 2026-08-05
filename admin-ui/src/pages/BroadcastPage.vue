@@ -6,54 +6,163 @@ import { Search, Plus } from '@element-plus/icons-vue'
 import PageHeader from '../components/app/PageHeader.vue'
 import StatusTag from '../components/app/StatusTag.vue'
 import StatCard from '../components/cards/StatCard.vue'
+import VirtualTargetTable from '../components/app/VirtualTargetTable.vue'
 import { userErrorMessage } from '../utils/error'
 import { promptGoToTaskCenter } from '../utils/taskFlow'
-import { friends, groups, instances, refreshDirectory, type ContactRow, type GroupRow } from '../stores/wechatData'
+import { filterSelectOptions, SELECT_OPTION_LIMIT_SEARCH, useSelectSearchQuery } from '../utils/searchableSelect'
+import {
+  isOfficialAccountWxid,
+  nicknameExactExcluded,
+  remarkMatchesExclude,
+  splitExcludeRules,
+  wxidExactExcluded,
+} from '../utils/broadcastTargets'
+import { friends, groups, instances, refreshDirectory, refreshInstances, type ContactRow, type GroupRow } from '../stores/wechatData'
 
 const router = useRouter()
 
 const activeTab = ref('好友群发')
 const broadcastTabs = ['好友群发', '群聊群发']
+const selectedInstanceIds = ref<string[]>([])
 const keyword = ref('')
 const excludeWxid = ref('')
 const excludeNick = ref('')
+const excludeRemark = ref('')
 const messageText = ref('')
 const imagePath = ref('')
 const imagePreview = ref('')
 const pastingImage = ref(false)
 const sendMode = ref('now')
 const scheduledAt = ref<Date | null>(null)
-const allocMode = ref('round')
-const accountWeights = ref<Record<string, number>>({})
 const skipSame = ref(true)
 const autoRetry = ref(true)
 const retryTimes = ref(2)
 const retryMinutes = ref(5)
-type TargetRow = { nickname: string; wxid: string; status: string; tag: string; sourceInstanceIds: string[] }
+
+type TargetRow = {
+  rowKey: string
+  nickname: string
+  wxid: string
+  remark: string
+  status: string
+  tag: string
+  sourceInstanceId: string
+  accountLabel: string
+}
+
 const selectedTargets = ref<TargetRow[]>([])
+const selectedKeyList = computed(() => selectedTargets.value.map((item) => item.rowKey))
 const tasks = ref<Array<Record<string, unknown>>>([])
 const lastCreatedTaskId = ref('')
 const creating = ref(false)
-const broadcastFriends = computed<TargetRow[]>(() => {
-  const owned = activeTab.value === '好友群发'
-    ? friends.value.map((item: ContactRow) => ({ nickname: item.nickname || item.remark || item.wxid, wxid: item.wxid, status: '可用', tag: item.remark, sourceInstanceIds: [item.sourceInstanceId] }))
-    : groups.value.map((item: GroupRow) => ({ nickname: item.name, wxid: item.roomId, status: '可用', tag: item.saved ? '已保存' : '未保存', sourceInstanceIds: [item.sourceInstanceId] }))
-  const merged = new Map<string, TargetRow>()
-  for (const item of owned) {
-    const existing = merged.get(item.wxid)
-    if (existing) existing.sourceInstanceIds = [...new Set([...existing.sourceInstanceIds, ...item.sourceInstanceIds])]
-    else merged.set(item.wxid, item)
+const instanceSearch = useSelectSearchQuery()
+
+const targetColumns = computed(() => {
+  if (activeTab.value === '好友群发') {
+    return [
+      { key: 'accountLabel', label: '发送微信', minWidth: 150, flex: 1.2 },
+      { key: 'nickname', label: '昵称', minWidth: 120, flex: 1 },
+      { key: 'remark', label: '备注', minWidth: 120, flex: 1 },
+      { key: 'wxid', label: '微信号', minWidth: 150, flex: 1.2 },
+      { key: 'status', label: '状态', width: 90, minWidth: 90 },
+    ]
   }
-  const source = [...merged.values()]
-  const terms = keyword.value.trim().toLowerCase()
-  // 与加好友排除规则一致：WXID / 昵称精确匹配且忽略大小写
-  const excludedIds = new Set(excludeWxid.value.split(/\r?\n/).map((item) => item.trim().toLowerCase()).filter(Boolean))
-  const excludedNames = new Set(excludeNick.value.split(/\r?\n/).map((item) => item.trim().toLowerCase()).filter(Boolean))
-  return source.filter((item) => (!terms || `${item.nickname} ${item.wxid}`.toLowerCase().includes(terms))
-    && !excludedIds.has(String(item.wxid || '').toLowerCase())
-    && !excludedNames.has(String(item.nickname || '').toLowerCase()))
+  return [
+    { key: 'accountLabel', label: '发送微信', minWidth: 150, flex: 1.2 },
+    { key: 'nickname', label: '昵称', minWidth: 120, flex: 1 },
+    { key: 'wxid', label: '群ID', minWidth: 160, flex: 1.2 },
+    { key: 'status', label: '状态', width: 90, minWidth: 90 },
+    { key: 'tag', label: '标签', minWidth: 100, flex: 0.8 },
+  ]
 })
-const broadcastStats = computed(() => [{ title: activeTab.value === '好友群发' ? '全部好友' : '全部群聊', value: String(broadcastFriends.value.length) }, { title: '已选择', value: String(selectedTargets.value.length) }, { title: '可用实例', value: String(instances.value.length) }])
+
+function accountLabelOf(instanceId: string) {
+  const account = instances.value.find((item) => item.id === instanceId)
+  if (!account) return '未知微信'
+  const idText = account.alias || account.accountWxid || ''
+  const name = account.nickname || (account.status === 'ONLINE' ? '正在读取昵称' : '待登录微信')
+  const base = idText ? `${name}（${idText}）` : name
+  return account.status === 'ONLINE' ? base : `${base} · 离线`
+}
+
+const instanceOptions = computed(() => {
+  const list = instances.value.map((item) => ({
+    label: accountLabelOf(item.id),
+    value: item.id,
+    online: item.status === 'ONLINE',
+  }))
+  return [...list].sort((a, b) => Number(b.online) - Number(a.online))
+})
+
+const visibleInstanceOptions = computed(() => filterSelectOptions(
+  instanceOptions.value,
+  instanceSearch.query.value,
+  selectedInstanceIds.value,
+  instanceSearch.query.value.trim() ? SELECT_OPTION_LIMIT_SEARCH : 80,
+))
+
+function selectAllInstances() {
+  selectedInstanceIds.value = instanceOptions.value.map((item) => item.value)
+}
+
+function clearSelectedInstances() {
+  selectedInstanceIds.value = []
+}
+
+const broadcastFriends = computed<TargetRow[]>(() => {
+  if (!selectedInstanceIds.value.length) return []
+  const selected = new Set(selectedInstanceIds.value)
+  // 两千好友时避免每行都 find 一遍账号标签
+  const accountLabels = new Map<string, string>()
+  for (const id of selectedInstanceIds.value) {
+    accountLabels.set(id, accountLabelOf(id))
+  }
+  const owned: TargetRow[] = activeTab.value === '好友群发'
+    ? friends.value
+      .filter((item: ContactRow) => selected.has(item.sourceInstanceId)
+        && !isOfficialAccountWxid(item.wxid)
+        && !String(item.wxid || '').endsWith('@chatroom'))
+      .map((item: ContactRow) => ({
+        rowKey: `${item.sourceInstanceId}::${item.wxid}`,
+        nickname: item.nickname || item.wxid,
+        wxid: item.wxid,
+        remark: item.remark || '',
+        status: '可用',
+        tag: item.remark || '',
+        sourceInstanceId: item.sourceInstanceId,
+        accountLabel: accountLabels.get(item.sourceInstanceId) || '未知微信',
+      }))
+    : groups.value
+      .filter((item: GroupRow) => selected.has(item.sourceInstanceId) && String(item.roomId || '').endsWith('@chatroom'))
+      .map((item: GroupRow) => ({
+        rowKey: `${item.sourceInstanceId}::${item.roomId}`,
+        nickname: item.name,
+        wxid: item.roomId,
+        remark: '',
+        status: '可用',
+        tag: item.saved ? '已保存' : '未保存',
+        sourceInstanceId: item.sourceInstanceId,
+        accountLabel: accountLabels.get(item.sourceInstanceId) || '未知微信',
+      }))
+  const terms = keyword.value.trim().toLowerCase()
+  const excludedIds = new Set(splitExcludeRules(excludeWxid.value).map((item) => item.toLowerCase()))
+  const excludedNames = new Set(splitExcludeRules(excludeNick.value).map((item) => item.toLowerCase()))
+  const remarkRules = splitExcludeRules(excludeRemark.value)
+  return owned.filter((item) => {
+    if (terms && !`${item.nickname} ${item.wxid} ${item.remark} ${item.accountLabel}`.toLowerCase().includes(terms)) return false
+    if (wxidExactExcluded(item.wxid, excludedIds)) return false
+    if (nicknameExactExcluded(item.nickname, excludedNames)) return false
+    if (activeTab.value === '好友群发' && remarkMatchesExclude(item.remark, remarkRules)) return false
+    return true
+  })
+})
+
+const broadcastStats = computed(() => [
+  { title: '已选微信号', value: String(selectedInstanceIds.value.length) },
+  { title: activeTab.value === '好友群发' ? '可选好友' : '可选群聊', value: String(broadcastFriends.value.length) },
+  { title: '已勾选对象', value: String(selectedTargets.value.length) },
+])
+
 const currentTask = computed(() => {
   if (lastCreatedTaskId.value) {
     const matched = tasks.value.find((item) => String(item.id) === lastCreatedTaskId.value)
@@ -62,6 +171,7 @@ const currentTask = computed(() => {
   const typePrefix = activeTab.value === '群聊群发' ? 'TO_GROUP' : 'TO_FRIEND'
   return tasks.value.find((item) => String(item.type || '').includes(typePrefix)) || {}
 })
+
 const broadcastProgress = computed(() => {
   const task = currentTask.value
   const total = Number(task.total || 0)
@@ -75,14 +185,86 @@ const broadcastProgress = computed(() => {
     eta: task.status ? String(task.status) : '-',
   }
 })
+
 const canPauseCurrent = computed(() => ['RUNNING', 'QUEUED', 'COOLING_DOWN'].includes(String(currentTask.value.status || '')))
+const canResumeCurrent = computed(() => ['PAUSED', 'COOLING_DOWN'].includes(String(currentTask.value.status || '')))
 const broadcastWarnings = computed(() => tasks.value.filter((item) => item.status === 'COOLING_DOWN').map((item) => ({ id: String(item.id), account: String(item.name), desc: '检测到明确频繁证据，任务已暂停', time: String(item.updated_at || '') })))
 const broadcastContent = computed(() => ({ imageName: imagePath.value || '未选择图片' }))
 
-watch(activeTab, () => { selectedTargets.value = [] })
+function formatAccountSummary(targets: TargetRow[]) {
+  const counts = new Map<string, number>()
+  for (const target of targets) {
+    const label = target.accountLabel || accountLabelOf(target.sourceInstanceId)
+    counts.set(label, (counts.get(label) || 0) + 1)
+  }
+  return [...counts.entries()].map(([label, count]) => `${label} → ${count} 个对象`).join('\n')
+}
 
-async function refresh() { await refreshDirectory(); tasks.value = (await window.wxControl?.listTasks() ?? []) as Array<Record<string, unknown>> }
-function preview() { if (!selectedTargets.value.length) return ElMessage.warning('请先勾选接收对象'); if (!messageText.value.trim() && !imagePath.value) return ElMessage.warning('请输入文字或选择图片'); ElMessageBox.alert(`接收对象：${selectedTargets.value.length} 个\n文字：${messageText.value.trim() || '不发送'}\n图片：${imagePath.value || '不发送'}`, '发送预览', { confirmButtonText: '关闭' }) }
+/** 全选当前过滤列表（虚表只渲染可见行，但勾选集合覆盖全部行） */
+function selectAllFilteredTargets(selected: boolean) {
+  if (!selected) {
+    selectedTargets.value = []
+    return
+  }
+  selectedTargets.value = broadcastFriends.value.slice()
+}
+
+function toggleTargetRow(rowKey: string, selected: boolean) {
+  if (selected) {
+    if (selectedTargets.value.some((item) => item.rowKey === rowKey)) return
+    const row = broadcastFriends.value.find((item) => item.rowKey === rowKey)
+    if (row) selectedTargets.value = [...selectedTargets.value, row]
+    return
+  }
+  selectedTargets.value = selectedTargets.value.filter((item) => item.rowKey !== rowKey)
+}
+
+/** 创建前再按当前排除规则筛一遍，防止勾选状态与列表过滤短暂不同步时误发 */
+function resolveSendableTargets() {
+  const allowedKeys = new Set(broadcastFriends.value.map((item) => item.rowKey))
+  const remarkRules = splitExcludeRules(excludeRemark.value)
+  const excludedIds = new Set(splitExcludeRules(excludeWxid.value).map((item) => item.toLowerCase()))
+  const excludedNames = new Set(splitExcludeRules(excludeNick.value).map((item) => item.toLowerCase()))
+  const isGroup = activeTab.value === '群聊群发'
+  return selectedTargets.value.filter((target) => {
+    if (!allowedKeys.has(target.rowKey)) return false
+    if (!isGroup && isOfficialAccountWxid(target.wxid)) return false
+    if (wxidExactExcluded(target.wxid, excludedIds)) return false
+    if (nicknameExactExcluded(target.nickname, excludedNames)) return false
+    if (!isGroup && remarkMatchesExclude(target.remark, remarkRules)) return false
+    return true
+  })
+}
+
+watch(activeTab, () => { selectedTargets.value = [] })
+watch(selectedInstanceIds, () => {
+  const allowed = new Set(selectedInstanceIds.value)
+  selectedTargets.value = selectedTargets.value.filter((item) => allowed.has(item.sourceInstanceId))
+})
+watch(broadcastFriends, (rows) => {
+  const allowed = new Set(rows.map((item) => item.rowKey))
+  selectedTargets.value = selectedTargets.value.filter((item) => allowed.has(item.rowKey))
+})
+
+async function refresh() {
+  await refreshInstances()
+  const valid = new Set(instances.value.map((item) => item.id))
+  selectedInstanceIds.value = selectedInstanceIds.value.filter((id) => valid.has(id))
+  await refreshDirectory(selectedInstanceIds.value.length ? selectedInstanceIds.value : undefined)
+  tasks.value = (await window.wxControl?.listTasks() ?? []) as Array<Record<string, unknown>>
+}
+
+function preview() {
+  if (!selectedInstanceIds.value.length) return ElMessage.warning('请先勾选要用的发送微信号')
+  const targets = resolveSendableTargets()
+  if (!targets.length) return ElMessage.warning('请先勾选接收对象')
+  if (!messageText.value.trim() && !imagePath.value) return ElMessage.warning('请输入文字或选择图片')
+  ElMessageBox.alert(
+    `发送微信号与对象：\n${formatAccountSummary(targets)}\n\n文字：${messageText.value.trim() || '不发送'}\n图片：${imagePath.value || '不发送'}`,
+    '发送预览',
+    { confirmButtonText: '关闭' },
+  )
+}
 
 /**
  * 暂停当前页跟踪的群发任务。
@@ -95,44 +277,91 @@ async function pauseCurrentBroadcast() {
   await refresh()
 }
 
+/**
+ * 继续当前页已暂停/冷却中的群发任务。
+ */
+async function resumeCurrentBroadcast() {
+  const id = String(currentTask.value.id || lastCreatedTaskId.value || '')
+  if (!id) return ElMessage.warning('当前没有可继续的群发任务，请到任务中心操作')
+  try {
+    await window.wxControl?.resumeTask?.(id)
+    ElMessage.success('任务已继续执行')
+    await refresh()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '继续任务失败')
+  }
+}
+
 async function createBroadcast() {
-  if (!selectedTargets.value.length) return ElMessage.warning('请先勾选接收对象')
+  if (!selectedInstanceIds.value.length) return ElMessage.warning('请先勾选要用的发送微信号')
+  const targets = resolveSendableTargets()
+  if (!targets.length) return ElMessage.warning('请先勾选接收对象（已按排除规则过滤）')
+  selectedTargets.value = targets
   const hasText = Boolean(messageText.value.trim())
   const hasImage = Boolean(imagePath.value)
   if (!hasText && !hasImage) return ElMessage.warning('请输入文字或选择图片')
+  if (hasImage && !String(imagePath.value || '').trim()) return ElMessage.warning('请重新选择图片')
   if (sendMode.value === 'schedule' && (!scheduledAt.value || scheduledAt.value.getTime() <= Date.now())) return ElMessage.warning('请选择未来的发送时间')
   const isGroup = activeTab.value === '群聊群发'
-  const mismatched = selectedTargets.value.filter((target) => isGroup !== String(target.wxid || '').endsWith('@chatroom'))
+  const mismatched = targets.filter((target) => isGroup !== String(target.wxid || '').endsWith('@chatroom'))
   if (mismatched.length) return ElMessage.warning(isGroup ? '勾选对象里混入了好友，请切换到「好友群发」或重新勾选群聊' : '勾选对象里混入了群聊，请切换到「群聊群发」或重新勾选好友')
+  const selectedSet = new Set(selectedInstanceIds.value)
+  const outside = targets.filter((target) => !selectedSet.has(target.sourceInstanceId))
+  if (outside.length) return ElMessage.warning('有接收对象不属于已勾选的发送微信号，请刷新后重选')
+  const onlineIds = new Set(instances.value.filter((item) => item.status === 'ONLINE').map((item) => item.id))
+  if (![...selectedSet].some((id) => onlineIds.has(id))) return ElMessage.warning('已勾选的发送微信号当前都不在线')
+  const offlineTargets = targets.filter((target) => !onlineIds.has(target.sourceInstanceId))
+  if (offlineTargets.length) return ElMessage.warning(`${offlineTargets.length} 个接收对象所属的微信当前不在线，请刷新后重试`)
   try {
-    await ElMessageBox.confirm(`确认创建包含 ${selectedTargets.value.length} 个目标的任务？创建后仍需在任务中心确认执行。`, '确认群发任务', { type: 'warning' })
+    await ElMessageBox.confirm(
+      `确认创建 ${targets.length} 个目标的群发任务？\n\n${formatAccountSummary(targets)}\n\n创建后仍需在任务中心确认执行。`,
+      '确认群发任务',
+      { type: 'warning' },
+    )
   } catch { return }
-  const type = hasText && hasImage ? (isGroup ? 'SEND_MIXED_TO_GROUP' : 'SEND_MIXED_TO_FRIEND') : hasText ? (isGroup ? 'SEND_TEXT_TO_GROUP' : 'SEND_TEXT_TO_FRIEND') : (isGroup ? 'SEND_IMAGE_TO_GROUP' : 'SEND_IMAGE_TO_FRIEND')
-  const available = instances.value.filter((item) => item.status === 'ONLINE')
-  if (!available.length) return ElMessage.warning('没有已登录的微信')
-  const unavailable = selectedTargets.value.filter((target) => !available.some((item) => target.sourceInstanceIds.includes(item.id)))
-  if (unavailable.length) return ElMessage.warning(`${unavailable.length} 个接收对象所属的微信当前不在线，请刷新后重试`)
+  const type = hasText && hasImage
+    ? (isGroup ? 'SEND_MIXED_TO_GROUP' : 'SEND_MIXED_TO_FRIEND')
+    : hasText
+      ? (isGroup ? 'SEND_TEXT_TO_GROUP' : 'SEND_TEXT_TO_FRIEND')
+      : (isGroup ? 'SEND_IMAGE_TO_GROUP' : 'SEND_IMAGE_TO_FRIEND')
   creating.value = true
   try {
-    const items = selectedTargets.value.flatMap((target, index) => {
-      const eligible = available.filter((item) => target.sourceInstanceIds.includes(item.id))
-      const allocationPool = eligible.flatMap((item) => Array.from({ length: allocMode.value === 'weight' ? Math.max(1, Math.round(accountWeights.value[item.id] || 1)) : 1 }, () => item))
-      const assigned = allocationPool[index % allocationPool.length]
-      return [
-        ...(hasText ? [{ instanceId: assigned.id, targetKey: target.wxid, actionType: 'SEND_TEXT', request: { wxid: target.wxid, msg: messageText.value.trim() } }] : []),
-        ...(hasImage ? [{ instanceId: assigned.id, targetKey: target.wxid, actionType: 'SEND_IMAGE', request: { wxid: target.wxid, filepath: imagePath.value } }] : []),
-      ]
-    })
-    const created = await window.wxControl?.createTask({ name: `${activeTab.value} ${new Date().toLocaleString()}`, type, config: { autoRetry: autoRetry.value, retryTimes: retryTimes.value, retryMinutes: retryMinutes.value, skipSame: skipSame.value, scheduledAt: sendMode.value === 'schedule' ? scheduledAt.value?.toISOString() : null, allocMode: allocMode.value, accountWeights: accountWeights.value }, items }) as Record<string, unknown> | undefined
+    // 每行对象由其所属微信发送；混发则同号拆成文字+图片两条；全部写成纯 JSON，避免 IPC 克隆失败
+    const text = messageText.value.trim()
+    const image = String(imagePath.value || '')
+    const selectedIds = selectedInstanceIds.value.map(String)
+    const items = targets.flatMap((target) => [
+      ...(hasText ? [{ instanceId: String(target.sourceInstanceId), targetKey: String(target.wxid), actionType: 'SEND_TEXT', request: { wxid: String(target.wxid), msg: text, nickname: String(target.nickname || '') } }] : []),
+      ...(hasImage ? [{ instanceId: String(target.sourceInstanceId), targetKey: String(target.wxid), actionType: 'SEND_IMAGE', request: { wxid: String(target.wxid), filepath: image, nickname: String(target.nickname || '') } }] : []),
+    ])
+    const created = await window.wxControl?.createTask({
+      name: `${activeTab.value} ${new Date().toLocaleString()}`,
+      type,
+      config: {
+        autoRetry: Boolean(autoRetry.value),
+        retryTimes: Number(retryTimes.value) || 1,
+        retryMinutes: Number(retryMinutes.value) || 1,
+        skipSame: Boolean(skipSame.value),
+        scheduledAt: sendMode.value === 'schedule' ? scheduledAt.value?.toISOString() || null : null,
+        selectedInstanceIds: selectedIds,
+      },
+      items,
+    }) as Record<string, unknown> | undefined
     lastCreatedTaskId.value = String(created?.id || '')
     await refresh()
-    await promptGoToTaskCenter(router, `已创建 ${selectedTargets.value.length} 个目标的群发任务`)
+    await promptGoToTaskCenter(router, `已创建 ${targets.length} 个目标的群发任务`)
   } catch (error) {
+    void window.wxControl?.reportError?.('创建群发任务失败', {
+      reason: String(error instanceof Error ? error.message : error || '').slice(0, 500),
+      targetCount: targets.length,
+      type,
+    })
     ElMessage.error(userErrorMessage(error, '创建群发任务失败'))
   } finally {
     creating.value = false
   }
 }
+
 async function selectImage() { imagePath.value = await window.wxControl?.selectImage() ?? ''; imagePreview.value = '' }
 function clearImage() { imagePath.value = ''; imagePreview.value = '' }
 async function pasteImage() {
@@ -152,13 +381,14 @@ function onPaste(event: ClipboardEvent) {
   event.preventDefault()
   void pasteImage()
 }
-onMounted(() => { refresh(); document.addEventListener('paste', onPaste) })
+
+onMounted(() => { void refresh(); document.addEventListener('paste', onPaste) })
 onBeforeUnmount(() => document.removeEventListener('paste', onPaste))
 </script>
 
 <template>
   <div class="app-page">
-    <PageHeader title="消息群发" subtitle="勾选接收对象后创建任务；创建后需到任务中心确认才会真正发送。" />
+    <PageHeader title="消息群发" subtitle="先勾选发送微信号，再勾选该号下的好友/群；创建后需到任务中心确认才会真正发送。" />
 
     <div class="chip-row">
       <button
@@ -175,6 +405,30 @@ onBeforeUnmount(() => document.removeEventListener('paste', onPaste))
     <div class="main-split">
       <section class="app-card block left-panel">
         <h3 class="section-title">接收对象选择区</h3>
+        <div class="form-block">
+          <div class="field-label-row">
+            <label>发送微信号</label>
+            <span class="field-select-actions">
+              <el-button link type="primary" :disabled="!instanceOptions.length" @click.stop="selectAllInstances">全选</el-button>
+              <el-button link type="info" :disabled="!selectedInstanceIds.length" @click.stop="clearSelectedInstances">全不选</el-button>
+            </span>
+          </div>
+          <el-select
+            v-model="selectedInstanceIds"
+            multiple
+            filterable
+            collapse-tags
+            collapse-tags-tooltip
+            placeholder="先勾选要用哪个微信发；不选则不展示对象"
+            style="width: 100%"
+            :filter-method="instanceSearch.setQuery"
+            @visible-change="(open: boolean) => { if (!open) instanceSearch.clearQuery() }"
+          >
+            <el-option v-for="o in visibleInstanceOptions" :key="o.value" :label="o.label" :value="o.value" />
+          </el-select>
+          <p class="muted" style="margin-top: 6px">同一好友/群若在多个微信里，会显示多行；勾哪行就用哪个号发。</p>
+        </div>
+
         <div class="mini-stats">
           <StatCard
             v-for="item in broadcastStats"
@@ -190,34 +444,47 @@ onBeforeUnmount(() => document.removeEventListener('paste', onPaste))
           <el-input
             v-model="keyword"
             style="width: 260px"
-            placeholder="搜索微信号或昵称"
+            placeholder="搜索昵称、微信号或发送微信"
             :prefix-icon="Search"
             clearable
           />
           <el-button @click="refresh">刷新</el-button>
+          <el-button :disabled="!broadcastFriends.length" @click="selectAllFilteredTargets(true)">全选当前列表</el-button>
+          <el-button :disabled="!selectedTargets.length" @click="selectAllFilteredTargets(false)">清空勾选</el-button>
         </div>
 
-        <div class="exclude-grid">
+        <div class="exclude-grid" :class="{ 'is-friend': activeTab === '好友群发' }">
           <div>
             <label>排除微信号</label>
-            <el-input v-model="excludeWxid" type="textarea" :rows="3" />
+            <el-input v-model="excludeWxid" type="textarea" :rows="3" placeholder="每行一个，精确匹配" />
           </div>
           <div>
             <label>排除昵称</label>
-            <el-input v-model="excludeNick" type="textarea" :rows="3" />
+            <el-input v-model="excludeNick" type="textarea" :rows="3" placeholder="每行一个，精确匹配" />
+          </div>
+          <div v-if="activeTab === '好友群发'">
+            <label>排除备注（包含即排除）</label>
+            <el-input v-model="excludeRemark" type="textarea" :rows="3" placeholder="备注包含指定内容则不发，每行一条" />
           </div>
         </div>
 
         <div class="table-wrap" style="margin-top: 12px">
-          <el-table :data="broadcastFriends" stripe height="280" style="width: 100%" @selection-change="selectedTargets = $event">
-            <el-table-column type="selection" width="48" />
-            <el-table-column prop="nickname" label="昵称" min-width="120" show-overflow-tooltip />
-            <el-table-column prop="wxid" label="微信号" min-width="150" show-overflow-tooltip />
-            <el-table-column label="状态" width="90">
-              <template #default="{ row }"><StatusTag :text="row.status" /></template>
-            </el-table-column>
-            <el-table-column prop="tag" label="标签" min-width="120" show-overflow-tooltip />
-          </el-table>
+          <el-empty v-if="!selectedInstanceIds.length" description="请先勾选发送微信号" :image-size="72" />
+          <VirtualTargetTable
+            v-else
+            :rows="broadcastFriends"
+            :columns="targetColumns"
+            :selected-keys="selectedKeyList"
+            :height="360"
+            :row-height="40"
+            empty-text="当前过滤条件下没有可发送对象"
+            @select-all="selectAllFilteredTargets"
+            @toggle-row="toggleTargetRow"
+          >
+            <template #cell-status="{ value }">
+              <StatusTag :text="value || '可用'" />
+            </template>
+          </VirtualTargetTable>
         </div>
       </section>
 
@@ -263,23 +530,9 @@ onBeforeUnmount(() => document.removeEventListener('paste', onPaste))
         </div>
 
         <div class="form-block">
-          <label>按账号分配</label>
-          <el-radio-group v-model="allocMode">
-            <el-radio value="round">轮询分配</el-radio>
-            <el-radio value="weight">按权重分配</el-radio>
-          </el-radio-group>
-          <div v-if="allocMode === 'weight'" class="checks" style="margin-top: 8px">
-            <div v-for="account in instances.filter(item => item.status === 'ONLINE')" :key="account.id" class="retry-row">
-              <span>{{ account.nickname || account.accountWxid || '未命名微信' }}</span>
-              <el-input-number v-model="accountWeights[account.id]" :min="1" :max="100" controls-position="right" />
-            </div>
-          </div>
-        </div>
-
-        <div class="form-block">
           <label>高级选项</label>
           <div class="checks">
-            <el-checkbox v-model="skipSame">跳过已接收过相同内容的好友</el-checkbox>
+            <el-checkbox v-model="skipSame">跳过已接收过相同内容的对象</el-checkbox>
             <div class="retry-row">
               <el-checkbox v-model="autoRetry">发送失败自动重试</el-checkbox>
               <el-input-number v-model="retryTimes" :min="1" controls-position="right" />
@@ -294,6 +547,7 @@ onBeforeUnmount(() => document.removeEventListener('paste', onPaste))
           <el-button @click="preview">预览</el-button>
           <el-button type="primary" :loading="creating" @click="createBroadcast">创建任务</el-button>
           <el-button :disabled="!canPauseCurrent" @click="pauseCurrentBroadcast">暂停</el-button>
+          <el-button type="primary" plain :disabled="!canResumeCurrent" @click="resumeCurrentBroadcast">继续</el-button>
         </div>
       </section>
     </div>
@@ -359,12 +613,39 @@ onBeforeUnmount(() => document.removeEventListener('paste', onPaste))
   gap: 12px;
 }
 
+.exclude-grid.is-friend {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+@media (max-width: 1200px) {
+  .exclude-grid.is-friend {
+    grid-template-columns: 1fr;
+  }
+}
+
 .exclude-grid label,
 .form-block label {
   display: block;
   margin-bottom: 6px;
   color: var(--app-text-secondary);
   font-size: 12px;
+}
+
+.field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.field-label-row label {
+  margin-bottom: 0;
+}
+
+.field-select-actions {
+  display: inline-flex;
+  gap: 4px;
 }
 
 .form-block {
@@ -401,7 +682,6 @@ onBeforeUnmount(() => document.removeEventListener('paste', onPaste))
   word-break: break-all;
 }
 
-.range-row,
 .retry-row {
   display: flex;
   align-items: center;

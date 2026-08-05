@@ -9,7 +9,7 @@
  * @returns {boolean}
  */
 function isLeaveText(text) {
-  return /退群|离开群|离开|移除|踢出/.test(String(text || ''))
+  return /退群|离开群|离开|移除|踢出|移出群聊/.test(String(text || ''))
 }
 
 /**

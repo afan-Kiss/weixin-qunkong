@@ -13,7 +13,7 @@ interface TaskView {
 
 const activeType = ref('全部')
 const rawTasks = ref<Array<Record<string, unknown>>>([])
-const taskTypeChips = ['全部', '群成员', '二维码', '好友群发', '群聊群发']
+const taskTypeChips = ['全部', '群成员', '二维码', '好友群发', '群聊群发', '被踢群']
 const selectedId = ref('')
 const detailRef = ref<HTMLElement | null>(null)
 const taskItems = ref<Array<Record<string, unknown>>>([])
@@ -35,6 +35,7 @@ function typeMatches(row: TaskView) {
   if (activeType.value === '二维码') return row.typeCode === 'QR_SCAN'
   if (activeType.value === '好友群发') return row.typeCode.includes('TO_FRIEND')
   if (activeType.value === '群聊群发') return row.typeCode.includes('TO_GROUP')
+  if (activeType.value === '被踢群') return row.typeCode === 'KICKED_GROUP_CLEANUP'
   return row.typeCode.includes('MEMBER') || row.typeCode === 'ADD_FRIEND'
 }
 const tasks = computed<TaskView[]>(() => rawTasks.value.map(normalizeTask).filter(typeMatches))
@@ -44,9 +45,88 @@ const taskAccounts = computed(() => {
   const ids = [...new Set(taskItems.value.map((item) => String(item.instance_id || '')).filter(Boolean))]
   return ids.map((id) => {
     const instance = taskInstances.value.find((item) => item.id === id)
-    return { id, nickname: instance?.nickname || '微信昵称读取中', wxid: instance?.accountWxid || '微信号读取中' }
+    const wechatId = instance?.alias || instance?.accountWxid || ''
+    return { id, nickname: instance?.nickname || '微信昵称读取中', wxid: wechatId || '微信号读取中' }
   })
 })
+
+/** 任务明细目标列：优先群名/微信名，不展示 roomId / wxid / 哈希 /「二维码目标」 */
+function taskItemTargetLabel(row: Record<string, unknown>) {
+  const isJunkLabel = (value: string) => !value
+    || value === '二维码目标'
+    || value === '群聊'
+    || /未知群名/.test(value)
+    || /^二维码/.test(value)
+    || /@chatroom$/i.test(value)
+    || /^wxid_/i.test(value)
+  const label = String(row.targetLabel || row.target_label || '').trim()
+  if (label && !isJunkLabel(label)) {
+    return label.replace(/[（(]\s*\d+\s*人\s*[）)]\s*$/, '').replace(/[（(]\s*人数未知\s*[）)].*$/, '').trim() || label
+  }
+  let request: Record<string, unknown> = {}
+  let response: Record<string, unknown> = {}
+  try {
+    request = typeof row.request_json === 'string' ? JSON.parse(row.request_json) as Record<string, unknown> : (row.request_json as Record<string, unknown>) || {}
+  } catch { /* ignore */ }
+  try {
+    response = typeof row.response_json === 'string' ? JSON.parse(row.response_json) as Record<string, unknown> : (row.response_json as Record<string, unknown>) || {}
+  } catch { /* ignore */ }
+  const preview = (response.preview && typeof response.preview === 'object')
+    ? response.preview as Record<string, unknown>
+    : {}
+  const roomName = String(
+    request.roomName || response.roomName || preview.roomName || '',
+  ).trim()
+  if (roomName && !isJunkLabel(roomName)) return roomName
+  const fromLabel = String(request.label || response.label || preview.label || '').trim()
+  if (fromLabel && !isJunkLabel(fromLabel)) {
+    return fromLabel.replace(/[（(]\s*\d+\s*人\s*[）)]\s*$/, '').replace(/[（(]\s*人数未知\s*[）)].*$/, '').trim() || fromLabel
+  }
+  const nick = String(request.nickname || '').trim()
+  if (nick && !/^wxid_/i.test(nick)) return nick
+  const err = String(row.error || '').trim()
+  const joined = err.match(/已进群[：:]\s*([^（(\n]+)/)
+  if (joined?.[1] && !/未知群名|二维码/.test(joined[1])) return joined[1].trim()
+  const key = String(row.target_key || '').trim()
+  if (key.endsWith('@chatroom')) return '未命名群聊'
+  if (String(row.action_type || '') === 'QR_SCAN') return '群邀请（未解析到群名）'
+  if (/^wxid_/i.test(key) || /^[0-9A-Fa-f]{32,}$/.test(key)) return '微信好友'
+  return key || '-'
+}
+
+/**
+ * 双击任务明细：在资源管理器中定位该条对应的二维码图片。
+ * @param row 明细行
+ */
+async function revealTaskItemQrImage(row: Record<string, unknown>) {
+  let request: Record<string, unknown> = {}
+  try {
+    request = typeof row.request_json === 'string'
+      ? JSON.parse(row.request_json) as Record<string, unknown>
+      : (row.request_json as Record<string, unknown>) || {}
+  } catch { /* ignore */ }
+  let target = String(request.path || request.localPath || '').trim()
+  if (!target) {
+    const key = String(row.target_key || '').trim()
+    if (key) {
+      try {
+        const items = (await window.wxControl?.listQrItems?.() ?? []) as Array<Record<string, unknown>>
+        const hit = items.find((item) => String(item.sha256 || '') === key || String(item.id || '') === key)
+        target = String(hit?.localPath || hit?.path || '').trim()
+      } catch { /* ignore */ }
+    }
+  }
+  if (!target || target === '-') {
+    ElMessage.info('该明细没有关联的本地二维码图片（纯链接导入项可能无图片文件）')
+    return
+  }
+  try {
+    const result = await window.wxControl?.revealInFolder?.(target)
+    if (!result?.ok) ElMessage.warning(result?.message || '无法在资源管理器中定位该图片')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '定位图片失败')
+  }
+}
 let timer: ReturnType<typeof setInterval> | undefined
 let refreshing = false
 async function refresh() {
@@ -73,6 +153,7 @@ async function viewTask(id: string) {
 function confirmCopy(typeCode: string) {
   if (typeCode === 'ADD_FRIEND') return '确认后将按间隔逐个提交加好友申请。'
   if (typeCode === 'QR_SCAN') return '确认后将按间隔识别二维码并提交进群申请（个人码按任务配置跳过）。'
+  if (typeCode === 'KICKED_GROUP_CLEANUP') return '确认后将按间隔逐个清理被踢群：取消通讯录、退出并清除会话，并永久屏蔽。任务明细与日志会显示每个群的成功或失败。'
   if (typeCode.includes('TO_GROUP') || typeCode.includes('TO_FRIEND')) return '确认后将向任务中的好友或群聊逐条发送消息。'
   return '确认后将开始执行该任务。'
 }
@@ -99,6 +180,15 @@ async function pauseTask(id: string) {
     ElMessage.error(error instanceof Error ? error.message : '暂停失败')
   }
 }
+async function resumeTask(id: string) {
+  try {
+    await window.wxControl?.resumeTask(id)
+    ElMessage.success('任务已继续执行')
+    await refresh()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '继续任务失败')
+  }
+}
 async function cancelTask(id: string) {
   try {
     await ElMessageBox.confirm('取消后不会自动恢复；未开始的加好友目标可重新创建。', '取消任务', { type: 'warning' })
@@ -114,7 +204,7 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
 
 <template>
   <div class="app-page">
-    <PageHeader title="任务中心" subtitle="所有加好友、进群、群发任务都在这里确认后才会执行；待确认请优先处理。" />
+    <PageHeader title="任务中心" subtitle="所有加好友、进群、群发、清理被踢群任务都在这里确认后才会执行；待确认请优先处理。" />
 
     <div class="stats-grid-5">
       <StatCard
@@ -167,6 +257,7 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
               <template #default="{ row }">
                 <el-button v-if="row.statusCode === 'WAITING_CONFIRMATION'" link type="primary" @click.stop="confirmTask(row.id)">确认执行</el-button>
                 <el-button v-if="['RUNNING','QUEUED'].includes(row.statusCode)" link @click.stop="pauseTask(row.id)">暂停</el-button>
+                <el-button v-if="['PAUSED','COOLING_DOWN'].includes(row.statusCode)" link type="primary" @click.stop="resumeTask(row.id)">继续</el-button>
                 <el-button link @click.stop="viewTask(row.id)">查看</el-button>
                 <el-button v-if="!['COMPLETED','CANCELLED'].includes(row.statusCode)" link type="danger" @click.stop="cancelTask(row.id)">取消</el-button>
               </template>
@@ -187,6 +278,11 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
             v-if="['RUNNING', 'QUEUED'].includes(current.statusCode)"
             @click="pauseTask(current.id)"
           >暂停任务</el-button>
+          <el-button
+            v-if="['PAUSED', 'COOLING_DOWN'].includes(current.statusCode)"
+            type="primary"
+            @click="resumeTask(current.id)"
+          >继续任务</el-button>
           <el-button
             v-if="!['COMPLETED', 'CANCELLED'].includes(current.statusCode)"
             type="danger"
@@ -211,12 +307,22 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
         <div v-else class="muted account-empty">暂未找到执行任务的微信</div>
         <h4 class="account-title">任务明细</h4>
         <div class="table-wrap">
-          <el-table :data="taskItems" stripe height="220" size="small" empty-text="暂无明细">
-            <el-table-column prop="target_key" label="目标" min-width="140" show-overflow-tooltip />
-            <el-table-column label="状态" width="100">
+          <el-table
+            :data="taskItems"
+            stripe
+            height="220"
+            size="small"
+            empty-text="暂无明细"
+            row-class-name="task-item-row"
+            @row-dblclick="(row: Record<string, unknown>) => revealTaskItemQrImage(row)"
+          >
+            <el-table-column label="目标" min-width="160" show-overflow-tooltip>
+              <template #default="{ row }">{{ taskItemTargetLabel(row) }}</template>
+            </el-table-column>
+            <el-table-column label="状态" width="120">
               <template #default="{ row }"><StatusTag :text="statusLabel(row.status)" /></template>
             </el-table-column>
-            <el-table-column prop="error" label="说明" min-width="160" show-overflow-tooltip />
+            <el-table-column prop="error" label="说明（含微信拒绝理由）" min-width="260" show-overflow-tooltip />
           </el-table>
         </div>
       </DetailPanel>
@@ -260,4 +366,5 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
 .account-empty { padding: 12px 0; }
 .result-success { color: #16a34a; font-weight: 700; }
 .result-failed { color: #dc2626; font-weight: 700; }
+:deep(.task-item-row) { cursor: pointer; }
 </style>

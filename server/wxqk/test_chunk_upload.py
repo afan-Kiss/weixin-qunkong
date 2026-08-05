@@ -65,6 +65,23 @@ class ChunkUploadTests(unittest.TestCase):
             self.assertTrue(complete["ok"])
             self.assertEqual(complete["mode"], "complete")
 
+    def test_custom_chunk_size_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data_dir = Path(temp)
+            payload = (b"big-chunk-" * 200_000) + b"end"
+            chunk = 2 * 1024 * 1024
+            started = cu.begin_chunked_upload(
+                data_dir, "build-4mb", "client.exe", len(payload), chunk_size=chunk
+            )
+            self.assertTrue(started["ok"])
+            self.assertEqual(int(started["chunkHint"]), chunk)
+            parts = [payload[i:i + chunk] for i in range(0, len(payload), chunk)]
+            for index, part in enumerate(parts):
+                self.assertTrue(cu.put_chunked_part(data_dir, "build-4mb", index, part)["ok"])
+            finished = cu.finish_chunked_upload(data_dir, "build-4mb")
+            self.assertTrue(finished["ok"])
+            self.assertEqual(finished["sha256"], hashlib.sha256(payload).hexdigest())
+
 
 if __name__ == "__main__":
     unittest.main()

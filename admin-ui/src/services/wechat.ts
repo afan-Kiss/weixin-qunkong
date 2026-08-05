@@ -6,6 +6,8 @@ export interface WechatInstance {
   tcpPort: number
   pid?: number
   accountWxid?: string
+  /** 用户可见微信号（profile.alias），未设置时可能为空 */
+  alias?: string
   nickname?: string
   avatar?: string
   status: 'STOPPED' | 'RESTORING' | 'STARTING' | 'WAITING_LOGIN' | 'ONLINE' | 'ERROR'
@@ -198,6 +200,8 @@ export function resolveGroupMemberAddCredentials(rawResponse: unknown, targetWxi
   const tickets = toRecordArray(payload.verifyUserValidTicketList)
   const matchedTicket = tickets.find((ticket) => readWechatString(ticket.username) === targetWxid) ?? tickets[0]
   let v3 = matchedContact ? readWechatString(matchedContact.encryptUserName) : undefined
+  // update_single_profile 等扁平响应：encryptUserName 在顶层
+  if (!v3) v3 = readWechatString(payload.encryptUserName)
   if (!v3 && matchedContact) {
     const candidate = readWechatString(matchedContact.userName)
     if (candidate?.toLowerCase().startsWith('v3_')) v3 = candidate
@@ -252,9 +256,33 @@ export async function resolveFriendCredentials(instance: WechatInstance, wxid: s
       hasV3: Boolean(parsed.v3), v3Prefix: parsed.v3?.slice(0, 10), v3Length: parsed.v3?.length || 0,
       hasV4: Boolean(parsed.v4), v4Prefix: parsed.v4?.slice(0, 10), v4Length: parsed.v4?.length || 0,
       missing: parsed.missing.join(','), attempt: 4, elapsedMs: Date.now() - startedAt,
-      nextAction: parsed.missing.length ? 'STOP_MISSING_CREDENTIALS' : 'CREATE_TASK', parserVersion: 'har-v1',
+      nextAction: parsed.missing.length ? 'FALLBACK_UPDATE_SINGLE_PROFILE' : 'CREATE_TASK', parserVersion: 'har-v1',
     })
     if (!parsed.missing.length) resolved = parsed
+    else {
+      // 群接口常仅有 V4；资料接口可补 V3（本机 4.1.8.27 已验证可与 scene 双字段一起发送）
+      const profile = await callWechat(instance, '/api/update_single_profile', { wxid }, 438557572)
+      const profileParsed = resolveGroupMemberAddCredentials(profile.raw, wxid, roomId)
+      const mergedV3 = profileParsed.v3 || resolved.v3
+      const mergedV4 = resolved.v4 || profileParsed.v4
+      const missing: Array<'v3' | 'v4'> = []
+      if (!mergedV3) missing.push('v3')
+      if (!mergedV4) missing.push('v4')
+      attempts.push(`update_single_profile[${missing.join('+') || 'complete'}]`)
+      diagnostics.push({
+        endpoint: '/api/update_single_profile', httpStatus: profile.ok ? 200 : 0, baseRet: profileParsed.baseRet,
+        hasV3: Boolean(mergedV3), v3Prefix: mergedV3?.slice(0, 10), v3Length: mergedV3?.length || 0,
+        hasV4: Boolean(mergedV4), v4Prefix: mergedV4?.slice(0, 10), v4Length: mergedV4?.length || 0,
+        missing: missing.join(','), attempt: 5, elapsedMs: Date.now() - startedAt,
+        nextAction: missing.length ? 'STOP_MISSING_CREDENTIALS' : 'CREATE_TASK', parserVersion: 'har-v1',
+      })
+      resolved = {
+        ...resolved,
+        v3: mergedV3,
+        v4: mergedV4,
+        missing,
+      }
+    }
   }
   resolved ??= resolveGroupMemberAddCredentials({}, wxid, roomId)
   return { ...resolved, attempts, diagnostics }

@@ -146,9 +146,15 @@ function hasFrequentMark(error?: string, status?: string) {
  */
 function resolveAddStatus(senderWxid: string, candidateStatus: string) {
   const friend = friendStatuses.value[senderWxid]
+  const reason = String(friend?.error || '').trim()
   // 仅看该项状态/错误，任务整体 COOLING_DOWN 不误伤已提交或其他候选人
-  if (friend && hasFrequentMark(friend.error, friend.status)) return '已经频繁'
-  if (friend?.status === 'SUBMITTED' || friend?.status === 'COMPLETED') return '已添加'
+  if (friend && hasFrequentMark(friend.error, friend.status)) return reason ? `已经频繁：${reason}` : '已经频繁'
+  if (friend?.status === 'REQUEST_SENT' || friend?.status === 'SUBMITTED' || friend?.status === 'COMPLETED') {
+    return reason || '申请已提交'
+  }
+  if (friend?.status === 'RESOLUTION_FAILED') return reason ? `资料失败：${reason}` : '资料解析失败'
+  if (friend?.status === 'FAILED' || friend?.status === 'PARTIAL_FAILED') return reason ? `失败：${reason}` : '失败'
+  if (friend?.status === 'SKIPPED') return reason ? `已过滤：${reason}` : '已过滤'
   if (candidateStatus === 'TASKED') return '已入任务'
   if (candidateStatus === 'PENDING') return '待创建'
   return candidateStatus || '-'
@@ -334,8 +340,8 @@ const DEFAULT_FRIEND_VERIFY_CONTENT = '你好，我是群里的朋友'
 async function createAddFriendTask(rows?: CandidateRow[]) {
   if (!rows?.length && !selectedIds.value.length) return ElMessage.warning('请先勾选要添加的发言候选')
   const source = (rows && rows.length ? rows : candidates.value.filter((item) => selectedIds.value.includes(item.id)))
-    .filter((item) => item.status === 'PENDING')
-  if (!source.length) return ElMessage.warning('勾选的候选中没有待创建项，请勾选状态为「待创建」的记录')
+    .filter((item) => item.status === 'PENDING' || item.status === 'TASKED')
+  if (!source.length) return ElMessage.warning('勾选的候选中没有可创建项')
   let prompt: { value: string }
   try {
     prompt = await ElMessageBox.prompt('添加好友验证内容', '创建加好友任务', {
@@ -361,14 +367,17 @@ async function createAddFriendTask(rows?: CandidateRow[]) {
         status: 'PROFILE_PENDING',
         request: {
           targetWxid: row.senderWxid,
+          nickname: row.nickname || '',
           sourceRoomId: row.sourceRoomId || row.roomId,
           sourceRoomName: row.sourceRoomName,
           sourceInstanceId: row.instanceId,
           sourceInstancePort: row.sourceInstancePort || instance.apiPort,
           accountWxid: row.accountWxid || instance.accountWxid,
           receivedAt: row.receivedAt || row.createdAt,
-          senderV3: row.senderV3,
-          scence: '3', friendFlg: '0', verifyContent: String(prompt.value || '').trim() || DEFAULT_FRIEND_VERIFY_CONTENT,
+          // 不把消息内 senderV3 写入任务：会与新鲜 V4 拼配失败；执行端用 update_single_profile 现取 V3
+          // 群聊来源：scene/scence 均用 14；执行端还会补齐 scene 双字段与群标识
+          scence: '14', scene: '14', friendFlg: '0',
+          verifyContent: String(prompt.value || '').trim() || DEFAULT_FRIEND_VERIFY_CONTENT,
         },
       })
       taskedIds.push(row.id)
@@ -385,21 +394,11 @@ async function createAddFriendTask(rows?: CandidateRow[]) {
     }) as Record<string, unknown> | undefined
     if (taskedIds.length) await window.wxControl?.markChatAddCandidatesTasked?.(taskedIds)
     await refreshCandidates()
-    const deduplicated = Number(created?.deduplicated || 0)
     const skipped = [skippedSelf ? `排除本人 ${skippedSelf} 人` : '', unavailable ? `资料暂不可用 ${unavailable} 人` : ''].filter(Boolean).join('，')
-    const duplicateText = deduplicated ? `，已跳过 ${deduplicated} 名曾处理成员` : ''
     const total = Number(created?.total || items.length) || items.length
-    await promptGoToTaskCenter(router, `已创建 ${total} 项加好友任务${duplicateText}${skipped ? `，${skipped}` : ''}`)
+    await promptGoToTaskCenter(router, `已创建 ${total} 项加好友任务${skipped ? `，${skipped}` : ''}`)
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error || '')
-    // 历史去重导致无法再创建时，同步标记候选，避免 PENDING 残留反复点创建
-    if (/已经创建过|没有重复添加/.test(message) && taskedIds.length) {
-      try { await window.wxControl?.markChatAddCandidatesTasked?.(taskedIds) } catch { /* ignore */ }
-      await refreshCandidates()
-      ElMessage.warning('这些成员已经创建过加好友任务，已从待创建中移除')
-    } else {
-      ElMessage.error(userErrorMessage(error, '创建加好友任务失败'))
-    }
+    ElMessage.error(userErrorMessage(error, '创建加好友任务失败'))
   } finally {
     creating.value = false
   }
@@ -498,15 +497,15 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <el-table :data="tableRows" height="420" @selection-change="(rows: CandidateRow[]) => selectedIds = rows.map((item) => item.id)">
-        <el-table-column type="selection" width="42" :selectable="(row: CandidateRow) => row.status === 'PENDING'" />
+        <el-table-column type="selection" width="42" :selectable="(row: CandidateRow) => row.status === 'PENDING' || row.status === 'TASKED'" />
         <el-table-column prop="nickname" label="昵称" min-width="120" />
         <el-table-column prop="senderWxid" label="WXID" min-width="150" show-overflow-tooltip />
         <el-table-column prop="groupName" label="来自群" min-width="140" show-overflow-tooltip />
         <el-table-column prop="messagePreview" label="消息摘要" min-width="180" show-overflow-tooltip />
         <el-table-column prop="keywordLabel" label="命中" width="100" />
-        <el-table-column prop="addStatus" label="添加状态" width="110">
+        <el-table-column prop="addStatus" label="添加状态" min-width="220" show-overflow-tooltip>
           <template #default="{ row }">
-            <span :class="{ 'is-frequent': row.addStatus === '已经频繁' }">{{ row.addStatus }}</span>
+            <span :class="{ 'is-frequent': String(row.addStatus || '').startsWith('已经频繁') }">{{ row.addStatus }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="displayTime" label="接收时间" min-width="170" />

@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import PageHeader from '../components/app/PageHeader.vue'
 import StatusTag from '../components/app/StatusTag.vue'
 import { userErrorMessage } from '../utils/error'
+import { promptGoToTaskCenter } from '../utils/taskFlow'
 import type { WechatInstance } from '../services/wechat'
+const router = useRouter()
 const settingsMenus = ['任务与频率', '连接设置', '文件位置']
 const logLevelChips = [{ label: '全部', value: '全部' }, { label: '普通', value: 'INFO' }, { label: '提醒', value: 'WARNING' }, { label: '错误', value: 'ERROR' }]
 const settingsForm = { intervalMin: 20, intervalMax: 40, httpPort: 19088, friendDailyLimit: 50, tcpPort: 61108, qrDir: '', weixinExe: '' }
@@ -15,6 +18,7 @@ const activeLogLevel = ref('全部')
 const form = reactive({ ...settingsForm })
 const weixinVersion = ref('')
 const detectingWeixin = ref(false)
+const cleaningKickedGroups = ref(false)
 const logKeyword = ref('')
 const logs = ref<Array<Record<string, unknown>>>([])
 const logInstances = ref<WechatInstance[]>([])
@@ -26,9 +30,28 @@ const apiOperationLabels: Record<string, string> = {
   '/api/get_contact_list2': '读取好友列表', '/api/get_chatroom_list': '读取群聊列表', '/api/batch_getroom_cache': '读取群聊资料',
   '/api/get_room_members': '读取群成员', '/api/get_group_member_contact': '读取群成员资料', '/api/save_chatroom_to_contact': '保存群聊到通讯录',
   '/api/check_login': '检测微信登录状态', '/api/get_profile_cache': '读取微信资料', '/api/qrscan': '识别二维码',
+  '/api/enter_room': '提交进群申请', '/api/get_a8key': '验证群邀请',
+}
+/** 内部 ID（wxid / roomId / 哈希）不直接展示给操作员 */
+function looksLikeInternalId(value: unknown) {
+  const text = String(value || '').trim()
+  if (!text) return false
+  return /@chatroom$/i.test(text) || /^wxid_/i.test(text) || /^[0-9A-Fa-f]{32,}$/.test(text)
+}
+function humanTargetLabel(item: Record<string, unknown>) {
+  const candidates = [item.nickname, item.roomName, item.label, item.targetLabel, item.targetName]
+  for (const value of candidates) {
+    const text = String(value || '').trim()
+    if (text && !looksLikeInternalId(text)) return text
+  }
+  const fallback = String(item.targetWxid || item.roomId || '').trim()
+  if (!fallback) return ''
+  if (fallback.endsWith('@chatroom')) return '群聊'
+  if (/^wxid_/i.test(fallback)) return '微信好友'
+  return ''
 }
 function detailsOf(item: Record<string, unknown>) { try { return typeof item.detailsJson === 'string' ? JSON.parse(item.detailsJson) as Record<string, unknown> : {} } catch { return {} } }
-function instanceName(id: unknown) { if (!id) return '本机'; const instance = logInstances.value.find((item) => item.id === String(id)); return instance?.nickname || instance?.accountWxid || '已解除的微信' }
+function instanceName(id: unknown) { if (!id) return '本机'; const instance = logInstances.value.find((item) => item.id === String(id)); return instance?.nickname || '已解除的微信' }
 const systemLogs = computed(() => logs.value.map((stored) => ({ ...detailsOf(stored), ...stored })).filter((item) => {
   if (activeLogLevel.value !== '全部' && item.level !== activeLogLevel.value) return false
   if (selectedInstance.value !== 'all' && item.instanceId !== selectedInstance.value) return false
@@ -37,9 +60,45 @@ const systemLogs = computed(() => logs.value.map((stored) => ({ ...detailsOf(sto
 }).map((item) => {
   const operation = String(item.operation || apiOperationLabels[String(item.path)] || item.module || '软件运行')
   const generic = ['微信 API 调用完成', '微信 API 调用失败'].includes(String(item.message))
-  return { ...item, levelLabel: logLevelLabels[String(item.level)] || '普通', instance: instanceName(item.instanceId), module: operation, content: generic ? `${operation}${String(item.message).endsWith('失败') ? '失败' : '完成'}` : item.message, cost: item.durationMs ? `${item.durationMs} 毫秒` : '-' }
+  const reason = String(item.reason || '').trim()
+  const target = humanTargetLabel(item)
+  let content = generic ? `${operation}${String(item.message).endsWith('失败') ? '失败' : '完成'}` : String(item.message || '')
+  // 加好友结果：列表直接露出成功/失败与微信拒绝理由
+  if (String(item.operation) === 'ADD_FRIEND_RESULT' || /^加好友(成功|失败)/.test(content)) {
+    const parts = [content]
+    if (target && !content.includes(target)) parts.push(`目标 ${target}`)
+    if (reason && !content.includes(reason)) parts.push(reason)
+    content = parts.filter(Boolean).join('｜')
+  } else if (String(item.module) === '被踢群清理' || /群昵称：/.test(content)) {
+    // 被踢清理：保证列表露出群昵称、被踢状态、退出结果
+    if (!/群昵称：/.test(content)) {
+      const nick = String(item.roomName || target || '未命名群聊').trim() || '未命名群聊'
+      const kickStatus = String(item.kickStatus || '').trim() || '待确认被踢'
+      const result = String(item.result || content || '-').trim() || '-'
+      content = `群昵称：${nick}｜被踢状态：${kickStatus}｜退出结果：${result}`
+    }
+  } else if (reason && !content.includes(reason) && /加好友|添加好友|PROFILE_RESOLUTION|进群/i.test(`${content} ${operation}`)) {
+    content = `${content}｜${reason}`
+  }
+  return { ...item, levelLabel: logLevelLabels[String(item.level)] || '普通', instance: instanceName(item.instanceId), module: operation, content, cost: item.durationMs ? `${item.durationMs} 毫秒` : '-', displayTarget: target }
 }).filter((item) => !logKeyword.value || `${item.content} ${item.instance} ${item.module}`.toLowerCase().includes(logKeyword.value.toLowerCase())))
-function showLogDetails(row: Record<string, unknown>) { ElMessageBox.alert(`时间：${row.time || '-'}\n级别：${row.levelLabel || '-'}\n功能：${row.module || '-'}\n内容：${row.content || '-'}`, '记录详情') }
+function showLogDetails(row: Record<string, unknown>) {
+  const lines = [
+    `时间：${row.time || '-'}`,
+    `级别：${row.levelLabel || '-'}`,
+    `功能：${row.module || '-'}`,
+    `内容：${row.content || '-'}`,
+  ]
+  const target = String(row.displayTarget || humanTargetLabel(row) || '').trim()
+  if (target) lines.push(`目标：${target}`)
+  const account = String(row.instance || instanceName(row.instanceId) || '').trim()
+  if (account && account !== '本机') lines.push(`执行微信：${account}`)
+  if (row.reason) lines.push(`结果说明：${row.reason}`)
+  if (row.businessCode !== undefined && row.businessCode !== null && row.businessCode !== '') lines.push(`微信错误码：${row.businessCode}`)
+  if (row.kickStatus) lines.push(`被踢状态：${row.kickStatus}`)
+  if (row.result) lines.push(`退出结果：${row.result}`)
+  ElMessageBox.alert(lines.join('\n'), '记录详情')
+}
 let unsubscribe: (() => void) | undefined
 /**
  * 加载设置；展示自动识别到的微信路径与版本。
@@ -115,6 +174,38 @@ async function detectWeixinInstall() {
   }
 }
 async function clear() { await ElMessageBox.confirm('确定清空本机日志记录？', '清空日志', { type: 'warning' }); await window.wxControl?.clearLogs(); logs.value = [] }
+
+/**
+ * 扫描历史被踢并创建清理任务；真正退出在任务中心确认后按队列执行。
+ */
+async function cleanupKickedGroups() {
+  await ElMessageBox.confirm(
+    '将先扫描本地事件与各群最近系统通知，把被踢群登记后创建清理任务。真正退出需到「任务中心」确认执行；执行时日志会显示每个群的成功或失败。',
+    '创建清理被踢群任务',
+    { type: 'warning', confirmButtonText: '创建任务', cancelButtonText: '取消' },
+  )
+  cleaningKickedGroups.value = true
+  try {
+    const result = await window.wxControl?.cleanupKickedGroups?.()
+    const message = String(result?.message || '已处理')
+    if (result?.ok === false && result?.queued) {
+      ElMessage.info(message)
+      return
+    }
+    const pending = Number(result?.pending || 0)
+    if (result?.taskId && pending > 0) {
+      await promptGoToTaskCenter(router, message)
+    } else {
+      ElMessage.info(message)
+    }
+    await load()
+  } catch (error) {
+    if (String((error as { message?: string })?.message || error) === 'cancel') return
+    ElMessage.error(userErrorMessage(error, '创建被踢群清理任务失败'))
+  } finally {
+    cleaningKickedGroups.value = false
+  }
+}
 onMounted(() => { load(); unsubscribe = window.wxControl?.onLog((entry) => logs.value.unshift(entry as Record<string, unknown>)) }); onBeforeUnmount(() => unsubscribe?.())
 </script>
 
@@ -149,6 +240,13 @@ onMounted(() => { load(); unsubscribe = window.wxControl?.onLog((entry) => logs.
           <div class="form-item">
             <label>添加好友每日上限（个）</label>
             <el-input-number v-model="form.friendDailyLimit" :min="1" controls-position="right" style="width: 100%" />
+          </div>
+          <div class="form-item form-item--wide">
+            <label>被踢群清理</label>
+            <div class="range-row">
+              <el-button type="warning" :loading="cleaningKickedGroups" @click="cleanupKickedGroups">创建清理任务</el-button>
+            </div>
+            <div class="form-note">点击后会先查本地事件与各群最近 10 条系统通知，把被踢群做成任务队列；再到「任务中心」确认执行。执行时按间隔逐个退出，日志会写明清理到哪个群、成功或失败。需微信在线。</div>
           </div>
         </div>
         <div v-else-if="activeMenu === '连接设置'" class="form-grid">

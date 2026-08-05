@@ -54,3 +54,5 @@ npm-debug.log*
 admin-ui/scripts/tmp-*
 admin-ui/scripts/_tmp*
 **/logs/
+admin-ui/diagnostics/
+admin-ui/config/

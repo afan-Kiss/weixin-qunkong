@@ -16,7 +16,7 @@ import {
   ChatDotRound,
   ChatLineRound,
 } from '@element-plus/icons-vue'
-import { refreshInstances } from '../stores/wechatData'
+import { refreshInstances, ensureBlockedDirectoryListener } from '../stores/wechatData'
 import { authState, ensureSession, logout } from '../stores/auth'
 
 const displayVersion = __APP_VERSION__
@@ -56,7 +56,13 @@ function go(path: string) {
 function globalSearch() { if (!searchText.value.trim()) return; router.push({ path: '/wxids', query: { q: searchText.value.trim() } }) }
 async function signOut() { await logout(); await router.replace('/login') }
 async function validateAccount() { if (!await ensureSession(true)) await router.replace('/login') }
-onMounted(() => { refreshInstances(); refreshMetrics(); metricsTimer = setInterval(refreshMetrics, 5000); authTimer = setInterval(validateAccount, 60000) })
+onMounted(() => {
+  ensureBlockedDirectoryListener()
+  refreshInstances()
+  refreshMetrics()
+  metricsTimer = setInterval(refreshMetrics, 5000)
+  authTimer = setInterval(validateAccount, 60000)
+})
 onBeforeUnmount(() => { if (metricsTimer) clearInterval(metricsTimer); if (authTimer) clearInterval(authTimer) })
 </script>
 

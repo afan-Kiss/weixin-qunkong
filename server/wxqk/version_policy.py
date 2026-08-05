@@ -209,7 +209,13 @@ def evaluate_client(meta: dict[str, Any], pol: dict[str, Any] | None = None, dat
             "minimumVersion": min_ver,
         }
 
-    # Protocol fields required (not optional)
+    # Protocol fields: accept legacy + neutral IDs (client rebrand)
+    protocol_compat = {
+        "protocolVersion": frozenset({"facai888-v1", "app-v1"}),
+        "securityProtocolVersion": frozenset({"security-v1", "sec-v1"}),
+        "desktopProtocolVersion": frozenset({"desktop-webrtc-v1", "desk-v1"}),
+        "updaterProtocolVersion": frozenset({"updater-v1", "upd-v1"}),
+    }
     expect = [
         ("protocolVersion", proto, pol.get("protocolVersion")),
         ("securityProtocolVersion", sec, pol.get("securityProtocolVersion")),
@@ -224,6 +230,16 @@ def evaluate_client(meta: dict[str, Any], pol: dict[str, Any] | None = None, dat
                 "code": "CLIENT_UPGRADE_REQUIRED",
                 "message": "当前版本已停止使用。",
             }
+        allowed = protocol_compat.get(name)
+        if allowed:
+            if got not in allowed:
+                return {
+                    "ok": False,
+                    "httpStatus": 403,
+                    "code": "PROTOCOL_RETIRED",
+                    "message": "当前版本已停止使用。",
+                }
+            continue
         if want and got != want:
             return {
                 "ok": False,

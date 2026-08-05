@@ -57,6 +57,195 @@ def load_signature_hex(data_dir: Path) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
+def _targeted_path(data_dir: Path) -> Path:
+    return _root(data_dir) / "targeted-releases.json"
+
+
+def load_targeted_releases(data_dir: Path) -> dict[str, Any]:
+    path = _targeted_path(data_dir)
+    if not path.exists():
+        return {"releases": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {"releases": []}
+
+
+def save_targeted_releases(data_dir: Path, data: dict[str, Any]) -> None:
+    path = _targeted_path(data_dir)
+    tmp = path.with_suffix(".json.tmp")
+    with _lock:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+
+def resolve_manifest_for_client(
+    data_dir: Path,
+    *,
+    client_id: str = "",
+    client_ip: str = "",
+    online_lookup=None,
+    clients_by_ip=None,
+) -> tuple[dict[str, Any], str]:
+    """Return (manifest, signature). Targeted override wins for matching clientId/IP."""
+    stable = load_manifest(data_dir)
+    stable_sig = load_signature_hex(data_dir)
+    targeted = load_targeted_releases(data_dir)
+    releases = targeted.get("releases") if isinstance(targeted, dict) else []
+    if not isinstance(releases, list) or not releases:
+        return stable, stable_sig
+
+    cid = str(client_id or "").strip()
+    tip = str(client_ip or "").strip()
+    candidate_ids: set[str] = set()
+    if cid:
+        candidate_ids.add(cid)
+    if tip and callable(clients_by_ip):
+        try:
+            for item in clients_by_ip(tip) or []:
+                if item:
+                    candidate_ids.add(str(item))
+        except Exception:
+            pass
+    # Fall back to persisted client records by IP
+    if tip and not candidate_ids:
+        clients_dir = Path(data_dir) / "clients"
+        if clients_dir.is_dir():
+            for path in clients_dir.glob("*.json"):
+                try:
+                    row = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if str(row.get("ip") or "").strip() == tip:
+                    candidate_ids.add(str(row.get("clientId") or path.stem))
+
+    for rel in releases:
+        if not isinstance(rel, dict):
+            continue
+        targets = [str(x).strip() for x in (rel.get("targetClientIds") or []) if str(x).strip()]
+        if not targets:
+            continue
+        if not candidate_ids.intersection(targets):
+            continue
+        man = rel.get("manifest") if isinstance(rel.get("manifest"), dict) else None
+        if not man:
+            continue
+        sig = str(rel.get("signature") or "")
+        # Ensure target list is visible to new clients
+        man = dict(man)
+        man["targetClientIds"] = targets
+        return man, sig or stable_sig
+    return stable, stable_sig
+
+
+def publish_targeted_release(
+    data_dir: Path,
+    *,
+    version: str,
+    build_id: str,
+    target_client_ids: list[str],
+    git_commit: str = "",
+    mandatory: bool = True,
+    file_name: str = "",
+    download_url: str = "",
+    seed_b64: str = "",
+    public_base_url: str = "https://xiangyuzhubao.xyz/wxqk",
+) -> dict[str, Any]:
+    """Publish a package only for selected clientIds; keep global stable manifest unchanged."""
+    targets = [str(x).strip() for x in (target_client_ids or []) if str(x).strip()]
+    if not targets:
+        return {"ok": False, "message": "targetClientIds 必填"}
+    bid = _safe_build_id(build_id)
+    if not bid:
+        return {"ok": False, "message": "buildId 必填"}
+    pkg = package_path(data_dir, bid)
+    if not pkg or not pkg.exists():
+        return {"ok": False, "message": "请先上传对应 buildId 的安装包"}
+    digest = sha256_file(pkg)
+    size = pkg.stat().st_size
+    stable = load_manifest(data_dir)
+    try:
+        seq = int(stable.get("releaseSequence") or 0) + 1
+    except Exception:
+        seq = 1
+    caller_ver = str(version or "").strip().lstrip("vV")
+    if not (len(caller_ver) <= 16 and caller_ver.replace(".", "", 1).isdigit() and caller_ver.count(".") == 1):
+        stem = Path(str(file_name or "")).stem
+        if "v" in stem.lower():
+            maybe = stem.lower().rsplit("v", 1)[-1].strip()
+            if maybe.replace(".", "", 1).isdigit() and maybe.count(".") == 1:
+                caller_ver = maybe
+    ver = caller_ver if (len(caller_ver) <= 16 and caller_ver.replace(".", "", 1).isdigit() and caller_ver.count(".") == 1) else f"1.{max(0, min(9, seq - 1))}"
+    fname = str(file_name or "").strip() or f"微信群控系统v{ver}.exe"
+    base = str(public_base_url or "").rstrip("/")
+    url = str(download_url or "").strip() or (base + "/api/update/package/" + bid)
+    published_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    man = {
+        "version": ver,
+        "buildId": bid,
+        "gitCommit": str(git_commit or "").strip(),
+        "protocolVersion": "facai888-v1",
+        "securityProtocolVersion": "security-v1",
+        "desktopProtocolVersion": "desktop-webrtc-v1",
+        "updaterProtocolVersion": "updater-v1",
+        "mandatory": bool(mandatory),
+        "publishedAt": published_at,
+        "minimumSupportedBuild": "",
+        "downloadURL": url,
+        "fileName": fname,
+        "fileSize": int(size),
+        "sha256": digest,
+        "signingKeyId": SIGNING_KEY_ID,
+        "authenticodePublisher": "",
+        "releaseSequence": seq,
+        "minimumReleaseSequence": 0,
+        "targetClientIds": targets,
+    }
+    sig_hex = sign_manifest(data_dir, man, seed_b64=seed_b64)
+    store = load_targeted_releases(data_dir)
+    releases = [r for r in (store.get("releases") or []) if isinstance(r, dict)]
+    # Replace overlapping targets
+    kept = []
+    target_set = set(targets)
+    for rel in releases:
+        old = set(str(x).strip() for x in (rel.get("targetClientIds") or []) if str(x).strip())
+        if old & target_set:
+            continue
+        kept.append(rel)
+    kept.append({
+        "targetClientIds": targets,
+        "manifest": man,
+        "signature": sig_hex,
+        "publishedAt": published_at,
+    })
+    save_targeted_releases(data_dir, {"releases": kept})
+    try:
+        import version_policy as vp
+        pol = vp.load(data_dir)
+        allowed = [str(x) for x in (pol.get("allowedBuildIds") or [])]
+        if bid not in allowed:
+            allowed.append(bid)
+        if "dev" not in allowed:
+            allowed.append("dev")
+        pol["allowedBuildIds"] = allowed
+        vp.save(data_dir, pol)
+    except Exception as e:
+        return {"ok": False, "message": f"版本策略更新失败（定向清单已写入）: {e}"}
+    report_event(data_dir, {
+        "t": published_at,
+        "event": "TARGETED_RELEASE_PUBLISHED",
+        "buildId": bid,
+        "version": ver,
+        "releaseSequence": seq,
+        "sha256": digest,
+        "targetClientIds": targets,
+    })
+    return {"ok": True, "manifest": man, "signature": sig_hex, "targeted": True, "targetClientIds": targets}
+
+
 def package_path(data_dir: Path, build_id: str) -> Path | None:
     """Resolve exactly packages/{buildId}.exe — never glob (avoids .meta.json / .partial)."""
     root = _root(data_dir) / "packages"

@@ -11,25 +11,28 @@ const {
   validateDownloadURL,
   packageFileMatchesManifest,
   setAllowUnsignedForTest,
+  DEFAULT_BASE,
 } = require('../electron/client-updater.cjs')
+const { getServiceBase, getLegacyManifestDefaults, isLegacyBrandDownloadUrl } = require('../electron/secure-config.cjs')
 
 function sampleManifest(overrides = {}) {
+  const legacy = getLegacyManifestDefaults()
   return {
     version: '1.6',
     buildId: '20260802-120000-abc',
     gitCommit: '',
-    protocolVersion: 'facai888-v1',
-    securityProtocolVersion: 'security-v1',
-    desktopProtocolVersion: 'desktop-webrtc-v1',
-    updaterProtocolVersion: 'updater-v1',
+    protocolVersion: legacy.protocolVersion,
+    securityProtocolVersion: legacy.securityProtocolVersion,
+    desktopProtocolVersion: legacy.desktopProtocolVersion,
+    updaterProtocolVersion: legacy.updaterProtocolVersion,
     mandatory: true,
     publishedAt: '2026-08-02T12:00:00Z',
     minimumSupportedBuild: '',
-    downloadURL: 'https://xiangyuzhubao.xyz/wxqk/api/update/package/20260802-120000-abc',
+    downloadURL: `${getServiceBase()}/api/update/package/20260802-120000-abc`,
     fileName: '微信群控系统v1.6.exe',
     fileSize: 12,
     sha256: '',
-    signingKeyId: 'facai888-v1',
+    signingKeyId: legacy.signingKeyId,
     authenticodePublisher: '',
     releaseSequence: 3,
     minimumReleaseSequence: 0,
@@ -46,20 +49,19 @@ test('needsUpgrade prefers releaseSequence and honors minimumReleaseSequence', (
 })
 
 test('needsUpgrade uses version when local releaseSequence is ahead of remote', () => {
-  // 现场故障：v1.6 本地 seq=2，远端发布 1.9 也是 seq=2，旧逻辑判定无需更新
   assert.equal(
-    needsUpgrade(sampleManifest({ version: '1.9', releaseSequence: 2 }), 2, 'wxqk-electron-1.6.0', '1.6.0'),
+    needsUpgrade(sampleManifest({ version: '1.9', releaseSequence: 2 }), 2, 'app-electron-1.6.0', '1.6.0'),
     true,
   )
   assert.equal(
-    needsUpgrade(sampleManifest({ version: '1.9', releaseSequence: 2 }), 5, 'wxqk-electron-1.9.0', '1.9.0'),
+    needsUpgrade(sampleManifest({ version: '1.9', releaseSequence: 2 }), 5, 'app-electron-1.9.0', '1.9.0'),
     false,
   )
 })
 
 test('validateDownloadURL only allows https whitelist hosts', () => {
-  assert.equal(validateDownloadURL('https://xiangyuzhubao.xyz/wxqk/api/update/package/a').ok, true)
-  assert.equal(validateDownloadURL('http://xiangyuzhubao.xyz/wxqk/api/update/package/a').ok, false)
+  assert.equal(validateDownloadURL(`${DEFAULT_BASE}/api/update/package/a`).ok, true)
+  assert.equal(validateDownloadURL(DEFAULT_BASE.replace(/^https/, 'http') + '/api/update/package/a').ok, false)
   assert.equal(validateDownloadURL('https://evil.example/pkg.exe').ok, false)
 })
 
@@ -77,7 +79,7 @@ test('canonical manifest excludes releaseSequence and verifies ed25519', () => {
 })
 
 test('packageFileMatchesManifest prevents update loops on same bytes', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'wxqk-upd-'))
+  const dir = mkdtempSync(path.join(tmpdir(), 'app-upd-'))
   const file = path.join(dir, 'pkg.exe')
   const payload = Buffer.from('portable-bytes')
   writeFileSync(file, payload)
@@ -88,11 +90,12 @@ test('packageFileMatchesManifest prevents update loops on same bytes', async () 
   try { unlinkSync(file) } catch {}
 })
 
-test('applyUpdate falls back from legacy 发财888 downloadURL to /wxqk package URL', () => {
+test('applyUpdate falls back from legacy brand downloadURL via secure-config helper', () => {
   const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
-  assert.match(src, /\/发财888\//)
-  assert.match(src, /强制回退到当前客户端的 \/wxqk 基址/)
+  assert.match(src, /isLegacyBrandDownloadUrl/)
+  assert.match(src, /isLegacyBrandFileName/)
   assert.match(src, /微信群控系统v\$\{ver\}\.exe/)
+  assert.equal(typeof isLegacyBrandDownloadUrl, 'function')
 })
 
 test('apply does not reject a newer semantic version when local releaseSequence is ahead', () => {
@@ -123,14 +126,15 @@ test('portable update writes and verifies the new executable before launching it
   assert.match(ui, /applyClientUpdate\(\), true/)
 })
 
-test('manifest signature failure does not block fetchManifest contract', () => {
+test('manifest signature failure blocks fetchManifest in production', () => {
   const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
-  assert.match(src, /不依赖密钥/)
-  assert.match(src, /ignore UPDATE_SIGNATURE_INVALID/)
-  assert.doesNotMatch(src, /if \(!verifyManifestSignature\(man, signature\)\) throw new Error\('UPDATE_SIGNATURE_INVALID'\)/)
+  assert.match(src, /UPDATE_SIGNATURE_MISSING/)
+  assert.match(src, /UPDATE_SIGNATURE_INVALID/)
+  assert.match(src, /throw new Error\('UPDATE_SIGNATURE_INVALID'\)/)
+  assert.doesNotMatch(src, /ignore UPDATE_SIGNATURE_INVALID/)
 })
 
-test('main wires updater scheduler and publish branding is wxqk', () => {
+test('main wires updater scheduler and client uses encoded service base', () => {
   const fs = require('node:fs')
   const root = path.join(__dirname, '..')
   const main = fs.readFileSync(path.join(root, 'electron', 'main.cjs'), 'utf8')
@@ -149,6 +153,7 @@ test('main wires updater scheduler and publish branding is wxqk', () => {
   assert.match(updater, /ipcCheckClientUpdate/)
   assert.match(updater, /ipcApplyClientUpdate/)
   assert.match(updater, /releaseSingleInstanceLock/)
+  assert.match(updater, /getServiceBase|secure-config/)
   assert.doesNotMatch(updater, /CHECK_INTERVAL_MS/)
   assert.doesNotMatch(updater, /setInterval\s*\(/)
   assert.match(preload, /checkClientUpdate/)
@@ -158,14 +163,17 @@ test('main wires updater scheduler and publish branding is wxqk', () => {
   assert.match(ui, /立即更新/)
   assert.match(ui, /稍后更新/)
   assert.match(ui, /绝不能提前 markStartupUpdateDone/)
-  assert.match(identity, /wxqkReleaseSequence/)
-  assert.match(bump, /wxqkReleaseSequence/)
+  assert.match(identity, /releaseSequence/)
   assert.match(bump, /releaseSequence/)
-  assert.equal(typeof pkg.wxqkReleaseSequence, 'number')
+  assert.match(bump, /getServiceBase/)
+  assert.equal(typeof pkg.releaseSequence, 'number')
   assert.match(server, /xiangyuzhubao\.xyz\/wxqk/)
   assert.doesNotMatch(server, /public_base_url="https:\/\/xiangyuzhubao\.xyz\/发财888"/)
   assert.match(manifest, /微信群控系统v\{ver\}\.exe/)
   assert.match(manifest, /xiangyuzhubao\.xyz\/wxqk/)
+  assert.match(updater, /LEGACY_UPDATE_OLD_TRASH_ENV/)
+  assert.match(updater, /WXQK_UPDATE_OLD_TRASH/)
+  assert.match(main, /clientId: String\(getRemoteAgentStatus/)
 })
 
 test('allowUnsignedForTest stays off by default', () => {
