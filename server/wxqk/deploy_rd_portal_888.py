@@ -13,7 +13,7 @@ USER = os.environ.get("RD_PORTAL_SSH_USER") or os.environ.get("WXQK_SSH_USER") o
 PASSWORD = (
     os.environ.get("RD_PORTAL_SSH_PASSWORD")
     or os.environ.get("WXQK_SSH_PASSWORD")
-    or "FFff472336362@@"
+    or None
 )
 
 REMOTE_DIR = "/opt/rd-portal"
@@ -3120,6 +3120,10 @@ print('nginx /888 path block upserted')
 
 
 def main() -> None:
+    if not HOST:
+        raise SystemExit("RD_PORTAL_SSH_HOST is required")
+    if not PASSWORD:
+        raise SystemExit("RD_PORTAL_SSH_PASSWORD or WXQK_SSH_PASSWORD is required (set env var, do NOT hardcode)")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
@@ -3172,16 +3176,13 @@ def main() -> None:
         hdr = f"-H 'Host: {host}' " if host else ""
         run(f"curl -sS -o /dev/null -w '{name} %{{http_code}}\\n' {hdr}{url}")
 
-    # 确认屏幕墙 /p/wxqk 已打到新服（登录应成功）
+    # 确认屏幕墙 /p/wxqk 已打到新服（仅检查端口可达，不在代码中嵌入密码）
     run(
-        "curl -sS -X POST 'http://127.0.0.1:888/p/wxqk/api/login' "
-        "-H 'Content-Type: application/json' "
-        "-d '{\"password\":\"ff472336362\"}' | head -c 180; echo"
+        "curl -sS -o /dev/null -w 'wxqk_proxy %{http_code}\\n' 'http://127.0.0.1:888/p/wxqk/api/login'"
     )
     run(
-        "curl -sS -X POST 'http://127.0.0.1/888/p/wxqk/api/login' "
-        "-H 'Host: xiangyuzhubao.xyz' -H 'Content-Type: application/json' "
-        "-d '{\"password\":\"ff472336362\"}' | head -c 180; echo"
+        "curl -sS -o /dev/null -w 'wxqk_domain %{http_code}\\n' "
+        "-H 'Host: xiangyuzhubao.xyz' 'http://127.0.0.1/888/p/wxqk/api/login'"
     )
 
     client.close()

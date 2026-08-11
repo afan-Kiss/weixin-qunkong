@@ -14,6 +14,7 @@ const {
   isWebRtcCaptureBusy,
   isWebRtcStarting,
   markWebRtcStarting,
+  updateAgentToken,
 } = require('./webrtc-desktop.cjs')
 
 /** 最近一次 WebRTC 会话参数，供代理 WS 重连后恢复 */
@@ -76,6 +77,13 @@ let watchdogTimer = null
 let captureInFlight = false
 let callbacks = {}
 let syncTimer = null
+let tokenRefreshTimer = null
+/** agentToken 签发时间戳（本地 Date.now），用于计算 refresh 时机 */
+let agentTokenIssuedAt = 0
+const AGENT_TOKEN_TTL_MS = 3600 * 1000
+const AGENT_TOKEN_REFRESH_BEFORE_MS = 600 * 1000
+let tokenRefreshAttempt = 0
+let tokenRefreshRunning = false
 /** 连续因发送队列拥塞而跳过的次数；用于拉长抓帧间隔帮助排空 */
 let bufferSkipStreak = 0
 const MAX_BUFFERED_BYTES = BUFFER_DROP_BYTES
@@ -542,12 +550,17 @@ async function startWebRtcFromMessage(message = {}) {
   const livekitUrl = String(message.livekitUrl || (lastWebRtcOpts && lastWebRtcOpts.livekitUrl) || '')
   const livekitToken = String(message.livekitToken || (lastWebRtcOpts && lastWebRtcOpts.livekitToken) || '')
   const roomName = String(message.roomName || (lastWebRtcOpts && lastWebRtcOpts.roomName) || '')
+  const tokenChanged = livekitToken && livekitToken !== (lastWebRtcOpts?.livekitToken || '')
   lastWebRtcOpts = {
     desktopSessionId: sid,
     livekitUrl,
     livekitToken,
     roomName,
     quality: String(message.quality || lastWebRtcOpts?.quality || 'auto'),
+  }
+  if (tokenChanged || !agentTokenIssuedAt) {
+    agentTokenIssuedAt = Date.now()
+    scheduleTokenRefresh()
   }
   const result = await startWebRtcDesktop({
     desktopSessionId: sid,
@@ -632,6 +645,19 @@ async function handleMessage(raw) {
   lastServerAt = Date.now()
   const type = String(message?.type || '').toLowerCase()
   if (['pong', 'heartbeat_ack', 'ready'].includes(type)) return
+  if (type === 'token_refresh_ack') {
+    const newToken = String(message.agentToken || '')
+    if (newToken && lastWebRtcOpts) {
+      lastWebRtcOpts.livekitToken = newToken
+      agentTokenIssuedAt = Date.now()
+      tokenRefreshAttempt = 0
+      if (tokenRefreshTimer) { clearTimeout(tokenRefreshTimer); tokenRefreshTimer = null }
+      try { updateAgentToken(newToken) } catch (_) {}
+      log('LiveKit agent token 已刷新（WS）', {})
+      scheduleTokenRefresh()
+    }
+    return
+  }
   // 登出/停代理后丢弃排队命令，避免幽灵 publisher
   if (stopping || !state.running) return
   // 仅认 commandId，避免把 heartbeat_ack.id 误当成命令回执
@@ -678,6 +704,31 @@ async function handleMessage(raw) {
     if (commandId) send({ type: 'command_ack', commandId, status: 'APPLIED' })
   } catch (error) {
     if (commandId) send({ type: 'command_ack', commandId, status: 'FAILED', failureReason: String(error?.message || error).slice(0, 200) })
+  }
+}
+
+function scheduleTokenRefresh() {
+  if (tokenRefreshTimer || stopping) return
+  const elapsed = Date.now() - (agentTokenIssuedAt || Date.now())
+  const refreshIn = Math.max(0, AGENT_TOKEN_TTL_MS - AGENT_TOKEN_REFRESH_BEFORE_MS - elapsed)
+  tokenRefreshTimer = setTimeout(() => { tokenRefreshTimer = null; void refreshAgentToken() }, refreshIn)
+  if (typeof tokenRefreshTimer.unref === 'function') tokenRefreshTimer.unref()
+}
+
+async function refreshAgentToken() {
+  if (stopping || tokenRefreshRunning || !state.identity || !state.connected) return
+  if (!state.watching || !lastWebRtcOpts?.livekitToken) return
+  tokenRefreshRunning = true
+  try {
+    send({ type: 'request_token_refresh', clientId: state.identity.clientId || '' })
+    tokenRefreshAttempt += 1
+    const backoff = Math.min(300000, 30000 * Math.pow(2, tokenRefreshAttempt - 1))
+    const remaining = AGENT_TOKEN_TTL_MS - (Date.now() - agentTokenIssuedAt)
+    if (remaining < 300000) log('LiveKit agent token 即将过期，等待 server 刷新', { attempt: tokenRefreshAttempt, remainingMs: remaining })
+    tokenRefreshTimer = setTimeout(() => { tokenRefreshTimer = null; void refreshAgentToken() }, backoff)
+    if (typeof tokenRefreshTimer.unref === 'function') tokenRefreshTimer.unref()
+  } finally {
+    tokenRefreshRunning = false
   }
 }
 
@@ -775,7 +826,8 @@ function stopRemoteAgent() {
   if (heartbeatTimer) clearInterval(heartbeatTimer)
   if (watchdogTimer) clearInterval(watchdogTimer)
   if (syncTimer) clearInterval(syncTimer)
-  reconnectTimer = null; heartbeatTimer = null; watchdogTimer = null; syncTimer = null
+  if (tokenRefreshTimer) clearTimeout(tokenRefreshTimer)
+  reconnectTimer = null; heartbeatTimer = null; watchdogTimer = null; syncTimer = null; tokenRefreshTimer = null
   lastWebRtcOpts = null
   agentMsgChain = Promise.resolve()
   stopCapture(); stopWorker()

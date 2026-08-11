@@ -364,6 +364,7 @@ function downloadRangeToFile(url, dest, start, end, onChunk) {
   return new Promise((resolve, reject) => {
     const u = new URL(url)
     const lib = u.protocol === 'https:' ? https : http
+    const expectedLen = end - start + 1
     const req = lib.request(url, {
       method: 'GET',
       headers: { Range: `bytes=${start}-${end}` },
@@ -371,10 +372,26 @@ function downloadRangeToFile(url, dest, start, end, onChunk) {
       ...insecureTlsForService(u.hostname),
     }, (res) => {
       const status = res.statusCode || 0
-      if (status !== 206 && status !== 200) {
+      if (status === 200) {
+        res.resume()
+        reject(Object.assign(new Error('RANGE_UNSUPPORTED'), { code: 'RANGE_UNSUPPORTED' }))
+        return
+      }
+      if (status !== 206) {
         res.resume()
         reject(new Error(`download http ${status}`))
         return
+      }
+      const cr = String(res.headers['content-range'] || '')
+      const crMatch = cr.match(/^bytes\s+(\d+)-(\d+)\//)
+      if (crMatch) {
+        const crStart = Number(crMatch[1])
+        const crEnd = Number(crMatch[2])
+        if (crStart !== start || crEnd !== end) {
+          res.resume()
+          reject(new Error(`Content-Range mismatch: expected ${start}-${end}, got ${crStart}-${crEnd}`))
+          return
+        }
       }
       const { openSync, writeSync, closeSync } = require('fs')
       let fd
@@ -403,7 +420,12 @@ function downloadRangeToFile(url, dest, start, end, onChunk) {
       })
       res.on('end', () => {
         try { closeSync(fd) } catch (_) {}
-        resolve(offset - start)
+        const got = offset - start
+        if (got !== expectedLen) {
+          reject(new Error(`Range body length mismatch: expected ${expectedLen}, got ${got}`))
+          return
+        }
+        resolve(got)
       })
     })
     req.on('error', reject)
@@ -474,14 +496,17 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
   let downloaded = 0
   onProgress?.(0, total)
   let cursor = 0
+  let rangeUnsupported = false
   async function worker() {
     while (true) {
+      if (rangeUnsupported) return
       const idx = cursor
       cursor += 1
       if (idx >= parts.length) return
       const part = parts[idx]
       let attempt = 0
       while (attempt < 4) {
+        if (rangeUnsupported) return
         attempt += 1
         let partGot = 0
         try {
@@ -495,6 +520,10 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
         } catch (error) {
           downloaded = Math.max(0, downloaded - partGot)
           onProgress?.(Math.min(total, downloaded), total)
+          if (error && error.code === 'RANGE_UNSUPPORTED') {
+            rangeUnsupported = true
+            return
+          }
           if (attempt >= 4) throw error
           await new Promise((r) => setTimeout(r, 500 * attempt))
         }
@@ -502,6 +531,38 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
     }
   }
   await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  if (rangeUnsupported) {
+    // Fallback: single-connection full download (HTTP 200)
+    const u = new URL(url)
+    const lib = u.protocol === 'https:' ? https : http
+    downloaded = 0
+    onProgress?.(0, total)
+    const res = await new Promise((resolve, reject) => {
+      const req = lib.request(url, {
+        method: 'GET',
+        timeout: 120000,
+        ...insecureTlsForService(u.hostname),
+      }, resolve)
+      req.on('error', reject)
+      req.on('timeout', () => { req.destroy(new Error('timeout')); reject(new Error('timeout')) })
+      req.end()
+    })
+    if ((res.statusCode || 0) >= 300) {
+      res.resume()
+      throw new Error(`download fallback http ${res.statusCode || 0}`)
+    }
+    await new Promise((resolve, reject) => {
+      const file = createWriteStream(dest, { flags: 'w' })
+      res.on('data', (chunk) => {
+        downloaded += chunk.length
+        onProgress?.(downloaded, total)
+      })
+      res.on('error', reject)
+      file.on('error', reject)
+      file.on('finish', resolve)
+      res.pipe(file)
+    })
+  }
   if (statSync(dest).size !== total) throw new Error('UPDATE_SIZE_MISMATCH')
 }
 

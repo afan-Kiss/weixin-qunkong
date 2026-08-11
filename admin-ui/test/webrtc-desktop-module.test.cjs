@@ -2,8 +2,20 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
+const { createHash } = require('node:crypto')
 
 const root = path.resolve(__dirname, '..')
+
+test('duplicate runtime files must be in sync with electron/ versions', () => {
+  for (const name of ['remote-agent.cjs', 'webrtc-desktop.cjs']) {
+    const electronPath = path.join(root, 'electron', name)
+    const rootPath = path.join(root, name)
+    if (!fs.existsSync(rootPath)) continue
+    const h1 = createHash('sha256').update(fs.readFileSync(electronPath)).digest('hex')
+    const h2 = createHash('sha256').update(fs.readFileSync(rootPath)).digest('hex')
+    assert.equal(h1, h2, `${name}: electron/ and root copies have drifted`)
+  }
+})
 
 test('webrtc publisher files are packaged under electron/', () => {
   for (const rel of [
@@ -23,7 +35,9 @@ test('livekit publisher guards: reuse room, timeout cleanup, reconnect soft-stat
   assert.match(html, /livekit-client\.umd\.js/)
   assert.match(html, /LK\.Room/)
   assert.match(html, /getDisplayMedia_timeout/)
-  assert.match(html, /timedOut/)
+  assert.match(html, /settled/)
+  assert.match(html, /clearTimeout\(captureTimer\)/)
+  assert.match(html, /captureTimer = null/)
   assert.match(html, /25000/)
   assert.match(html, /stream\.getTracks\(\)\.forEach/)
   assert.match(html, /reused: true/)
@@ -84,6 +98,181 @@ test('livekit publisher guards: reuse room, timeout cleanup, reconnect soft-stat
   assert.doesNotMatch(agent, /JPEG_SNAPSHOT_INTERVAL_MS \* 6/)
 })
 
+// ---- Behavioral tests for ensureStream timeout logic ----
+// Simulate the exact Promise/timer pattern from webrtc-publisher.html
+
+function makeCaptureRace(getDisplayMediaFn, timeoutMs) {
+  let settled = false
+  let captureTimer = null
+  const trackStops = []
+  return new Promise(function (resolve, reject) {
+    captureTimer = setTimeout(function () {
+      captureTimer = null
+      if (settled) return
+      settled = true
+      reject(new Error('getDisplayMedia_timeout'))
+      getDisplayMediaFn.__promise.then(function (s) {
+        if (s) s.getTracks().forEach(function (t) { t.stop(); trackStops.push(t) })
+      }, function () {})
+    }, timeoutMs)
+    getDisplayMediaFn.__promise.then(function (stream) {
+      if (settled) {
+        if (stream) stream.getTracks().forEach(function (t) { t.stop(); trackStops.push(t) })
+        return
+      }
+      settled = true
+      if (captureTimer) { clearTimeout(captureTimer); captureTimer = null }
+      resolve(stream)
+    }, function (err) {
+      if (settled) return
+      settled = true
+      if (captureTimer) { clearTimeout(captureTimer); captureTimer = null }
+      reject(err)
+    })
+  }).then(
+    (s) => ({ ok: true, stream: s, trackStops }),
+    (e) => ({ ok: false, error: e, trackStops })
+  )
+}
+
+function makeTrack() {
+  let stopped = false
+  return { readyState: 'live', stop() { stopped = true; this.readyState = 'ended' }, get _stopped() { return stopped } }
+}
+function makeStream(tracks) {
+  return { getTracks() { return tracks }, getVideoTracks() { return tracks.filter(t => t.readyState !== undefined) } }
+}
+function makeDelayedCapture(delayMs, result) {
+  let resolveFn, rejectFn
+  const p = new Promise((res, rej) => { resolveFn = res; rejectFn = rej })
+  const fn = {}
+  fn.__promise = p
+  if (result instanceof Error) {
+    setTimeout(() => rejectFn(result), delayMs)
+  } else {
+    setTimeout(() => resolveFn(result), delayMs)
+  }
+  return fn
+}
+
+test('A: getDisplayMedia succeeds at 1s, track.stop not called at 30s', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const track = makeTrack()
+  const stream = makeStream([track])
+  const cap = makeDelayedCapture(0, stream)
+
+  // Resolve getDisplayMedia immediately
+  t.mock.timers.tick(0)
+  const raceP = makeCaptureRace(cap, 25000)
+  // Let the microtask resolve
+  await new Promise(r => setImmediate(r))
+  t.mock.timers.tick(1000)
+  await new Promise(r => setImmediate(r))
+
+  const result = await raceP
+  assert.equal(result.ok, true)
+  assert.equal(result.stream, stream)
+
+  // Advance past 25s timeout — track must NOT be stopped
+  t.mock.timers.tick(30000)
+  await new Promise(r => setImmediate(r))
+  assert.equal(track._stopped, false, 'track.stop must not be called after successful capture')
+  assert.equal(result.trackStops.length, 0)
+})
+
+test('B: getDisplayMedia exceeds 25s, late stream must be stopped', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const track = makeTrack()
+  const stream = makeStream([track])
+  let resolveCapture
+  const p = new Promise((res) => { resolveCapture = res })
+  const cap = { __promise: p }
+
+  const raceP = makeCaptureRace(cap, 25000)
+  // Timeout fires at 25s
+  t.mock.timers.tick(25001)
+  await new Promise(r => setImmediate(r))
+
+  const result = await raceP
+  assert.equal(result.ok, false)
+  assert.match(result.error.message, /getDisplayMedia_timeout/)
+
+  // Late stream arrives at 30s — must be stopped
+  resolveCapture(stream)
+  await new Promise(r => setImmediate(r))
+  t.mock.timers.tick(5000)
+  await new Promise(r => setImmediate(r))
+  assert.equal(track._stopped, true, 'late stream must be stopped')
+})
+
+test('C: getDisplayMedia rejects immediately, timer cleaned', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const cap = makeDelayedCapture(0, new Error('permission_denied'))
+  t.mock.timers.tick(0)
+  const raceP = makeCaptureRace(cap, 25000)
+  await new Promise(r => setImmediate(r))
+  t.mock.timers.tick(1)
+  await new Promise(r => setImmediate(r))
+
+  const result = await raceP
+  assert.equal(result.ok, false)
+  assert.match(result.error.message, /permission_denied/)
+
+  // Advance past 25s — no second timeout error
+  t.mock.timers.tick(30000)
+  await new Promise(r => setImmediate(r))
+  assert.equal(result.trackStops.length, 0)
+})
+
+test('D: restart/stop clears old timer, new session unaffected', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  // Session 1: start capture, then "stop" before it completes (simulated by clearing)
+  let resolveCapture1
+  const p1 = new Promise((res) => { resolveCapture1 = res })
+  const cap1 = { __promise: p1 }
+  const race1P = makeCaptureRace(cap1, 25000)
+
+  // "Stop/restart" — we don't await race1P, start session 2
+  const track2 = makeTrack()
+  const stream2 = makeStream([track2])
+  const cap2 = makeDelayedCapture(0, stream2)
+  t.mock.timers.tick(0)
+  const race2P = makeCaptureRace(cap2, 25000)
+  await new Promise(r => setImmediate(r))
+  t.mock.timers.tick(1)
+  await new Promise(r => setImmediate(r))
+
+  const result2 = await race2P
+  assert.equal(result2.ok, true)
+  assert.equal(result2.stream, stream2)
+
+  // Advance past both timers — session 2's track must remain live
+  t.mock.timers.tick(30000)
+  await new Promise(r => setImmediate(r))
+  assert.equal(track2._stopped, false, 'new session track must not be stopped by old timer')
+})
+
+test('E: successful capture stays alive for 60s without internal stop', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const track = makeTrack()
+  const stream = makeStream([track])
+  const cap = makeDelayedCapture(0, stream)
+  t.mock.timers.tick(0)
+  const raceP = makeCaptureRace(cap, 25000)
+  await new Promise(r => setImmediate(r))
+  t.mock.timers.tick(1)
+  await new Promise(r => setImmediate(r))
+
+  const result = await raceP
+  assert.equal(result.ok, true)
+
+  // 60 seconds of simulated time
+  t.mock.timers.tick(60000)
+  await new Promise(r => setImmediate(r))
+  assert.equal(track._stopped, false, 'track must stay live for 60s')
+  assert.equal(track.readyState, 'live')
+})
+
 test('screen wall slows webrtc hard-kick to protect getDisplayMedia recovery', () => {
   const portal = fs.readFileSync(path.join(root, '..', 'server/wxqk/deploy_rd_portal_888.py'), 'utf8')
   assert.match(portal, /START_COOLDOWN_MS = 45000/)
@@ -110,4 +299,54 @@ test('server livekit session helper is present for desktop transport', () => {
   assert.match(py, /def mint_token|def issue_token|livekit/)
   assert.match(sess, /livekit/)
   assert.match(sess, /def create_session|def create/)
+})
+
+test('agent token refresh: remote-agent schedules proactive refresh', () => {
+  const agent = fs.readFileSync(path.join(root, 'electron', 'remote-agent.cjs'), 'utf8')
+  assert.ok(agent.includes('scheduleTokenRefresh'), 'should have scheduleTokenRefresh')
+  assert.ok(agent.includes('refreshAgentToken'), 'should have refreshAgentToken')
+  assert.ok(agent.includes('AGENT_TOKEN_TTL_MS'), 'should define token TTL')
+  assert.ok(agent.includes('AGENT_TOKEN_REFRESH_BEFORE_MS'), 'should define refresh window')
+  assert.ok(agent.includes('token_refresh_ack'), 'should handle server ack')
+  assert.ok(agent.includes('updateAgentToken'), 'should push token to publisher')
+})
+
+test('agent token refresh: publisher accepts update-token without stopping', () => {
+  const pub = fs.readFileSync(path.join(root, 'electron', 'webrtc-publisher.html'), 'utf8')
+  assert.ok(pub.includes("op === 'update-token'"), 'should handle update-token op')
+  const handler = pub.split("op === 'update-token'")[1]?.split('return')[0] || ''
+  assert.ok(handler.includes('lastToken'), 'should update lastToken')
+  assert.ok(!handler.includes('stopMedia'), 'should not stop media')
+  assert.ok(!handler.includes('disconnect'), 'should not disconnect')
+})
+
+test('agent token refresh: webrtc-desktop exports updateAgentToken', () => {
+  const mod = fs.readFileSync(path.join(root, 'electron', 'webrtc-desktop.cjs'), 'utf8')
+  assert.ok(mod.includes('updateAgentToken'), 'should export updateAgentToken')
+  assert.ok(mod.includes("op: 'update-token'"), 'should send update-token command')
+})
+
+test('agent token refresh: reconnect uses lastToken which can be refreshed', () => {
+  const pub = fs.readFileSync(path.join(root, 'electron', 'webrtc-publisher.html'), 'utf8')
+  const reconnect = pub.split('scheduleAutoReconnect')[1]?.split('function ')[0] || ''
+  assert.ok(reconnect.includes('lastToken'), 'reconnect should use lastToken')
+})
+
+test('agent token refresh: single reconnect loop (no duplicate timers)', () => {
+  const pub = fs.readFileSync(path.join(root, 'electron', 'webrtc-publisher.html'), 'utf8')
+  assert.ok(pub.includes('clearAutoReconnect()'), 'should clear before scheduling')
+  const agent = fs.readFileSync(path.join(root, 'electron', 'remote-agent.cjs'), 'utf8')
+  assert.ok(agent.includes('if (stopping || reconnectTimer) return'), 'should guard against duplicate reconnect')
+})
+
+test('agent token refresh: server handles request_token_refresh', () => {
+  const srv = fs.readFileSync(path.join(root, '..', 'server/wxqk/server.py'), 'utf8')
+  assert.ok(srv.includes('request_token_refresh'), 'should handle token refresh request')
+  assert.ok(srv.includes('token_refresh_ack'), 'should send ack with token')
+})
+
+test('agent token refresh: stopRemoteAgent clears tokenRefreshTimer', () => {
+  const agent = fs.readFileSync(path.join(root, 'electron', 'remote-agent.cjs'), 'utf8')
+  const stopFn = agent.split('function stopRemoteAgent')[1]?.split('\nfunction ')[0] || ''
+  assert.ok(stopFn.includes('tokenRefreshTimer'), 'should clear tokenRefreshTimer on stop')
 })

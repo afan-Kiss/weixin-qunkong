@@ -46,7 +46,10 @@ function scheduleJpegResume(delayMs) {
   clearJpegResumeTimer()
   jpegResumeTimer = setTimeout(() => {
     jpegResumeTimer = null
+    // 重连过久仍无 connected：放行 JPEG，避免屏幕墙永久无画面
     mediaConnected = false
+    captureBusy = false
+    markWebRtcStarting(false)
   }, Math.max(0, Number(delayMs) || 0))
   if (typeof jpegResumeTimer.unref === 'function') jpegResumeTimer.unref()
 }
@@ -179,10 +182,12 @@ function wireIpc() {
         captureFailStreak = 0
         clearJpegResumeTimer()
       } else if (st === 'reconnecting' || st === 'signalReconnecting') {
-        // 不把 reconnecting 当成已连通；宽限数秒后放行 JPEG，避免长卡死
-        captureBusy = false
-        markWebRtcStarting(false)
-        scheduleJpegResume(4000)
+        // 重连期间可能再次 getDisplayMedia：保持 busy，禁止 JPEG 双开卡死
+        captureBusy = true
+        webrtcStarting = true
+        if (!startingSince) startingSince = Date.now()
+        // 8s 仍未 connected 再放行 JPEG（比假连通卡死更稳）
+        scheduleJpegResume(8000)
       } else if (st === 'disconnected' || st === 'failed' || st === 'closed') {
         captureBusy = false
         markWebRtcStarting(false)
@@ -257,6 +262,11 @@ function sendCommand(cmd) {
   }
 }
 
+function updateAgentToken(token) {
+  if (!token) return false
+  return sendCommand({ op: 'update-token', livekitToken: token })
+}
+
 async function drainQueuedStart() {
   if (!queuedStart) return
   const next = queuedStart
@@ -315,17 +325,19 @@ async function startWebRtcDesktop(opts = {}) {
       } catch (_) {}
       return { ok: false, error: err }
     }
-    // LiveKit 房间按设备固定；新 desktopSessionId 默认复用。显式 forceRestart 且未连通才硬拉。
+    // LiveKit 房间按设备固定；新 desktopSessionId 默认复用。墙侧 force/kick 必须能拆冻屏。
     const prevRoom = activeRoomName
     const sameRoom = !!(roomName && prevRoom && roomName === prevRoom)
     if (roomName) activeRoomName = roomName
-    // 已连通同房：忽略墙侧 forceRestart，避免 DUPLICATE_IDENTITY 卡死
-    if (mediaConnected && sameRoom) {
+    const wantForce = !!(opts.forceRestart || opts.kick || opts.force)
+    // 已连通同房且非强制：复用；务必清 busy，否则 soft start 会把 JPEG 永久堵死
+    if (mediaConnected && sameRoom && !wantForce) {
+      captureBusy = false
       markWebRtcStarting(false)
       return { ok: true, reused: true }
     }
-    // 未连通或换房才 restart；显式 force 仅在未连通时生效
-    const forceRestart = !mediaConnected || !!(roomName && prevRoom && roomName !== prevRoom) || (!!opts.forceRestart && !mediaConnected)
+    // 未连通 / 换房 / 墙侧硬拉：restart（publisher 内 stopMedia 再连，避免 DUPLICATE_IDENTITY）
+    const forceRestart = wantForce || !mediaConnected || !!(roomName && prevRoom && roomName !== prevRoom)
     // 先占门再发令：堵住 startCapture 同步启动 JPEG 的竞态窗口
     markWebRtcStarting(true)
     const sent = sendCommand({
@@ -429,4 +441,5 @@ module.exports = {
   isWebRtcCaptureBusy,
   isWebRtcStarting,
   markWebRtcStarting,
+  updateAgentToken,
 }

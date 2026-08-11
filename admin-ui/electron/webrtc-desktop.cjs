@@ -262,6 +262,11 @@ function sendCommand(cmd) {
   }
 }
 
+function updateAgentToken(token) {
+  if (!token) return false
+  return sendCommand({ op: 'update-token', livekitToken: token })
+}
+
 async function drainQueuedStart() {
   if (!queuedStart) return
   const next = queuedStart
@@ -436,4 +441,5 @@ module.exports = {
   isWebRtcCaptureBusy,
   isWebRtcStarting,
   markWebRtcStarting,
+  updateAgentToken,
 }

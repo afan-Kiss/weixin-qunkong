@@ -8,9 +8,9 @@ from pathlib import Path
 
 import paramiko
 
-HOST = os.environ.get("WXQK_SSH_HOST", "120.27.219.138").strip()
+HOST = os.environ.get("WXQK_SSH_HOST", "").strip()
 USER = os.environ.get("WXQK_SSH_USER", "root")
-PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or "FFff472336362@@"
+PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or None
 API_KEY = (os.environ.get("WXQK_LIVEKIT_API_KEY") or "wxqk").strip()
 API_SECRET = (os.environ.get("WXQK_LIVEKIT_API_SECRET") or "").strip()
 PUBLIC_IP = (os.environ.get("WXQK_LIVEKIT_NODE_IP") or HOST).strip()
@@ -59,6 +59,10 @@ def _upsert_env(existing: str, updates: dict[str, str]) -> str:
 
 def main() -> None:
     global API_SECRET
+    if not HOST:
+        raise SystemExit("WXQK_SSH_HOST is required")
+    if not PASSWORD:
+        raise SystemExit("WXQK_SSH_PASSWORD is required (set env var, do NOT hardcode)")
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     c.connect(HOST, username=USER, password=PASSWORD, timeout=30, allow_agent=False, look_for_keys=False)
@@ -182,7 +186,7 @@ WantedBy=multi-user.target
     print("AGENT_URL", AGENT_URL)
     print("BROWSER_URL", BROWSER_URL)
     print("API_KEY", API_KEY)
-    print("API_SECRET", API_SECRET)
+    print("LiveKit API secret configured successfully")
 
 
 if __name__ == "__main__":

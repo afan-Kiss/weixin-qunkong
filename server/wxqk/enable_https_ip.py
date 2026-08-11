@@ -130,7 +130,12 @@ def main() -> None:
         f"-keyout /etc/nginx/ssl/wxqk-ip.key -out /etc/nginx/ssl/wxqk-ip.crt "
         f"-subj '/CN={HOST}' "
         f"-addext 'subjectAltName=IP:{HOST}'; fi; "
-        "openssl x509 -in /etc/nginx/ssl/wxqk-ip.crt -noout -subject -dates"
+        "openssl x509 -in /etc/nginx/ssl/wxqk-ip.crt -noout -subject -dates; "
+        "echo '--- SPKI PIN (for WXQK_TLS_SPKI_PINS) ---'; "
+        "openssl x509 -in /etc/nginx/ssl/wxqk-ip.crt -pubkey -noout | "
+        "openssl pkey -pubin -outform der 2>/dev/null | "
+        "openssl dgst -sha256 -binary | base64 | "
+        "xargs -I{} echo 'sha256/{}'"
     )
     # ensure map exists in http context (already in wxqk.conf for greenfield)
     run("grep -q 'map $http_upgrade $connection_upgrade' /etc/nginx/sites-available/wxqk.conf || "
@@ -179,8 +184,10 @@ def main() -> None:
     )
 
     run("curl -skS -o /dev/null -w 'https8443 %{http_code}\\n' https://127.0.0.1:8443/wxqk/")
-    run("curl -skS -X POST https://127.0.0.1:8443/wxqk/api/login -H 'Content-Type: application/json' "
-        "-d '{\"password\":\"ff472336362\"}' | head -c 180; echo")
+    # 仅检查端口可达，不在代码中嵌入密码
+    run("curl -skS -o /dev/null -w 'login %{http_code}\\n' -X POST https://127.0.0.1:8443/wxqk/api/login "
+        "-H 'Content-Type: application/json' -d '{}'")
+    # NOTE: 仓库历史出现过的真实凭据必须人工轮换
     run("curl -skS https://127.0.0.1:8443/wxqk/api/update/manifest | head -c 280; echo")
     run("ss -lntp | grep -E ':8443|:80|:888|:4812' | head -20")
     c.close()

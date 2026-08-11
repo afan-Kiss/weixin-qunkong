@@ -184,3 +184,22 @@ test('allowUnsignedForTest stays off by default', () => {
   setAllowUnsignedForTest(false)
   assert.equal(verifyManifestSignature(sampleManifest(), '00'.repeat(64)), false)
 })
+
+test('downloadRangeToFile rejects HTTP 200 with RANGE_UNSUPPORTED', () => {
+  const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
+  assert.match(src, /RANGE_UNSUPPORTED/)
+  assert.match(src, /status === 200/)
+  assert.match(src, /status !== 206/)
+  assert.match(src, /Content-Range mismatch/)
+  assert.match(src, /Range body length mismatch/)
+  assert.match(src, /content-range/)
+})
+
+test('downloadWithResume falls back to single-connection on RANGE_UNSUPPORTED', () => {
+  const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
+  assert.match(src, /rangeUnsupported/)
+  assert.match(src, /error\.code === 'RANGE_UNSUPPORTED'/)
+  assert.match(src, /Fallback: single-connection full download/)
+  assert.match(src, /download fallback http/)
+  assert.match(src, /UPDATE_SIZE_MISMATCH/)
+})

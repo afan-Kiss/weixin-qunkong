@@ -142,7 +142,7 @@
     }
     // 告知主进程：抓屏中，JPEG 必须让路（Windows desktopCapturer 双开会卡死）
     post('state', { connectionState: 'capturing', transport: 'livekit' });
-    const mediaPromise = navigator.mediaDevices.getDisplayMedia({
+    var mediaPromise = navigator.mediaDevices.getDisplayMedia({
       audio: false,
       video: {
         width: { ideal: 1280, max: 1280 },
@@ -150,29 +150,38 @@
         frameRate: { ideal: 12, max: 15 },
       },
     });
-    let timedOut = false;
+    var settled = false;
+    var captureTimer = null;
     try {
-      localStream = await Promise.race([
-        mediaPromise.then((stream) => {
-          if (timedOut && stream) {
-            try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
-            throw new Error('getDisplayMedia_timeout');
+      localStream = await new Promise(function (resolve, reject) {
+        captureTimer = setTimeout(function () {
+          captureTimer = null;
+          if (settled) return;
+          settled = true;
+          reject(new Error('getDisplayMedia_timeout'));
+          // 如果 getDisplayMedia 晚到，stop 那个晚到 stream
+          mediaPromise.then(function (s) {
+            try { s && s.getTracks().forEach(function (t) { t.stop(); }); } catch (_) {}
+          }, function () {});
+        }, 25000);
+        mediaPromise.then(function (stream) {
+          if (settled) {
+            // timeout 已先发生，stop 这个晚到 stream
+            try { stream && stream.getTracks().forEach(function (t) { t.stop(); }); } catch (_) {}
+            return;
           }
-          return stream;
-        }),
-        new Promise((_, reject) => {
-          setTimeout(() => {
-            timedOut = true;
-            reject(new Error('getDisplayMedia_timeout'));
-            try {
-              mediaPromise.then((s) => {
-                try { s && s.getTracks().forEach((t) => t.stop()); } catch (_) {}
-              }, () => {});
-            } catch (_) {}
-          }, 25000);
-        }),
-      ]);
+          settled = true;
+          if (captureTimer) { clearTimeout(captureTimer); captureTimer = null; }
+          resolve(stream);
+        }, function (err) {
+          if (settled) return;
+          settled = true;
+          if (captureTimer) { clearTimeout(captureTimer); captureTimer = null; }
+          reject(err);
+        });
+      });
     } catch (error) {
+      if (captureTimer) { clearTimeout(captureTimer); captureTimer = null; }
       post('state', {
         connectionState: 'failed',
         transport: 'livekit',
@@ -332,6 +341,11 @@
       return;
     }
     if (op === 'signal') return;
+    if (op === 'update-token') {
+      const newToken = String((cmd && cmd.livekitToken) || '');
+      if (newToken) lastToken = newToken;
+      return;
+    }
     if (op === 'stop') {
       intentionalStop = true;
       clearAutoReconnect();

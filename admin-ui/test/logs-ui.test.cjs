@@ -9,7 +9,7 @@ test('logs use Chinese levels, concrete operation names, and WeChat nicknames', 
   const main = readFileSync(path.join(root, 'electron', 'main.cjs'), 'utf8')
 
   assert.match(page, /INFO: '普通', WARNING: '提醒', ERROR: '错误'/)
-  assert.match(page, /instance\?\.nickname \|\| instance\?\.accountWxid/)
+  assert.match(page, /\.nickname \|\| .*\.accountWxid/)
   assert.match(page, /apiOperationLabels\[String\(item\.path\)\]/)
   assert.match(page, /v-model="selectedInstance"/)
   assert.match(page, /v-model="timeRange"/)

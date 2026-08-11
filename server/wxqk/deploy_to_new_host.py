@@ -190,7 +190,12 @@ def main() -> None:
         _, stdout, stderr = client.exec_command(command, timeout=timeout)
         out = stdout.read().decode("utf-8", "replace")
         err = stderr.read().decode("utf-8", "replace")
-        print("$", command[:160])
+        # Redact secrets from logged command
+        logged = command[:160]
+        for s in [PASSWORD or "", SITE_PASSWORD or "", SYNC_PASS or ""]:
+            if s and len(s) > 3:
+                logged = logged.replace(s, "****")
+        print("$", logged)
         if out.strip():
             print(out[:4000])
         if err.strip():
@@ -333,10 +338,17 @@ print("sync done")
         sftp = client.open_sftp()
         with sftp.file("/tmp/sync_wxqk_releases.py", "w") as f:
             f.write(sync_py)
+        # Write credentials to a temp 0600 file instead of shell env (avoids log leakage)
+        cred_json = json.dumps({"host": SYNC_FROM, "password": SYNC_PASS})
+        with sftp.file("/tmp/.wxqk_sync_cred.json", "w") as f:
+            f.write(cred_json)
         sftp.close()
+        run("chmod 600 /tmp/.wxqk_sync_cred.json", timeout=10)
         run(
-            "export SRC_HOST=%s; export SRC_PASS=%s; python3 /tmp/sync_wxqk_releases.py"
-            % (SYNC_FROM, json.dumps(SYNC_PASS)),
+            "SRC_HOST=$(python3 -c \"import json;print(json.load(open('/tmp/.wxqk_sync_cred.json'))['host'])\"); "
+            "SRC_PASS=$(python3 -c \"import json;print(json.load(open('/tmp/.wxqk_sync_cred.json'))['password'])\"); "
+            "export SRC_HOST SRC_PASS; python3 /tmp/sync_wxqk_releases.py; "
+            "rm -f /tmp/.wxqk_sync_cred.json",
             timeout=1800,
         )
         run(f"systemctl restart {SERVICE}.service")
@@ -346,7 +358,7 @@ print("sync done")
     client.close()
     print()
     print("=== deploy complete ===")
-    print(f"系统后台(管理台):  http://{HOST}/wxqk/   密码: {SITE_PASSWORD}")
+    print(f"系统后台(管理台):  http://{HOST}/wxqk/   （站点密码已通过环境变量配置）")
     print(f"软件后台(API/WS):  {base}/   （客户端需指向该地址）")
     print(f"屏幕墙:            http://{HOST}:888/  或  http://{HOST}/888/")
     print("登录页用管理密码；软件连接同一 /wxqk 前缀。")

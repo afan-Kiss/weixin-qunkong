@@ -4,6 +4,9 @@
 Single-node docker (host network). Agents use ws://HOST:7880.
 Browsers on the wall use wss://xiangyuzhubao.xyz:7882 (TLS proxy on portal host).
 
+SECURITY WARNING: 仓库历史出现过的真实凭据（SSH密码、API Secret等）必须人工轮换。
+删除当前代码中的硬编码凭据无法撤销已提交到 Git 历史中的泄露。
+
 Usage:
   set WXQK_SSH_HOST / WXQK_SSH_PASSWORD
   optionally RD_PORTAL_SSH_HOST / RD_PORTAL_SSH_PASSWORD for browser TLS proxy
@@ -18,11 +21,11 @@ from pathlib import Path
 
 import paramiko
 
-HOST = os.environ.get("WXQK_SSH_HOST", "120.27.219.138").strip()
+HOST = os.environ.get("WXQK_SSH_HOST", "").strip()
 USER = os.environ.get("WXQK_SSH_USER", "root")
-PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or "FFff472336362@@"
-PORTAL_HOST = os.environ.get("RD_PORTAL_SSH_HOST", "47.108.21.50").strip()
-PORTAL_PASS = os.environ.get("RD_PORTAL_SSH_PASSWORD") or PASSWORD
+PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or None
+PORTAL_HOST = os.environ.get("RD_PORTAL_SSH_HOST", "").strip()
+PORTAL_PASS = os.environ.get("RD_PORTAL_SSH_PASSWORD") or None
 API_KEY = (os.environ.get("WXQK_LIVEKIT_API_KEY") or "wxqk").strip()
 API_SECRET = (os.environ.get("WXQK_LIVEKIT_API_SECRET") or "").strip()
 PUBLIC_IP = (os.environ.get("WXQK_LIVEKIT_NODE_IP") or HOST).strip()
@@ -158,6 +161,10 @@ server {
 
 def main() -> None:
     global API_SECRET
+    if not HOST:
+        raise SystemExit("WXQK_SSH_HOST is required")
+    if not PASSWORD:
+        raise SystemExit("WXQK_SSH_PASSWORD is required (set env var, do NOT hardcode)")
     if not API_SECRET:
         API_SECRET = secrets.token_hex(24)
 
@@ -225,6 +232,8 @@ def main() -> None:
 
     # Browser TLS front on portal host
     try:
+        if not PORTAL_HOST or not PORTAL_PASS:
+            raise Exception("RD_PORTAL_SSH_HOST / RD_PORTAL_SSH_PASSWORD not set, skipping portal TLS front")
         p = _ssh(PORTAL_HOST, PORTAL_PASS)
         _run(
             p,
@@ -278,7 +287,7 @@ def main() -> None:
     print("AGENT_URL", AGENT_URL)
     print("BROWSER_URL", BROWSER_URL)
     print("API_KEY", API_KEY)
-    print("API_SECRET", API_SECRET)
+    print("LiveKit API secret configured successfully")
 
 
 if __name__ == "__main__":

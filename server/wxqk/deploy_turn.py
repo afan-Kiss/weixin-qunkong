@@ -18,9 +18,9 @@ from pathlib import Path
 
 import paramiko
 
-HOST = os.environ.get("WXQK_SSH_HOST", "120.27.219.138").strip()
+HOST = os.environ.get("WXQK_SSH_HOST", "").strip()
 USER = os.environ.get("WXQK_SSH_USER", "root")
-PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or "FFff472336362@@"
+PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or None
 TURN_HOST = (os.environ.get("FACAI888_TURN_HOST") or HOST).strip()
 TURN_SECRET = (os.environ.get("FACAI888_TURN_SECRET") or "").strip()
 REALM = os.environ.get("FACAI888_TURN_REALM") or "wxqk-turn"
@@ -93,7 +93,9 @@ def _upsert_env(existing: str, updates: dict[str, str]) -> str:
 
 def main() -> None:
     if not HOST:
-        raise SystemExit("WXQK_SSH_HOST required")
+        raise SystemExit("WXQK_SSH_HOST is required")
+    if not PASSWORD:
+        raise SystemExit("WXQK_SSH_PASSWORD is required (set env var, do NOT hardcode)")
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     c.connect(HOST, username=USER, password=PASSWORD, timeout=30, allow_agent=False, look_for_keys=False)
@@ -131,7 +133,9 @@ def main() -> None:
     run("grep -q TURNSERVER_ENABLED=1 /etc/default/coturn || echo TURNSERVER_ENABLED=1 >> /etc/default/coturn")
 
     conf = _turnserver_conf(external_ip, secret, private_ip=priv)
-    print("--- turnserver.conf preview ---\n", conf)
+    # Redact secret from preview to avoid console log leakage
+    redacted = conf.replace(f"static-auth-secret={secret}", "static-auth-secret=****REDACTED****")
+    print("--- turnserver.conf preview (secret redacted) ---\n", redacted)
     sftp = c.open_sftp()
     # Atomic replace so we never leave a duplicated/partial conf
     with sftp.file("/etc/turnserver.conf.tmp", "w") as f:

@@ -3085,6 +3085,31 @@ class Handler(BaseHTTPRequestHandler):
                                 push_to_viewers(cid, msg)
                     elif typ == "pong":
                         pass
+                    elif typ == "request_token_refresh":
+                        if cid:
+                            try:
+                                import webrtc_session as ws
+                                sess = ws._active_session_for_device(cid)
+                                if sess and sess.get("agentToken"):
+                                    now = time.time()
+                                    agent_issued = float(sess.get("agentTokenIssuedAt") or sess.get("issuedAt") or 0)
+                                    if (now - agent_issued) > 3000:
+                                        try:
+                                            import livekit_session as lks
+                                            if lks.livekit_enabled():
+                                                pair = lks.issue_pair(cid)
+                                                if pair.get("ok") and pair.get("agentToken"):
+                                                    sess["agentToken"] = pair["agentToken"]
+                                                    sess["agentTokenIssuedAt"] = now
+                                        except Exception:
+                                            pass
+                                    send_json(sock, {
+                                        "type": "token_refresh_ack",
+                                        "agentToken": str(sess.get("agentToken") or ""),
+                                        "expiresIn": 3600,
+                                    })
+                            except Exception:
+                                pass
             except Exception:
                 pass
             finally:
