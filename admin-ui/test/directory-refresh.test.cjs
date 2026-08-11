@@ -3,14 +3,14 @@ const assert = require('node:assert/strict')
 const { readFileSync } = require('node:fs')
 const path = require('node:path')
 
-test('directory refresh is shared, cached, partially tolerant, and logs concrete failures', () => {
+test('directory refresh is keyed single-flight with shared cache and partial tolerance', () => {
   const store = readFileSync(path.join(__dirname, '..', 'src', 'stores', 'wechatData.ts'), 'utf8')
   const preload = readFileSync(path.join(__dirname, '..', 'electron', 'preload.cjs'), 'utf8')
   const main = readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
-  assert.match(store, /directoryRefreshPromise/)
+  assert.match(store, /directoryRefreshInflight/)
+  assert.match(store, /activeDirectoryRefreshCount/)
   assert.match(store, /Date\.now\(\) - directoryRefreshedAt < 5000/)
   assert.match(store, /options\?\.force/)
-  assert.match(store, /force && directoryRefreshPromise/)
   assert.match(store, /刷新通讯录部分失败/)
   assert.match(store, /directorySyncPayload\(\{ contactInstanceIds: refreshedContactInstances, groupInstanceIds: refreshedGroupInstances \}\)/)
   assert.match(store, /memberRooms: \[\{ instanceId: instance\.id, roomId \}\]/)

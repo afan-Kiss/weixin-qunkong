@@ -23,6 +23,8 @@ const creating = ref(false)
 const folder = ref('默认分组')
 const outputDir = ref('')
 const selectedGroupIds = ref<string[]>([])
+/** 通讯录尚未刷到的监控群：保留 instanceId，禁止绑定「第一个在线微信」 */
+const orphanMonitorRoomsByKey = ref<Record<string, { instanceId: string; roomId: string; name: string }>>({})
 const groupSearch = useSelectSearchQuery(120)
 const collecting = ref(false)
 const collectProgressText = ref('')
@@ -243,20 +245,25 @@ async function collectHistory() {
     stopCollectProgress = undefined
   }
 }
+function monitorRoomKey(instanceId: string, roomId: string) {
+  return `${instanceId}\u0000${roomId}`
+}
+
 function selectedRooms() {
   const byId = groups.value.filter((item) => selectedGroupIds.value.includes(item.id))
-  const knownRoomIds = new Set(byId.map((item) => item.roomId))
+  const knownKeys = new Set(byId.map((item) => monitorRoomKey(item.sourceInstanceId, item.roomId)))
   const orphanRooms = selectedGroupIds.value
-    .filter((id) => String(id).endsWith('@chatroom') && !knownRoomIds.has(id))
+    .filter((id) => String(id).endsWith('@chatroom'))
     .map((roomId) => {
-      const online = instances.value.find((item) => item.status === 'ONLINE')
-      return {
-        instanceId: online?.id || '',
-        roomId,
-        name: '群聊',
+      const fromDirectory = byId.find((item) => item.roomId === roomId)
+      if (fromDirectory) {
+        return { instanceId: fromDirectory.sourceInstanceId, roomId, name: fromDirectory.name }
       }
+      const hit = Object.values(orphanMonitorRoomsByKey.value).find((item) => item.roomId === roomId)
+      return hit ? { instanceId: hit.instanceId, roomId: hit.roomId, name: hit.name || '群聊' } : null
     })
-    .filter((item) => item.instanceId)
+    .filter((item): item is { instanceId: string; roomId: string; name: string } => Boolean(item?.instanceId))
+    .filter((item) => !knownKeys.has(monitorRoomKey(item.instanceId, item.roomId)))
   return [
     ...byId.map((item) => ({ instanceId: item.sourceInstanceId, roomId: item.roomId, name: item.name })),
     ...orphanRooms,
@@ -267,12 +274,21 @@ function selectedRooms() {
  * @param rooms 监控群
  */
 function applyMonitorRoomsToSelection(rooms: Array<{ roomId: string; instanceId?: string; name?: string }> = []) {
-  const roomIds = new Set(rooms.map((room) => String(room.roomId || '')).filter((id) => id.endsWith('@chatroom')))
-  if (!roomIds.size) return
+  const normalized = rooms
+    .map((room) => ({
+      instanceId: String(room.instanceId || '').trim(),
+      roomId: String(room.roomId || '').trim(),
+      name: String(room.name || '群聊'),
+    }))
+    .filter((room) => room.instanceId && room.roomId.endsWith('@chatroom'))
+  if (!normalized.length) return
+  const roomIds = new Set(normalized.map((room) => room.roomId))
   const matched = groups.value.filter((group) => roomIds.has(group.roomId)).map((group) => group.id)
-  // 通讯录尚未刷新到的新群：用 roomId 暂存，刷新后仍能对上
-  const orphans = [...roomIds].filter((roomId) => !groups.value.some((group) => group.roomId === roomId))
-  selectedGroupIds.value = [...new Set([...matched, ...orphans])]
+  const orphans = normalized.filter((room) => !groups.value.some((group) => group.sourceInstanceId === room.instanceId && group.roomId === room.roomId))
+  for (const room of orphans) {
+    orphanMonitorRoomsByKey.value[monitorRoomKey(room.instanceId, room.roomId)] = room
+  }
+  selectedGroupIds.value = [...new Set([...matched, ...orphans.map((room) => room.roomId)])]
   monitorWatchedCount.value = Math.max(roomIds.size, selectedGroupIds.value.length)
 }
 
@@ -281,9 +297,10 @@ async function startMonitor() {
   if (!outputDir.value) return ElMessage.warning('请先选择二维码保存文件夹')
   try {
     const rooms = selectedRooms()
-    // 全选当前目录时默认开启「含新进群自动扩容」；也可手动勾选
-    const watchAll = monitorWatchAll.value
-      || (historyGroupOptions.value.length > 0 && selectedGroupIds.value.length >= historyGroupOptions.value.length)
+    const selectedSet = new Set(selectedGroupIds.value)
+    const allCurrentSelected = historyGroupOptions.value.length > 0
+      && historyGroupOptions.value.every((option) => selectedSet.has(option.value))
+    const watchAll = monitorWatchAll.value || allCurrentSelected
     monitorWatchAll.value = watchAll
     await window.wxControl?.startQrMonitor({ rooms, outputDir: outputDir.value, folder: folder.value, watchAll })
     monitorEnabled.value = true

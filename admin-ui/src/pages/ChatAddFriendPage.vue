@@ -147,13 +147,18 @@ function hasFrequentMark(error?: string, status?: string) {
   return text.includes('已经频繁') || text.includes('频繁') || text.includes('frequent') || text.includes('too many requests')
 }
 
+function friendStatusKey(instanceId: string, targetWxid: string) {
+  return `${instanceId}\u0000${targetWxid}`
+}
+
 /**
  * 映射候选的添加状态展示文案。
  * @param senderWxid 发送者
  * @param candidateStatus 候选状态
  */
 function resolveAddStatus(senderWxid: string, candidateStatus: string) {
-  const friend = friendStatuses.value[senderWxid]
+  const instanceId = String(activeRule?.instanceId || '')
+  const friend = instanceId ? friendStatuses.value[friendStatusKey(instanceId, senderWxid)] : undefined
   const reason = String(friend?.error || '').trim()
   // 仅看该项状态/错误，任务整体 COOLING_DOWN 不误伤已提交或其他候选人
   if (friend && hasFrequentMark(friend.error, friend.status)) return reason ? `已经频繁：${reason}` : '已经频繁'
@@ -379,7 +384,8 @@ async function refreshCandidates() {
   const seq = ++candidatesRefreshSeq
   const keepIds = [...selectedIds.value]
   // 停止监听只阻止新增候选，不清空已有候选；只有“清空候选”按钮可以删除。
-  if (!activeRule?.instanceId || !activeRule.roomIds.length) {
+  const rule = activeRule
+  if (!rule?.instanceId || !rule.roomIds.length) {
     if (seq !== candidatesRefreshSeq) return
     candidates.value = []
     friendStatuses.value = {}
@@ -388,15 +394,20 @@ async function refreshCandidates() {
     return
   }
   const nextRows = (await window.wxControl?.listChatAddCandidates?.({
-    instanceId: activeRule.instanceId,
-    roomIds: activeRule.roomIds,
+    instanceId: rule.instanceId,
+    roomIds: rule.roomIds,
     limit: 2000,
   }) ?? []) as CandidateRow[]
   if (seq !== candidatesRefreshSeq) return
   candidates.value = nextRows
   // 仅查待创建候选的状态；key 未变则跳过 IPC，降低 CPU/IPC
-  const pendingKeys = nextRows.filter((item) => item.status === 'PENDING').map((item) => item.senderWxid)
-  const statusKey = pendingKeys.slice().sort().join('\n')
+  const pendingKeys = nextRows
+    .filter((item) => item.status === 'PENDING')
+    .map((item) => ({ instanceId: rule.instanceId, targetKey: item.senderWxid }))
+  const statusKey = pendingKeys
+    .map((item) => `${item.instanceId}\u0000${item.targetKey}`)
+    .sort()
+    .join('\n')
   if (!pendingKeys.length) {
     friendStatuses.value = {}
     lastFriendStatusKey = ''

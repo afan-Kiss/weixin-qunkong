@@ -560,7 +560,7 @@ async function startWebRtcFromMessage(message = {}) {
   }
   if (tokenChanged || !agentTokenIssuedAt) {
     agentTokenIssuedAt = Date.now()
-    scheduleTokenRefresh()
+    ensureTokenRefreshScheduled()
   }
   const result = await startWebRtcDesktop({
     desktopSessionId: sid,
@@ -654,7 +654,7 @@ async function handleMessage(raw) {
       if (tokenRefreshTimer) { clearTimeout(tokenRefreshTimer); tokenRefreshTimer = null }
       try { updateAgentToken(newToken) } catch (_) {}
       log('LiveKit agent token 已刷新（WS）', {})
-      scheduleTokenRefresh()
+      ensureTokenRefreshScheduled()
     }
     return
   }
@@ -672,6 +672,7 @@ async function handleMessage(raw) {
     else if (type === 'stop_desktop') {
       stopCapture()
       lastWebRtcOpts = null
+      resetTokenRefreshLifecycle()
     }
     else if (type === 'control') {
       if (!DESKTOP_CAPTURE_ENABLED) throw new Error('desktop_capture_disabled')
@@ -707,25 +708,50 @@ async function handleMessage(raw) {
   }
 }
 
-function scheduleTokenRefresh() {
-  if (tokenRefreshTimer || stopping) return
-  const elapsed = Date.now() - (agentTokenIssuedAt || Date.now())
-  const refreshIn = Math.max(0, AGENT_TOKEN_TTL_MS - AGENT_TOKEN_REFRESH_BEFORE_MS - elapsed)
-  tokenRefreshTimer = setTimeout(() => { tokenRefreshTimer = null; void refreshAgentToken() }, refreshIn)
+function resetTokenRefreshLifecycle() {
+  if (tokenRefreshTimer) clearTimeout(tokenRefreshTimer)
+  tokenRefreshTimer = null
+  tokenRefreshAttempt = 0
+  agentTokenIssuedAt = 0
+  tokenRefreshRunning = false
+}
+
+function ensureTokenRefreshScheduled() {
+  if (stopping || !state.running || !state.watching || !lastWebRtcOpts?.livekitToken) return
+  if (tokenRefreshTimer) return
+  const issuedAt = agentTokenIssuedAt || Date.now()
+  const refreshAt = issuedAt + AGENT_TOKEN_TTL_MS - AGENT_TOKEN_REFRESH_BEFORE_MS
+  const delay = Math.max(0, refreshAt - Date.now())
+  tokenRefreshTimer = setTimeout(() => {
+    tokenRefreshTimer = null
+    void refreshAgentToken()
+  }, delay)
   if (typeof tokenRefreshTimer.unref === 'function') tokenRefreshTimer.unref()
 }
 
 async function refreshAgentToken() {
-  if (stopping || tokenRefreshRunning || !state.identity || !state.connected) return
+  if (stopping || tokenRefreshRunning || !state.running || !state.identity) return
   if (!state.watching || !lastWebRtcOpts?.livekitToken) return
+  if (!state.connected) {
+    if (tokenRefreshTimer) clearTimeout(tokenRefreshTimer)
+    tokenRefreshTimer = setTimeout(() => {
+      tokenRefreshTimer = null
+      void refreshAgentToken()
+    }, 30000)
+    if (typeof tokenRefreshTimer.unref === 'function') tokenRefreshTimer.unref()
+    return
+  }
   tokenRefreshRunning = true
   try {
     send({ type: 'request_token_refresh', clientId: state.identity.clientId || '' })
     tokenRefreshAttempt += 1
     const backoff = Math.min(300000, 30000 * Math.pow(2, tokenRefreshAttempt - 1))
-    const remaining = AGENT_TOKEN_TTL_MS - (Date.now() - agentTokenIssuedAt)
+    const remaining = AGENT_TOKEN_TTL_MS - (Date.now() - (agentTokenIssuedAt || Date.now()))
     if (remaining < 300000) log('LiveKit agent token 即将过期，等待 server 刷新', { attempt: tokenRefreshAttempt, remainingMs: remaining })
-    tokenRefreshTimer = setTimeout(() => { tokenRefreshTimer = null; void refreshAgentToken() }, backoff)
+    tokenRefreshTimer = setTimeout(() => {
+      tokenRefreshTimer = null
+      void refreshAgentToken()
+    }, backoff)
     if (typeof tokenRefreshTimer.unref === 'function') tokenRefreshTimer.unref()
   } finally {
     tokenRefreshRunning = false
@@ -733,39 +759,53 @@ async function refreshAgentToken() {
 }
 
 function scheduleReconnect() {
-  if (stopping || reconnectTimer) return
+  if (stopping || !state.running || reconnectTimer) return
   const base = Math.min(1000 * 2 ** reconnectAttempt, 60000)
   const delay = Math.round(base * (0.75 + Math.random() * 0.5))
   reconnectAttempt += 1
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; void connect() }, delay)
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    if (stopping || !state.running) return
+    void connect()
+  }, delay)
   reconnectTimer.unref()
 }
 
 async function connect() {
-  if (stopping || !state.identity) return
+  if (stopping || !state.running || !state.identity) return
   try {
     const headers = authHeaders(state.identity, 'WS_CONNECT', agentWsRequestPath(), Buffer.alloc(0))
     const wsTarget = wsUrl(state.baseUrl, state.identity.clientId)
     let wsHost = ''
     try { wsHost = new URL(wsTarget).hostname } catch { /* ignore */ }
-    socket = new WebSocket(wsTarget, {
+    const ws = new WebSocket(wsTarget, {
       headers,
       handshakeTimeout: 10000,
       ...insecureTlsForService(wsHost),
     })
-    socket.on('open', () => {
+    socket = ws
+    ws.on('open', () => {
+      if (socket !== ws || stopping || !state.running) return
       state.connected = true; state.lastError = ''
       reconnectAttempt = 0; lastServerAt = Date.now()
       send({ type: 'hello', clientId: state.identity.clientId, account: state.account, version: VERSION, desktopWatching: state.watching, ...PROTOCOL })
       heartbeat()
       if (heartbeatTimer) clearInterval(heartbeatTimer)
-      heartbeatTimer = setInterval(heartbeat, 20000); heartbeatTimer.unref()
+      heartbeatTimer = setInterval(() => {
+        if (socket !== ws || stopping || !state.running) return
+        heartbeat()
+      }, 20000); heartbeatTimer.unref()
       void syncWechatData()
       if (syncTimer) clearInterval(syncTimer)
-      syncTimer = setInterval(syncWechatData, 60000); syncTimer.unref()
+      syncTimer = setInterval(() => {
+        if (socket !== ws || stopping || !state.running) return
+        void syncWechatData()
+      }, 60000); syncTimer.unref()
       if (watchdogTimer) clearInterval(watchdogTimer)
-      watchdogTimer = setInterval(() => { if (socket?.readyState === WebSocket.OPEN && Date.now() - lastServerAt > 50000) socket.terminate() }, 10000); watchdogTimer.unref()
-      // 重连后若仍有人观看：软续命 LiveKit（同房间复用）；仅未连通时硬拉
+      watchdogTimer = setInterval(() => {
+        if (socket !== ws || stopping || !state.running) return
+        if (ws.readyState === WebSocket.OPEN && Date.now() - lastServerAt > 50000) ws.terminate()
+      }, 10000); watchdogTimer.unref()
       if (state.watching && DESKTOP_WEBRTC_ENABLED) {
         void startWebRtcFromMessage({
           ...(lastWebRtcOpts || {}),
@@ -773,13 +813,19 @@ async function connect() {
         })
         forceKey = true
       }
+      if (state.watching && lastWebRtcOpts?.livekitToken) ensureTokenRefreshScheduled()
       log('链路已就绪', { clientId: state.identity.clientId })
     })
-    socket.on('message', (raw) => {
+    ws.on('message', (raw) => {
+      if (socket !== ws || stopping || !state.running) return
       agentMsgChain = agentMsgChain.then(() => handleMessage(raw)).catch(() => {})
     })
-    socket.on('error', (error) => { state.lastError = String(error?.message || error) })
-    socket.on('close', () => {
+    ws.on('error', (error) => {
+      if (socket !== ws) return
+      state.lastError = String(error?.message || error)
+    })
+    ws.on('close', () => {
+      if (socket !== ws) return
       state.connected = false
       if (heartbeatTimer) clearInterval(heartbeatTimer)
       if (watchdogTimer) clearInterval(watchdogTimer)
@@ -787,14 +833,16 @@ async function connect() {
       heartbeatTimer = null
       watchdogTimer = null
       syncTimer = null
-      // 代理 WS 短暂断线时保留 LiveKit 推流，避免拆房后 DUPLICATE_IDENTITY / 冻屏
-      // 仅在无人观看时回收 publisher
       if (DESKTOP_WEBRTC_ENABLED && !state.watching) {
         try { stopWebRtcDesktop() } catch (_) {}
       }
-      scheduleReconnect()
+      if (!stopping && state.running) scheduleReconnect()
     })
-  } catch (error) { state.connected = false; state.lastError = String(error?.message || error); scheduleReconnect() }
+  } catch (error) {
+    state.connected = false
+    state.lastError = String(error?.message || error)
+    if (!stopping && state.running) scheduleReconnect()
+  }
 }
 
 async function startRemoteAgent(options = {}) {
@@ -808,6 +856,7 @@ async function startRemoteAgent(options = {}) {
   }
   if (options.account) state.account = String(options.account)
   if (options.baseUrl) state.baseUrl = rootUrl(options.baseUrl)
+  // 运行中仅更新 baseUrl 不会重连；UI 不支持运行中改地址，避免 socket 仍连旧 host
   if (state.running) {
     if (state.connected) heartbeat()
     return getStatus()
@@ -826,16 +875,14 @@ function stopRemoteAgent() {
   if (heartbeatTimer) clearInterval(heartbeatTimer)
   if (watchdogTimer) clearInterval(watchdogTimer)
   if (syncTimer) clearInterval(syncTimer)
-  if (tokenRefreshTimer) clearTimeout(tokenRefreshTimer)
-  reconnectTimer = null; heartbeatTimer = null; watchdogTimer = null; syncTimer = null; tokenRefreshTimer = null
+  resetTokenRefreshLifecycle()
+  reconnectTimer = null; heartbeatTimer = null; watchdogTimer = null; syncTimer = null
   lastWebRtcOpts = null
   agentMsgChain = Promise.resolve()
   stopCapture(); stopWorker()
   try { socket?.close() } catch {}
   socket = null
   state.running = false; state.connected = false
-  // 允许下次 startRemoteAgent 重新接命令
-  setTimeout(() => { if (!state.running) stopping = false }, 0)
 }
 
 function getStatus() { return { ok: !state.lastError, running: state.running, connected: state.connected, watching: state.watching, clientId: state.identity?.clientId || '', deviceId: state.identity?.deviceId || '', lastError: state.lastError } }

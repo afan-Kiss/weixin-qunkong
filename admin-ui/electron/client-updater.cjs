@@ -383,15 +383,18 @@ function downloadRangeToFile(url, dest, start, end, onChunk) {
         return
       }
       const cr = String(res.headers['content-range'] || '')
-      const crMatch = cr.match(/^bytes\s+(\d+)-(\d+)\//)
-      if (crMatch) {
-        const crStart = Number(crMatch[1])
-        const crEnd = Number(crMatch[2])
-        if (crStart !== start || crEnd !== end) {
-          res.resume()
-          reject(new Error(`Content-Range mismatch: expected ${start}-${end}, got ${crStart}-${crEnd}`))
-          return
-        }
+      const crMatch = cr.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/)
+      if (!crMatch) {
+        res.resume()
+        reject(Object.assign(new Error('RANGE_INVALID_CONTENT_RANGE'), { code: 'RANGE_INVALID_CONTENT_RANGE' }))
+        return
+      }
+      const crStart = Number(crMatch[1])
+      const crEnd = Number(crMatch[2])
+      if (crStart !== start || crEnd !== end) {
+        res.resume()
+        reject(new Error(`Content-Range mismatch: expected ${start}-${end}, got ${crStart}-${crEnd}`))
+        return
       }
       const { openSync, writeSync, closeSync } = require('fs')
       let fd
@@ -405,6 +408,13 @@ function downloadRangeToFile(url, dest, start, end, onChunk) {
       let offset = start
       res.on('data', (chunk) => {
         try {
+          if (offset + chunk.length > end + 1) {
+            try { closeSync(fd) } catch (_) {}
+            res.destroy()
+            req.destroy()
+            reject(Object.assign(new Error('RANGE_BODY_TOO_LARGE'), { code: 'RANGE_BODY_TOO_LARGE' }))
+            return
+          }
           writeSync(fd, chunk, 0, chunk.length, offset)
           offset += chunk.length
           onChunk?.(chunk.length)

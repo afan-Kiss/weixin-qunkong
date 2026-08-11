@@ -188,6 +188,10 @@ function resolveAddStatus(status?: string, error?: string, _taskStatus?: string)
   return '未添加'
 }
 
+function friendStatusKey(instanceId: string, targetWxid: string) {
+  return `${instanceId}\u0000${targetWxid}`
+}
+
 /**
  * 将最新入群记录转为可加好友的成员行（不依赖当前 members 缓存，避免多群采集被覆盖）。
  * @param row 入群记录
@@ -211,7 +215,7 @@ const groupMembers = computed(() => {
   if (onlyLatestJoins.value) {
     return joinRows.value.map((row) => {
       const member = joinToMember(row)
-      const friend = friendStatuses.value[row.wxid]
+      const friend = friendStatuses.value[friendStatusKey(row.instanceId, row.wxid)]
       return {
         ...member,
         joinTime: row.joinAt ? new Date(row.joinAt).toLocaleString() : '-',
@@ -225,7 +229,7 @@ const groupMembers = computed(() => {
   }
   return members.value.map((item) => {
     const join = joinMap.value.get(joinKey(item.sourceInstanceId, item.roomId, item.wxid))
-    const friend = friendStatuses.value[item.wxid]
+    const friend = friendStatuses.value[friendStatusKey(item.sourceInstanceId, item.wxid)]
     return {
       ...item,
       joinTime: join?.joinAt ? new Date(join.joinAt).toLocaleString() : '-',
@@ -349,9 +353,9 @@ async function refreshJoinRows() {
  */
 async function refreshFriendStatuses() {
   const keys = [...new Set([
-    ...members.value.map((item) => item.wxid),
-    ...joinRows.value.map((item) => item.wxid),
-  ].filter(Boolean))]
+    ...members.value.map((item) => ({ instanceId: item.sourceInstanceId, targetKey: item.wxid })),
+    ...joinRows.value.map((item) => ({ instanceId: item.instanceId, targetKey: item.wxid })),
+  ].filter((item) => item.instanceId && item.targetKey))]
   friendStatuses.value = keys.length ? await window.wxControl?.listFriendAddStatuses?.(keys) ?? {} : {}
 }
 

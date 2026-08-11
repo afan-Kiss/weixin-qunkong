@@ -39,9 +39,20 @@ export const contacts = ref<ContactRow[]>([])
 export const groups = ref<GroupRow[]>([])
 export const members = ref<MemberRow[]>([])
 export const loading = ref(false)
-let directoryRefreshPromise: Promise<{ contacts: ContactRow[]; groups: GroupRow[] }> | null = null
+const directoryRefreshInflight = new Map<string, Promise<{ contacts: ContactRow[]; groups: GroupRow[] }>>()
+let activeDirectoryRefreshCount = 0
 let directoryRefreshKey = ''
 let directoryRefreshedAt = 0
+
+function beginDirectoryRefresh() {
+  activeDirectoryRefreshCount += 1
+  loading.value = activeDirectoryRefreshCount > 0
+}
+
+function endDirectoryRefresh() {
+  activeDirectoryRefreshCount = Math.max(0, activeDirectoryRefreshCount - 1)
+  loading.value = activeDirectoryRefreshCount > 0
+}
 export const friends = computed(() => contacts.value.filter((item) => !item.isGroup))
 export const savedGroups = computed(() => contacts.value.filter((item) => item.isGroup))
 
@@ -267,16 +278,14 @@ export async function refreshInstances() {
 export async function refreshDirectory(instanceIds?: string[], options?: { force?: boolean }) {
   const force = Boolean(options?.force)
   const refreshKey = [...(instanceIds ?? [])].sort().join(',') || 'ALL'
-  // 取消保存等写操作后必须强制重拉；否则 5 秒缓存 / 进行中的旧刷新会让 UI 仍显示「已保存」
-  if (!force && directoryRefreshPromise) return directoryRefreshPromise
+  if (!force && directoryRefreshInflight.has(refreshKey)) {
+    return directoryRefreshInflight.get(refreshKey)!
+  }
   if (!force && refreshKey === directoryRefreshKey && Date.now() - directoryRefreshedAt < 5000) {
     return { contacts: contacts.value, groups: groups.value }
   }
-  if (force && directoryRefreshPromise) {
-    try { await directoryRefreshPromise } catch { /* 旧刷新失败不阻断强制刷新 */ }
-  }
-  loading.value = true
-  directoryRefreshPromise = (async () => {
+  beginDirectoryRefresh()
+  const promise = (async () => {
     await refreshInstances()
     const selected = instances.value.filter((item) => item.status === 'ONLINE' && (!instanceIds?.length || instanceIds.includes(item.id)))
     const blockedByInstance = await window.wxControl?.listBlockedRoomIds?.(selected.map((item) => item.id)) ?? {}
@@ -393,8 +402,12 @@ export async function refreshDirectory(instanceIds?: string[], options?: { force
     const message = error instanceof Error ? error.message : '刷新通讯录失败'
     await window.wxControl?.reportError?.('刷新通讯录失败', { reason: message })
     throw error
-  }).finally(() => { loading.value = false; directoryRefreshPromise = null })
-  return directoryRefreshPromise
+  }).finally(() => {
+    directoryRefreshInflight.delete(refreshKey)
+    endDirectoryRefresh()
+  })
+  directoryRefreshInflight.set(refreshKey, promise)
+  return promise
 }
 
 export async function loadMembers(instanceId: string, roomId: string) {

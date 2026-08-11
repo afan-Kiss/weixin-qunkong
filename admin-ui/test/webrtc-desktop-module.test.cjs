@@ -303,7 +303,7 @@ test('server livekit session helper is present for desktop transport', () => {
 
 test('agent token refresh: remote-agent schedules proactive refresh', () => {
   const agent = fs.readFileSync(path.join(root, 'electron', 'remote-agent.cjs'), 'utf8')
-  assert.ok(agent.includes('scheduleTokenRefresh'), 'should have scheduleTokenRefresh')
+  assert.ok(agent.includes('ensureTokenRefreshScheduled'), 'should have ensureTokenRefreshScheduled')
   assert.ok(agent.includes('refreshAgentToken'), 'should have refreshAgentToken')
   assert.ok(agent.includes('AGENT_TOKEN_TTL_MS'), 'should define token TTL')
   assert.ok(agent.includes('AGENT_TOKEN_REFRESH_BEFORE_MS'), 'should define refresh window')
@@ -336,7 +336,7 @@ test('agent token refresh: single reconnect loop (no duplicate timers)', () => {
   const pub = fs.readFileSync(path.join(root, 'electron', 'webrtc-publisher.html'), 'utf8')
   assert.ok(pub.includes('clearAutoReconnect()'), 'should clear before scheduling')
   const agent = fs.readFileSync(path.join(root, 'electron', 'remote-agent.cjs'), 'utf8')
-  assert.ok(agent.includes('if (stopping || reconnectTimer) return'), 'should guard against duplicate reconnect')
+  assert.ok(agent.includes('if (stopping || !state.running || reconnectTimer) return'), 'should guard against duplicate reconnect')
 })
 
 test('agent token refresh: server handles request_token_refresh', () => {
@@ -348,5 +348,5 @@ test('agent token refresh: server handles request_token_refresh', () => {
 test('agent token refresh: stopRemoteAgent clears tokenRefreshTimer', () => {
   const agent = fs.readFileSync(path.join(root, 'electron', 'remote-agent.cjs'), 'utf8')
   const stopFn = agent.split('function stopRemoteAgent')[1]?.split('\nfunction ')[0] || ''
-  assert.ok(stopFn.includes('tokenRefreshTimer'), 'should clear tokenRefreshTimer on stop')
+  assert.ok(stopFn.includes('resetTokenRefreshLifecycle'), 'should reset token refresh lifecycle on stop')
 })

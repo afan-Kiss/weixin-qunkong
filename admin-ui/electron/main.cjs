@@ -18,7 +18,7 @@ const { createSerialExecutor, parseInjectorOutput, decodeInjectorChunks, waitFor
 const { rawErrorMessage, toUserErrorMessage } = require('./user-error.cjs')
 const { parseProfileCredentials, rawStructure } = require('./friend-profile.cjs')
 const { resolveFriendProfileCredentials } = require('./friend-credential-resolve.cjs')
-const { requestWechatRead, clearInstanceCache, invalidateInstanceApi, getReadBrokerStats, resetAllStats } = require('./wechat-read-broker.cjs')
+const { requestWechatRead, clearInstanceCache, invalidateInstanceApi, getReadBrokerStats, resetAllStats, READ_API_WHITELIST } = require('./wechat-read-broker.cjs')
 const { runFriendCredentialDiagnostic } = require('./friend-credential-diagnostic.cjs')
 const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
 const softwareAuth = require('./software-auth.cjs')
@@ -167,6 +167,9 @@ const friendCredentialInflight = new Map()
 /** @type {Map<string, number>} key: instanceId|roomId|messageId → timestamp of last enqueue */
 const qrMonitorRecentEvents = new Map()
 const QR_MONITOR_EVENT_DEDUP_TTL_MS = 90000
+const deliveryImageHashCache = new Map()
+const DELIVERY_IMAGE_HASH_TTL_MS = 10 * 60 * 1000
+const DELIVERY_IMAGE_HASH_MAX = 512
 const { cleanupRuntimeTtlMaps: sweepRuntimeTtlMaps } = require('./runtime-ttl-cleanup.cjs')
 const RUNTIME_CACHE_CLEANUP_INTERVAL_MS = 60000
 let runtimeCacheCleanupTimer = null
@@ -176,6 +179,12 @@ function cleanupRuntimeTtlMaps(now = Date.now()) {
     qrInvitePreviewCache,
     qrMonitorRecentEvents,
     QR_MONITOR_EVENT_DEDUP_TTL_MS,
+    qrValidityCache,
+    qrMonitorSkipLogAt,
+    QR_MONITOR_SKIP_LOG_TTL_MS: 600000,
+    deliveryImageHashCache,
+    DELIVERY_IMAGE_HASH_TTL_MS,
+    DELIVERY_IMAGE_HASH_MAX,
   }, now)
 }
 
@@ -952,7 +961,7 @@ async function saveClassifiedQrImage(record, room, sourcePath, message, options)
  * @returns {Promise<boolean>}
  */
 async function isQrLinkCurrentlyValid(record, decodedText, qrType) {
-  const key = contentHash(decodedText)
+  const key = `${record.id}|${contentHash(decodedText)}`
   const cached = qrValidityCache.get(key)
   if (cached && cached.expiresAt > Date.now()) return cached.valid
   let valid = false
@@ -1295,7 +1304,8 @@ function buildKickRoomDelContactBody(roomId) {
 }
 
 /**
- * 取消通讯录 + 退出删会话 + del_contact 兜底，并回拉群列表核验是否仍残留。
+ * quit_and_del_chat_room 后仍调 del_contact：实测 quit 接口 HTTP 200 但群列表仍残留时，
+ * del_contact 可补清通讯录/会话；delContactOk 亦作为 deleteOk 的兜底成功信号（见 kicked-group-cleanup 测试）。
  * 未核验到「已不在群列表」前，不把清理当作真正成功（避免本地屏蔽后界面消失、微信仍在）。
  * @param {{ id: string }} record
  * @param {string} roomId
@@ -1653,6 +1663,10 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
     let unsaveStatus = String(row.unsaveStatus || row.unsave_status || 'PENDING')
     let deleteChatStatus = String(row.deleteChatStatus || row.delete_chat_status || 'PENDING')
     // 已屏蔽群也一律重跑退群：此前可能 HTTP 假成功，微信会话仍在
+    if (taskId && isTaskStopRequested(taskId)) {
+      const message = logKick('WARN', '已暂停：清理已取消')
+      return { ...base, outcome: 'SKIPPED', message }
+    }
     {
       const cleared = await quitAndClearKickedRoomSession(record, roomId)
       unsaveStatus = cleared.unsaveStatus
@@ -1785,6 +1799,10 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
   let unsaveStatus = String(row.unsaveStatus || row.unsave_status || 'PENDING')
   let deleteChatStatus = String(row.deleteChatStatus || row.delete_chat_status || 'PENDING')
   if (unsaveStatus !== 'DONE' || deleteChatStatus !== 'DONE') {
+    if (taskId && isTaskStopRequested(taskId)) {
+      const message = logKick('WARN', '已暂停：清理已取消')
+      return { ...base, outcome: 'SKIPPED', message }
+    }
     const cleared = await quitAndClearKickedRoomSession(record, roomId)
     unsaveStatus = cleared.unsaveStatus
     deleteChatStatus = cleared.deleteChatStatus
@@ -2399,6 +2417,20 @@ function isTaskStopRequested(taskId) {
   const task = listTasks().find((item) => item.id === taskId)
   return !task || ['PAUSED', 'CANCELLED'].includes(String(task.status || ''))
 }
+
+/**
+ * 暂停/取消后阻止尚未提交的 Mutation；返回 true 表示已拦截。
+ * @param {string} taskId
+ * @param {string} itemId
+ * @returns {boolean}
+ */
+function blockMutationForTaskStop(taskId, itemId) {
+  if (!taskId || !isTaskStopRequested(taskId)) return false
+  const task = listTasks().find((item) => item.id === taskId)
+  const cancelled = String(task?.status || '') === 'CANCELLED'
+  setTaskItemResult(itemId, cancelled ? 'CANCELLED' : 'PAUSED', null, cancelled ? '任务已取消' : '任务已暂停')
+  return true
+}
 /**
  * 等待到指定时间；暂停/取消时返回 false。
  * earlyContinueStatuses：冷却等待中若用户点「继续」把状态改成这些值，则立刻返回 true 继续执行。
@@ -2416,17 +2448,25 @@ async function waitForTaskTime(taskId, timestamp, options = {}) {
   }
   return true
 }
-const deliveryImageHashCache = new Map()
 function deliveryContentHash(actionType, request) {
   if (actionType === 'SEND_IMAGE') {
     const file = String(request?.filepath || '')
     if (file && existsSync(file)) {
       const cacheKey = `${actionType}\0${file}`
-      const cached = deliveryImageHashCache.get(cacheKey)
-      if (cached) return cached
-      const digest = createHash('sha256').update(`${actionType}\0`).update(readFileSync(file)).digest('hex')
-      deliveryImageHashCache.set(cacheKey, digest)
-      return digest
+      try {
+        const st = statSync(file)
+        const cached = deliveryImageHashCache.get(cacheKey)
+        if (cached && cached.size === st.size && cached.mtimeMs === st.mtimeMs) {
+          cached.usedAt = Date.now()
+          return cached.digest
+        }
+        const digest = createHash('sha256').update(`${actionType}\0`).update(readFileSync(file)).digest('hex')
+        deliveryImageHashCache.set(cacheKey, { digest, size: st.size, mtimeMs: st.mtimeMs, usedAt: Date.now() })
+        cleanupRuntimeTtlMaps()
+        return digest
+      } catch {
+        /* fall through to hash without cache */
+      }
     }
   }
   const hash = createHash('sha256').update(`${actionType}\0`)
@@ -3684,6 +3724,7 @@ async function runTask(taskId) {
           })
           continue
         }
+        if (blockMutationForTaskStop(taskId, item.id)) continue
         friendRequestMeta.v3 = resolution.v3
         friendRequestMeta.v4 = resolution.v4
         friendRequestMeta.credentialSource = resolution.credentialSource || ''
@@ -3754,6 +3795,7 @@ async function runTask(taskId) {
           }
         }
         if (item.action_type === 'ADD_FRIEND') {
+          if (blockMutationForTaskStop(taskId, item.id)) continue
           const reservation = reserveFriendDailyAttempt(record.accountWxid, item.id, item.target_key, settings.friendDailyLimit)
           if (!reservation.accepted) {
             const message = reservation.reason === 'ACCOUNT_REQUIRED' ? '未读取到登录微信号，为避免绕过上限已跳过' : '已达到本微信今日添加好友上限'
@@ -3829,6 +3871,7 @@ async function runTask(taskId) {
           continue
         }
         for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+          if (item.action_type === 'ADD_FRIEND' && blockMutationForTaskStop(taskId, item.id)) break
           const startedAt = Date.now()
           const { response, raw } = await requestApi(record, apiPath, request)
           const durationMs = Date.now() - startedAt
@@ -4225,6 +4268,8 @@ function cleanInstanceMaps(instanceId) {
   for (const [key] of qrInvitePreviewCache) { if (key.startsWith(`${instanceId}|`)) qrInvitePreviewCache.delete(key) }
   for (const [key] of friendCredentialInflight) { if (key.startsWith(`${instanceId}|`)) friendCredentialInflight.delete(key) }
   for (const [key] of qrMonitorRecentEvents) { if (key.startsWith(`${instanceId}|`)) qrMonitorRecentEvents.delete(key) }
+  for (const [key] of qrValidityCache) { if (key.startsWith(`${instanceId}|`)) qrValidityCache.delete(key) }
+  for (const [key] of qrMonitorSkipLogAt) { if (key.startsWith(`${instanceId}|`)) qrMonitorSkipLogAt.delete(key) }
   for (const [key] of kickedMutationDone) { if (key.includes(`|${instanceId}|`)) kickedMutationDone.delete(key) }
 }
 
@@ -4411,7 +4456,10 @@ function registerIpc() {
       }
       const startedAt = Date.now()
       const timeout = Math.min(Math.max(Number(timeoutMs) || 30000, 500), 30000)
-      const { response, raw } = await requestApi(record, apiPath, body, timeout)
+      const isReadApi = READ_API_WHITELIST.has(apiPath)
+      const { response, raw } = isReadApi
+        ? await readApi(record, apiPath, body, { timeout })
+        : await requestApi(record, apiPath, body, timeout)
       saveApiSample({ instanceId: id, sourceId, path: apiPath, request: body, response: raw, httpStatus: response.status, durationMs: Date.now() - startedAt })
       const operation = apiOperationLabel(apiPath)
       appLog(response.ok ? 'INFO' : 'ERROR', response.ok ? `${operation}完成` : `${operation}失败`, { instanceId: id, module: operation, operation, sourceId, path: apiPath, status: response.status, durationMs: Date.now() - startedAt })

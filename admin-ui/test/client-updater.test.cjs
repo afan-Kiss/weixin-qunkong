@@ -190,6 +190,8 @@ test('downloadRangeToFile rejects HTTP 200 with RANGE_UNSUPPORTED', () => {
   assert.match(src, /RANGE_UNSUPPORTED/)
   assert.match(src, /status === 200/)
   assert.match(src, /status !== 206/)
+  assert.match(src, /RANGE_INVALID_CONTENT_RANGE/)
+  assert.match(src, /RANGE_BODY_TOO_LARGE/)
   assert.match(src, /Content-Range mismatch/)
   assert.match(src, /Range body length mismatch/)
   assert.match(src, /content-range/)

@@ -14,7 +14,7 @@ declare global {
       callApi: <T = unknown>(id: string, path: string, body?: unknown, sourceId?: number, timeoutMs?: number) => Promise<ApiResult<T>>
       listEvents: (id: string) => Promise<Array<{ time: string; data: unknown }>>
       listMemberJoins: (filters?: { instanceIds?: string[]; roomIds?: string[]; limit?: number; sinceHours?: number }) => Promise<Array<{ id: number; instanceId: string; roomId: string; wxid: string; nickname: string; avatar: string; inviter: string; source: string; joinAt: string }>>
-      listFriendAddStatuses: (targetKeys: string[]) => Promise<Record<string, { status: string; error: string; taskStatus: string; updatedAt: string }>>
+      listFriendAddStatuses: (targetKeys: Array<string | { instanceId: string; targetKey: string }>) => Promise<Record<string, { status: string; error: string; taskStatus: string; updatedAt: string }>>
       getChatAddRule: () => Promise<{ enabled: boolean; instanceId: string; accountWxid?: string; roomIds: string[]; keywords: string[]; excludeText: string; updatedAt: string }>
       saveChatAddRule: (rule: unknown) => Promise<{ enabled: boolean; instanceId: string; accountWxid?: string; roomIds: string[]; keywords: string[]; excludeText: string; updatedAt: string }>
       listChatAddCandidates: (filters?: { status?: string; instanceId?: string; roomIds?: string[]; since?: string; limit?: number }) => Promise<Array<{ id: number; instanceId: string; roomId: string; senderWxid: string; nickname: string; messagePreview: string; matchedKeyword: string; status: string; createdAt: string }>>

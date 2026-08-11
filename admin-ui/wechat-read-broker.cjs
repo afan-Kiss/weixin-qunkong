@@ -11,6 +11,7 @@ const READ_API_WHITELIST = new Set([
   '/api/get_contact',
   '/api/update_single_profile',
   '/api/get_db_handle',
+  '/api/batch_getroom_cache',
 ])
 
 const DEFAULT_TTLS = {
@@ -18,6 +19,7 @@ const DEFAULT_TTLS = {
   '/api/get_all_room_detail': 300000,
   '/api/update_single_profile': 0,
   '/api/get_group_member_contact': 0,
+  '/api/batch_getroom_cache': 3000,
 }
 const DEFAULT_TTL = 2000
 

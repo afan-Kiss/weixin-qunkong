@@ -210,7 +210,17 @@ function removeInstance(id) { database().prepare('DELETE FROM wechat_instances W
 function removeInactiveInstancesByPorts(apiPort, tcpPort) { database().prepare('DELETE FROM wechat_instances WHERE api_port=? OR tcp_port=?').run(apiPort, tcpPort) }
 
 function saveLog(entry) {
-  database().prepare('INSERT INTO logs(time,level,instance_id,module,message,details_json) VALUES(?,?,?,?,?,?)').run(entry.time, entry.level, entry.instanceId ?? null, entry.module ?? null, entry.message, JSON.stringify(entry))
+  database().prepare('INSERT INTO logs(time,level,instance_id,module,message,details_json) VALUES(?,?,?,?,?,?)').run(entry.time, entry.level, entry.instanceId ?? null, entry.module ?? null, entry.message, JSON.stringify(entry.details ?? entry))
+  if (!saveLog._writes) saveLog._writes = 0
+  saveLog._writes += 1
+  if (saveLog._writes % 200 === 0) {
+    try {
+      const row = database().prepare('SELECT COUNT(*) AS c FROM logs').get()
+      if (Number(row?.c || 0) > 30000) {
+        database().prepare('DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY id ASC LIMIT 2000)').run()
+      }
+    } catch { /* ignore */ }
+  }
 }
 
 function listLogs(limit = 500) {
@@ -325,8 +335,49 @@ function listTaskItemDiagnostics(limit = 300) {
     LIMIT ?`).all(size)
 }
 
+const SENSITIVE_SAMPLE_KEY_RE = /^(v3|v4|encryptusername|encryptedusername|antispamticket|antispamticket|cookie|authorization|password|secret|token|accesstoken|refreshtoken)$/i
+
+function sanitizeApiSampleValue(value, depth = 0) {
+  if (depth > 8) return '[depth]'
+  if (value == null || typeof value !== 'object') return value
+  if (Array.isArray(value)) return value.map((item) => sanitizeApiSampleValue(item, depth + 1))
+  const out = {}
+  for (const [key, nested] of Object.entries(value)) {
+    if (SENSITIVE_SAMPLE_KEY_RE.test(String(key))) {
+      const text = String(nested ?? '')
+      out[key] = { redacted: true, prefix: text.slice(0, 4), length: text.length }
+    } else {
+      out[key] = sanitizeApiSampleValue(nested, depth + 1)
+    }
+  }
+  return out
+}
+
+let apiSampleWrites = 0
+const API_SAMPLE_MAX = 8000
+
 function saveApiSample(sample) {
-  database().prepare('INSERT INTO wechat_api_runtime_samples(instance_id,source_id,api_path,request_json,response_json,http_status,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?)').run(sample.instanceId, sample.sourceId ?? null, sample.path, JSON.stringify(sample.request ?? null), JSON.stringify(sample.response ?? null), sample.httpStatus ?? null, sample.durationMs ?? null, new Date().toISOString())
+  const sanitizedRequest = sanitizeApiSampleValue(sample.request ?? null)
+  const sanitizedResponse = sanitizeApiSampleValue(sample.response ?? null)
+  database().prepare('INSERT INTO wechat_api_runtime_samples(instance_id,source_id,api_path,request_json,response_json,http_status,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?)').run(
+    sample.instanceId,
+    sample.sourceId ?? null,
+    sample.path,
+    JSON.stringify(sanitizedRequest),
+    JSON.stringify(sanitizedResponse),
+    sample.httpStatus ?? null,
+    sample.durationMs ?? null,
+    new Date().toISOString(),
+  )
+  apiSampleWrites += 1
+  if (apiSampleWrites % 200 === 0) {
+    try {
+      const row = database().prepare('SELECT COUNT(*) AS c FROM wechat_api_runtime_samples').get()
+      if (Number(row?.c || 0) > API_SAMPLE_MAX) {
+        database().prepare('DELETE FROM wechat_api_runtime_samples WHERE id IN (SELECT id FROM wechat_api_runtime_samples ORDER BY id ASC LIMIT 1500)').run()
+      }
+    } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -457,18 +508,38 @@ function listMemberJoins(filters = {}) {
  * @param {string[]} targetKeys 成员 wxid 列表
  * @returns {Record<string, { status: string, error: string, taskStatus: string, updatedAt: string }>}
  */
-function listFriendAddStatuses(targetKeys = []) {
-  const keys = [...new Set((targetKeys || []).map(String).filter(Boolean))]
-  if (!keys.length) return {}
-  const rows = database().prepare(`SELECT ti.target_key AS targetKey, ti.status, COALESCE(ti.error,'') AS error,
+function listFriendAddStatuses(targets = []) {
+  const pairs = (targets || []).map((item) => {
+    if (item && typeof item === 'object') {
+      return { instanceId: String(item.instanceId || ''), targetKey: String(item.targetKey || item.wxid || '') }
+    }
+    const raw = String(item || '')
+    const sep = raw.indexOf('\0')
+    if (sep >= 0) return { instanceId: raw.slice(0, sep), targetKey: raw.slice(sep + 1) }
+    return { instanceId: '', targetKey: raw }
+  }).filter((item) => item.targetKey)
+  if (!pairs.length) return {}
+  const clauses = []
+  const params = []
+  for (const pair of pairs) {
+    if (pair.instanceId) {
+      clauses.push('(ti.instance_id=? AND ti.target_key=?)')
+      params.push(pair.instanceId, pair.targetKey)
+    } else {
+      clauses.push('ti.target_key=?')
+      params.push(pair.targetKey)
+    }
+  }
+  const rows = database().prepare(`SELECT ti.instance_id AS instanceId, ti.target_key AS targetKey, ti.status, COALESCE(ti.error,'') AS error,
       t.status AS taskStatus, COALESCE(ti.finished_at, ti.started_at, t.updated_at) AS updatedAt
     FROM task_items ti JOIN tasks t ON t.id=ti.task_id
-    WHERE ti.action_type='ADD_FRIEND' AND ti.target_key IN (${keys.map(() => '?').join(',')})
-    ORDER BY COALESCE(ti.finished_at, ti.started_at, t.updated_at) DESC`).all(...keys)
+    WHERE ti.action_type='ADD_FRIEND' AND (${clauses.join(' OR ')})
+    ORDER BY COALESCE(ti.finished_at, ti.started_at, t.updated_at) DESC`).all(...params)
   const result = {}
   for (const row of rows) {
-    if (result[row.targetKey]) continue
-    result[row.targetKey] = { status: String(row.status || ''), error: String(row.error || ''), taskStatus: String(row.taskStatus || ''), updatedAt: String(row.updatedAt || '') }
+    const key = row.instanceId ? `${row.instanceId}\0${row.targetKey}` : String(row.targetKey)
+    if (result[key]) continue
+    result[key] = { status: String(row.status || ''), error: String(row.error || ''), taskStatus: String(row.taskStatus || ''), updatedAt: String(row.updatedAt || '') }
   }
   return result
 }
@@ -1538,7 +1609,7 @@ function listOwnedChatrooms(instanceId) {
 
 module.exports = {
   initStorage, database, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts,
-  saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, recordMemberJoin, listMemberJoins, listFriendAddStatuses,
+  saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, sanitizeApiSampleValue, saveEvent, listMessageEventsForKickScan, recordMemberJoin, listMemberJoins, listFriendAddStatuses,
   createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks,
   repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent,
   hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType,
