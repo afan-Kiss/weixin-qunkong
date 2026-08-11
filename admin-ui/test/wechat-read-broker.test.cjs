@@ -1,7 +1,14 @@
 'use strict'
 const { describe, it, beforeEach } = require('node:test')
 const assert = require('node:assert/strict')
-const { requestWechatRead, clearInstanceCache, getReadBrokerStats, resetAllStats, invalidateInstanceApi, stopCleanupTimer } = require('../electron/wechat-read-broker.cjs')
+const { requestWechatRead, clearInstanceCache, getReadBrokerStats, resetAllStats, invalidateInstanceApi, stopCleanupTimer, getGeneration } = require('../electron/wechat-read-broker.cjs')
+
+function createDeferred() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
 
 function makeRecord(id) { return { id, apiPort: 19000 } }
 function okResult(data) { return { response: { ok: true, status: 200 }, raw: data || { data: [] } } }
@@ -326,6 +333,108 @@ describe('resolveFriendProfileCredentials request budget', () => {
 })
 
 const test = require('node:test')
+
+test('generation race A: stale inflight must not delete new entry; C coalesces to B', async () => {
+  resetAllStats()
+  stopCleanupTimer()
+  clearInstanceCache('instance-1')
+
+  let realCalls = 0
+  let callIndex = 0
+  const deferredA = createDeferred()
+  const deferredB = createDeferred()
+  const mockRequestApi = async () => {
+    realCalls += 1
+    const idx = callIndex
+    callIndex += 1
+    if (idx === 0) return deferredA.promise
+    if (idx === 1) return deferredB.promise
+    throw new Error(`unexpected extra real request #${idx + 1}`)
+  }
+
+  const record = { id: 'instance-1' }
+  const apiPath = '/api/get_chatroom_list'
+  const body = {}
+
+  const pA = requestWechatRead(record, apiPath, body, { requestApiFn: mockRequestApi })
+  assert.equal(realCalls, 1)
+
+  clearInstanceCache('instance-1')
+  assert.ok(getGeneration('instance-1') >= 1)
+
+  const pB = requestWechatRead(record, apiPath, body, { requestApiFn: mockRequestApi })
+  assert.equal(realCalls, 2)
+
+  deferredA.resolve({ response: { ok: true }, data: { rooms: ['OLD'] } })
+  await pA
+
+  const pC = requestWechatRead(record, apiPath, body, { requestApiFn: mockRequestApi })
+  assert.equal(realCalls, 2, 'C must coalesce to B, not start a third real request')
+
+  deferredB.resolve({ response: { ok: true }, data: { rooms: ['NEW'] } })
+  const rB = await pB
+  const rC = await pC
+  assert.deepEqual(rB.data.rooms, ['NEW'])
+  assert.deepEqual(rC.data.rooms, ['NEW'])
+
+  const rFinal = await requestWechatRead(record, apiPath, body, { requestApiFn: mockRequestApi })
+  assert.deepEqual(rFinal.data.rooms, ['NEW'], 'must not serve OLD from cache')
+  assert.equal(realCalls, 2)
+})
+
+test('generation race B: stale success after account switch must not write cache', async () => {
+  resetAllStats()
+  stopCleanupTimer()
+  clearInstanceCache('inst-b')
+
+  const deferred = createDeferred()
+  const mockRequestApi = async () => deferred.promise
+  const record = { id: 'inst-b' }
+
+  const pA = requestWechatRead(record, '/api/get_chatroom_list', {}, { requestApiFn: mockRequestApi })
+  clearInstanceCache('inst-b')
+  deferred.resolve({ response: { ok: true }, data: { tag: 'OLD' } })
+  await pA
+
+  let gotFresh = false
+  const freshMock = async () => {
+    gotFresh = true
+    return { response: { ok: true }, data: { tag: 'NEW' } }
+  }
+  const r = await requestWechatRead(record, '/api/get_chatroom_list', {}, { requestApiFn: freshMock })
+  assert.ok(gotFresh, 'must not hit stale cache from OLD generation')
+  assert.equal(r.data.tag, 'NEW')
+})
+
+test('generation race C: stale reject must not delete new inflight', async () => {
+  resetAllStats()
+  stopCleanupTimer()
+  clearInstanceCache('inst-c')
+
+  const deferredA = createDeferred()
+  const deferredB = createDeferred()
+  let callIndex = 0
+  const mockRequestApi = async () => {
+    const idx = callIndex
+    callIndex += 1
+    if (idx === 0) return deferredA.promise
+    return deferredB.promise
+  }
+  const record = { id: 'inst-c' }
+
+  const pA = requestWechatRead(record, '/api/get_chatroom_list', {}, { requestApiFn: mockRequestApi })
+  clearInstanceCache('inst-c')
+  const pB = requestWechatRead(record, '/api/get_chatroom_list', {}, { requestApiFn: mockRequestApi })
+  const pC = requestWechatRead(record, '/api/get_chatroom_list', {}, { requestApiFn: mockRequestApi })
+  assert.equal(callIndex, 2)
+
+  deferredA.reject(new Error('OLD_FAIL'))
+  await assert.rejects(pA, /OLD_FAIL/)
+
+  deferredB.resolve({ response: { ok: true }, data: { ok: true } })
+  await pB
+  await pC
+})
 
 test('account switch clears all instance cache — new wxid gets fresh data', async () => {
   resetAllStats()

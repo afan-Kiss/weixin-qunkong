@@ -167,6 +167,24 @@ const friendCredentialInflight = new Map()
 /** @type {Map<string, number>} key: instanceId|roomId|messageId → timestamp of last enqueue */
 const qrMonitorRecentEvents = new Map()
 const QR_MONITOR_EVENT_DEDUP_TTL_MS = 90000
+const { cleanupRuntimeTtlMaps: sweepRuntimeTtlMaps } = require('./runtime-ttl-cleanup.cjs')
+const RUNTIME_CACHE_CLEANUP_INTERVAL_MS = 60000
+let runtimeCacheCleanupTimer = null
+
+function cleanupRuntimeTtlMaps(now = Date.now()) {
+  sweepRuntimeTtlMaps({
+    qrInvitePreviewCache,
+    qrMonitorRecentEvents,
+    QR_MONITOR_EVENT_DEDUP_TTL_MS,
+  }, now)
+}
+
+function startRuntimeCacheCleanupTimer() {
+  if (runtimeCacheCleanupTimer) return
+  runtimeCacheCleanupTimer = setInterval(() => cleanupRuntimeTtlMaps(), RUNTIME_CACHE_CLEANUP_INTERVAL_MS)
+  if (typeof runtimeCacheCleanupTimer.unref === 'function') runtimeCacheCleanupTimer.unref()
+}
+startRuntimeCacheCleanupTimer()
 
 /** per taskId+instanceId+roomId mutation tracking for kicked group cleanup */
 const kickedMutationDone = new Map()
@@ -2190,7 +2208,13 @@ async function handleQrMonitorEvent(record, event) {
   if (msgId) {
     const dedupKey = `${record.id}|${room.roomId}|${msgId}`
     const lastEnqueue = qrMonitorRecentEvents.get(dedupKey) || 0
-    if (Date.now() - lastEnqueue < QR_MONITOR_EVENT_DEDUP_TTL_MS) return
+    if (lastEnqueue) {
+      if (Date.now() - lastEnqueue >= QR_MONITOR_EVENT_DEDUP_TTL_MS) {
+        qrMonitorRecentEvents.delete(dedupKey)
+      } else {
+        return
+      }
+    }
     qrMonitorRecentEvents.set(dedupKey, Date.now())
   }
   void enqueueQrMonitorJob(record.id, () => processQrMonitorImage(record, room, event, type))
@@ -2498,7 +2522,13 @@ async function fetchInvitePreviewCached(record, url) {
   if (!sourceUrl) return fetchInvitePreviewReal(record, url)
   const key = `${record.id}|${normalizeQrText(sourceUrl)}`
   const cached = qrInvitePreviewCache.get(key)
-  if (cached && Date.now() < cached.expiresAt) return { ...cached.preview }
+  if (cached) {
+    if (Date.now() >= cached.expiresAt) {
+      qrInvitePreviewCache.delete(key)
+    } else {
+      return { ...cached.preview }
+    }
+  }
   const existing = qrInvitePreviewInflight.get(key)
   if (existing) return existing.promise
   const promise = fetchInvitePreviewReal(record, url).then((result) => {
@@ -5154,6 +5184,10 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   quitting = true
   closeSplashWindow()
+  if (runtimeCacheCleanupTimer) {
+    clearInterval(runtimeCacheCleanupTimer)
+    runtimeCacheCleanupTimer = null
+  }
   try { stopUpdateScheduler() } catch {}
   stopRemoteAgent()
   tray?.destroy()

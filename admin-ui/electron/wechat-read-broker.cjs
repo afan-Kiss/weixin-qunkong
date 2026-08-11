@@ -26,12 +26,24 @@ const DEFAULT_TIMEOUTS = {
 }
 const DEFAULT_TIMEOUT = 30000
 
-// instanceId|apiPath|bodyHash → { promise }
+// instanceId|apiPath|bodyHash → { promise, generation }
 const inflight = new Map()
 // instanceId|apiPath|bodyHash → { result, expiresAt }
 const cache = new Map()
 // instanceId → { realRequests, coalescedHits, cacheHits }
 const stats = new Map()
+// instanceId → monotonic generation (survives clearInstanceCache)
+const generations = new Map()
+
+function getGeneration(instanceId) {
+  return generations.get(instanceId) || 0
+}
+
+function bumpGeneration(instanceId) {
+  const next = getGeneration(instanceId) + 1
+  generations.set(instanceId, next)
+  return next
+}
 
 function stableBodyHash(body) {
   if (!body || typeof body !== 'object' || !Object.keys(body).length) return '{}'
@@ -80,24 +92,32 @@ async function requestWechatRead(record, apiPath, body, options = {}) {
 
   // Real request
   s.realRequests += 1
-  const promise = requestApiFn(record, apiPath, body, timeout)
+  const requestGeneration = getGeneration(instanceId)
+  const entry = { promise: null, generation: requestGeneration }
+
+  entry.promise = requestApiFn(record, apiPath, body, timeout)
     .then((result) => {
-      inflight.delete(key)
-      if (result?.response?.ok) {
+      if (inflight.get(key) === entry) {
+        inflight.delete(key)
+      }
+      if (result?.response?.ok && requestGeneration === getGeneration(instanceId)) {
         cache.set(key, { result, expiresAt: Date.now() + ttl })
       }
       return result
     })
     .catch((err) => {
-      inflight.delete(key)
+      if (inflight.get(key) === entry) {
+        inflight.delete(key)
+      }
       throw err
     })
 
-  inflight.set(key, { promise })
-  return promise
+  inflight.set(key, entry)
+  return entry.promise
 }
 
 function clearInstanceCache(instanceId) {
+  bumpGeneration(instanceId)
   const prefix = `${instanceId}|`
   for (const key of [...inflight.keys()]) {
     if (key.startsWith(prefix)) inflight.delete(key)
@@ -149,4 +169,6 @@ module.exports = {
   resetAllStats,
   READ_API_WHITELIST,
   stopCleanupTimer,
+  getGeneration,
+  bumpGeneration,
 }
