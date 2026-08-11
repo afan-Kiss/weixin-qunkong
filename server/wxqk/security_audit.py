@@ -55,7 +55,7 @@ def emit(
 
 
 def prune_security_audit(*, retention_days: float = 90, max_rows: int = 500_000) -> dict[str, int]:
-    """Drop old audit rows; cap total row count."""
+    """Drop old audit rows; cap total row count via subquery LIMIT (bounded binds)."""
     cutoff = sdb.now_ts() - float(retention_days) * 86400.0
     deleted = 0
     with sdb.transaction():
@@ -68,22 +68,16 @@ def prune_security_audit(*, retention_days: float = 90, max_rows: int = 500_000)
         count = int(conn.execute("SELECT COUNT(*) FROM security_audit").fetchone()[0])
         if count > int(max_rows):
             excess = count - int(max_rows)
-            ids = [
-                r[0]
-                for r in conn.execute(
-                    """
+            cur2 = conn.execute(
+                """
+                DELETE FROM security_audit
+                WHERE event_id IN (
                     SELECT event_id FROM security_audit
                     ORDER BY timestamp ASC
                     LIMIT ?
-                    """,
-                    (excess,),
-                ).fetchall()
-            ]
-            if ids:
-                placeholders = ",".join("?" * len(ids))
-                cur2 = conn.execute(
-                    f"DELETE FROM security_audit WHERE event_id IN ({placeholders})",
-                    ids,
                 )
-                deleted += int(cur2.rowcount or 0)
+                """,
+                (excess,),
+            )
+            deleted += int(cur2.rowcount or 0)
     return {"deleted": deleted}

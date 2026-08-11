@@ -89,7 +89,13 @@ function initStorage(userDataPath) {
       matched_keyword TEXT,
       status TEXT NOT NULL DEFAULT 'PENDING',
       created_at TEXT NOT NULL,
-      UNIQUE(instance_id, sender_wxid)
+      source_room_id TEXT NOT NULL,
+      source_room_name TEXT,
+      source_instance_port INTEGER,
+      account_wxid TEXT,
+      sender_v3 TEXT,
+      received_at TEXT NOT NULL,
+      UNIQUE(instance_id, sender_wxid, source_room_id)
     );
     CREATE TABLE IF NOT EXISTS kicked_group_cleanup (
       instance_id TEXT NOT NULL,
@@ -120,9 +126,9 @@ function initStorage(userDataPath) {
       PRIMARY KEY(account_wxid, room_id)
     );
   `)
+  // 1) base tables created above
+  // 2) legacy structural migrations（字段补齐 / 旧表重建）
   migrateDirectoryOwnership(db)
-  const { runStorageSchemaMigrations } = require('./storage-schema-migrations.cjs')
-  runStorageSchemaMigrations(db)
   // 历史已确认清理的被踢群，迁移进永久屏蔽表（按微信号，重启实例仍生效）
   try {
     db.prepare(`INSERT OR IGNORE INTO blocked_chatrooms(account_wxid,room_id,room_name,reason,evidence,source_instance_id,created_at,updated_at)
@@ -173,6 +179,12 @@ function initStorage(userDataPath) {
         SELECT id,instance_id,room_id,sender_wxid,nickname,message_preview,matched_keyword,status,created_at,room_id,created_at FROM chat_add_candidates_legacy;
       DROP TABLE chat_add_candidates_legacy;
     `)
+  } else {
+    if (!candidateColumns.has('source_room_name')) db.exec('ALTER TABLE chat_add_candidates ADD COLUMN source_room_name TEXT')
+    if (!candidateColumns.has('source_instance_port')) db.exec('ALTER TABLE chat_add_candidates ADD COLUMN source_instance_port INTEGER')
+    if (!candidateColumns.has('account_wxid')) db.exec('ALTER TABLE chat_add_candidates ADD COLUMN account_wxid TEXT')
+    if (!candidateColumns.has('sender_v3')) db.exec('ALTER TABLE chat_add_candidates ADD COLUMN sender_v3 TEXT')
+    if (!candidateColumns.has('received_at')) db.exec("ALTER TABLE chat_add_candidates ADD COLUMN received_at TEXT NOT NULL DEFAULT ''")
   }
   db.exec(`INSERT OR IGNORE INTO friend_target_history(account_key,target_id,first_task_id,first_instance_id,created_at)
     SELECT COALESCE(NULLIF(w.account_wxid,''),'instance:' || ti.instance_id),ti.target_key,ti.task_id,ti.instance_id,COALESCE(ti.started_at,t.created_at)
@@ -182,6 +194,9 @@ function initStorage(userDataPath) {
     SELECT ti.id,w.account_wxid,date(COALESCE(ti.started_at,ti.finished_at),'localtime'),ti.target_key,COALESCE(ti.started_at,ti.finished_at)
     FROM task_items ti JOIN wechat_instances w ON w.id=ti.instance_id
     WHERE ti.action_type='ADD_FRIEND' AND NULLIF(w.account_wxid,'') IS NOT NULL AND (ti.started_at IS NOT NULL OR ti.finished_at IS NOT NULL)`)
+  // 3) final schema / index migrations（必须在字段补齐之后，保证新装与升级 schema 一致）
+  const { runStorageSchemaMigrations } = require('./storage-schema-migrations.cjs')
+  runStorageSchemaMigrations(db)
   return db
 }
 
@@ -1306,18 +1321,43 @@ function upsertChatAddCandidate(hit) {
   const sourceInstancePort = Number(hit.sourceInstancePort) || null
   const accountWxid = String(hit.accountWxid || '')
   const senderV3 = String(hit.senderV3 || '')
-  const existing = database().prepare('SELECT id, status FROM chat_add_candidates WHERE instance_id=? AND sender_wxid=? AND source_room_id=?').get(instanceId, senderWxid, roomId)
+  let existing = null
+  if (accountWxid) {
+    existing = database().prepare(
+      "SELECT id, status FROM chat_add_candidates WHERE account_wxid=? AND sender_wxid=? AND source_room_id=? AND account_wxid!=''",
+    ).get(accountWxid, senderWxid, roomId)
+  }
+  if (!existing) {
+    existing = database().prepare('SELECT id, status FROM chat_add_candidates WHERE instance_id=? AND sender_wxid=? AND source_room_id=?').get(instanceId, senderWxid, roomId)
+  }
   if (existing) {
     // 已入过任务的候选仍可刷新消息，并回到待创建，允许再次创建同一任务
-    database().prepare(`UPDATE chat_add_candidates SET room_id=?, nickname=?, message_preview=?, matched_keyword=?, status='PENDING', created_at=?,
+    database().prepare(`UPDATE chat_add_candidates SET instance_id=?, room_id=?, nickname=?, message_preview=?, matched_keyword=?, status='PENDING', created_at=?,
       source_room_name=?,source_instance_port=?,account_wxid=?,sender_v3=?,received_at=? WHERE id=?`)
-      .run(roomId, nickname || null, messagePreview || null, matchedKeyword || null, now, sourceRoomName || null, sourceInstancePort, accountWxid || null, senderV3 || null, now, existing.id)
+      .run(instanceId, roomId, nickname || null, messagePreview || null, matchedKeyword || null, now, sourceRoomName || null, sourceInstancePort, accountWxid || null, senderV3 || null, now, existing.id)
     return { accepted: true, id: existing.id }
   }
-  const result = database().prepare(`INSERT INTO chat_add_candidates(instance_id,room_id,sender_wxid,nickname,message_preview,matched_keyword,status,created_at,
-    source_room_id,source_room_name,source_instance_port,account_wxid,sender_v3,received_at) VALUES(?,?,?,?,?,?, 'PENDING', ?,?,?,?,?,?,?)`)
-    .run(instanceId, roomId, senderWxid, nickname || null, messagePreview || null, matchedKeyword || null, now, roomId, sourceRoomName || null, sourceInstancePort, accountWxid || null, senderV3 || null, now)
-  return { accepted: true, id: Number(result.lastInsertRowid) }
+  try {
+    const result = database().prepare(`INSERT INTO chat_add_candidates(instance_id,room_id,sender_wxid,nickname,message_preview,matched_keyword,status,created_at,
+      source_room_id,source_room_name,source_instance_port,account_wxid,sender_v3,received_at) VALUES(?,?,?,?,?,?, 'PENDING', ?,?,?,?,?,?,?)`)
+      .run(instanceId, roomId, senderWxid, nickname || null, messagePreview || null, matchedKeyword || null, now, roomId, sourceRoomName || null, sourceInstancePort, accountWxid || null, senderV3 || null, now)
+    return { accepted: true, id: Number(result.lastInsertRowid) }
+  } catch (error) {
+    const msg = String(error?.message || error || '')
+    if (!/UNIQUE/i.test(msg)) throw error
+    const raced = accountWxid
+      ? database().prepare(
+        "SELECT id FROM chat_add_candidates WHERE account_wxid=? AND sender_wxid=? AND source_room_id=? AND account_wxid!=''",
+      ).get(accountWxid, senderWxid, roomId)
+      : database().prepare('SELECT id FROM chat_add_candidates WHERE instance_id=? AND sender_wxid=? AND source_room_id=?').get(instanceId, senderWxid, roomId)
+    if (raced?.id) {
+      database().prepare(`UPDATE chat_add_candidates SET instance_id=?, room_id=?, nickname=?, message_preview=?, matched_keyword=?, status='PENDING', created_at=?,
+        source_room_name=?,source_instance_port=?,account_wxid=?,sender_v3=?,received_at=? WHERE id=?`)
+        .run(instanceId, roomId, nickname || null, messagePreview || null, matchedKeyword || null, now, sourceRoomName || null, sourceInstancePort, accountWxid || null, senderV3 || null, now, raced.id)
+      return { accepted: true, id: raced.id }
+    }
+    return { accepted: false, reason: 'UNIQUE_CONFLICT' }
+  }
 }
 
 /**

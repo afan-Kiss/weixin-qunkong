@@ -4372,6 +4372,35 @@ def require_client_id(raw: Any) -> tuple[str | None, dict[str, Any] | None]:
     return cid, None
 
 
+def _run_security_retention_once() -> None:
+    """Hourly light prune for device_commands + security_audit (never per-request)."""
+    try:
+        import command_queue as cq
+        import security_audit as sa
+        out_cmd = cq.prune_terminal_commands()
+        out_audit = sa.prune_security_audit()
+        print(
+            f"[security-retention] commands_deleted={out_cmd.get('deleted', 0)} "
+            f"audit_deleted={out_audit.get('deleted', 0)}",
+            flush=True,
+        )
+    except Exception as e:  # pragma: no cover
+        print(f"[security-retention] failed: {e}", flush=True)
+
+
+def start_security_retention_timer(*, interval_sec: float = 3600.0) -> None:
+    """Daemon timer: first run after 60s, then every interval_sec (default 1h)."""
+
+    def _loop() -> None:
+        time.sleep(60.0)
+        while True:
+            _run_security_retention_once()
+            time.sleep(max(300.0, float(interval_sec)))
+
+    t = threading.Thread(target=_loop, name="security-retention", daemon=True)
+    t.start()
+
+
 def main() -> None:
     if not SITE_PASSWORD:
         raise SystemExit(
@@ -4381,6 +4410,7 @@ def main() -> None:
     ensure_dirs()
     init_analytics_migrate()
     load_policy(force=True)
+    start_security_retention_timer(interval_sec=3600.0)
     try:
         from analytics_versions import (
             ANALYTICS_ALGORITHM_VERSION,

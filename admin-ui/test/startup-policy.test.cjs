@@ -9,9 +9,15 @@ test('app startup shows UI before restoring WeChat sessions', () => {
 
   assert.ok(readyBlock.includes('createWindow()'))
   assert.ok(readyBlock.includes('showMainWindow()'))
-  assert.ok(readyBlock.includes('restoreInstances()'))
+  assert.ok(readyBlock.includes('restoreInstancesThenResumeQueuedTasks()') || readyBlock.includes('restoreInstances()'))
   // 先显示界面，再恢复实例，避免卡在网络/微信探测导致“有进程无窗口”
-  assert.ok(readyBlock.indexOf('createWindow()') < readyBlock.indexOf('restoreInstances()'))
+  const restorePos = Math.min(
+    ...['restoreInstancesThenResumeQueuedTasks()', 'restoreInstances()']
+      .map((token) => readyBlock.indexOf(token))
+      .filter((i) => i >= 0),
+  )
+  assert.ok(readyBlock.indexOf('createWindow()') < restorePos)
+  assert.ok(readyBlock.includes('resumeQueuedTasks') || readyBlock.includes('restoreInstancesThenResumeQueuedTasks'))
   assert.equal(readyBlock.includes('enqueueWechatInstanceStart()'), false)
   assert.doesNotMatch(source, /autoStart/)
   assert.match(source, /disableHardwareAcceleration/)

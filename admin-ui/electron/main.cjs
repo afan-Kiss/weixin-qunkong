@@ -21,6 +21,11 @@ const { resolveFriendProfileCredentials } = require('./friend-credential-resolve
 const { requestWechatRead, clearInstanceCache, invalidateInstanceApi, getReadBrokerStats, resetAllStats, READ_API_WHITELIST } = require('./wechat-read-broker.cjs')
 const { runFriendCredentialDiagnostic } = require('./friend-credential-diagnostic.cjs')
 const { resolveTaskItemInstance } = require('./task-instance-resolve.cjs')
+const {
+  waitForTaskInstance,
+  TASK_INSTANCE_WAIT_TIMEOUT_MS,
+  TASK_INSTANCE_WAIT_INTERVAL_MS,
+} = require('./task-instance-wait.cjs')
 const { resolveIpcApiTimeout } = require('./ipc-api-timeout.cjs')
 const { buildHistoryImagePageSql } = require('./qr-history-pagination.cjs')
 const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
@@ -3809,7 +3814,13 @@ async function runTask(taskId) {
         setTaskItemResult(item.id, 'UNSAFE_RESUME', null, '暂停或中断时该项结果不确定，为避免重复操作已跳过')
         continue
       }
-      const resolved = resolveTaskItemInstance(item, instances)
+      const resolved = await resolveTaskItemInstanceWithWait(taskId, item)
+      if (resolved.stopped) {
+        if (resolved.reason === 'PAUSED' || String(listTasks().find((t) => t.id === taskId)?.status || '') === 'PAUSED') {
+          setTaskStatus(taskId, 'PAUSED')
+        }
+        break
+      }
       if (!resolved.ok) {
         setTaskItemResult(item.id, 'FAILED', null, resolved.reason || '实例不在线')
         continue
@@ -4583,6 +4594,56 @@ async function restoreInstances() {
   }
 }
 
+function resumeQueuedTasks() {
+  for (const task of listTasks().filter((item) => item.status === 'QUEUED')) {
+    setImmediate(() => runTask(task.id))
+  }
+}
+
+/**
+ * 启动/登录后：先恢复实例，再恢复 QUEUED 任务，避免抢跑 FAILED。
+ */
+async function restoreInstancesThenResumeQueuedTasks() {
+  await restoreInstances()
+  migrateQrMonitorAccountWxids()
+  pruneStoppedRuntimeInstances()
+  resumeQueuedTasks()
+}
+
+/**
+ * 解析任务执行微信；WAITING_INSTANCE 时有上限等待，不把 item 提前 FAILED。
+ * @param {string} taskId
+ * @param {object} item
+ */
+async function resolveTaskItemInstanceWithWait(taskId, item) {
+  const first = resolveTaskItemInstance(item, instances)
+  if (first.ok) return { ...first, stopped: false }
+  const accountWxid = String(item?.account_wxid || item?.accountWxid || '').trim()
+  if (first.code === 'WAITING_INSTANCE' && accountWxid) {
+    appLog('INFO', '等待执行微信上线', {
+      taskId,
+      itemId: item.id,
+      accountWxid,
+      instanceId: item.instance_id,
+      waitTimeoutMs: TASK_INSTANCE_WAIT_TIMEOUT_MS,
+    })
+    return waitForTaskInstance(item, {
+      getInstances: () => instances,
+      isStopRequested: () => isTaskStopRequested(taskId),
+      getTaskStatus: () => String(listTasks().find((t) => t.id === taskId)?.status || ''),
+      isRuntimeAllowed: () => runtimeAllowed,
+      timeoutMs: TASK_INSTANCE_WAIT_TIMEOUT_MS,
+      intervalMs: TASK_INSTANCE_WAIT_INTERVAL_MS,
+      onWaiting: () => {
+        appLog('INFO', '仍在等待执行微信上线', {
+          taskId, itemId: item.id, accountWxid, module: '任务执行',
+        })
+      },
+    })
+  }
+  return { ...first, stopped: false }
+}
+
 async function startWechatInstance() {
   let record
   try {
@@ -4686,8 +4747,9 @@ function registerIpc() {
     try {
       const account = await softwareAuth.login(username, password)
       if (instances.size === 0) {
-        await restoreInstances()
-        migrateQrMonitorAccountWxids()
+        await restoreInstancesThenResumeQueuedTasks()
+      } else {
+        resumeQueuedTasks()
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
       return { ok: true, account }
@@ -4697,8 +4759,9 @@ function registerIpc() {
     try {
       const account = await softwareAuth.register(username, password)
       if (instances.size === 0) {
-        await restoreInstances()
-        migrateQrMonitorAccountWxids()
+        await restoreInstancesThenResumeQueuedTasks()
+      } else {
+        resumeQueuedTasks()
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
       return { ok: true, account }
@@ -5529,13 +5592,11 @@ app.whenReady().then(async () => {
     // 账号校验走网络，绝不 await 挡住启动后续；超时也只影响恢复实例/远程桌面
     void softwareAuth.session().then((account) => {
       if (!account) return
-      restoreInstances().then(() => {
-        migrateQrMonitorAccountWxids()
-        pruneStoppedRuntimeInstances()
-      }).catch((error) => appLog('ERROR', '恢复微信实例失败', { error: rawErrorMessage(error) }))
-      for (const task of listTasks().filter((item) => item.status === 'QUEUED')) setImmediate(() => runTask(task.id))
+      // 远程 Agent 可并行；QUEUED 任务必须等 restoreInstances 完成后再恢复
       startRemoteAgent(remoteAgentOptions(account.username))
         .catch((error) => appLog('ERROR', '设备连接失败', { error: rawErrorMessage(error) }))
+      restoreInstancesThenResumeQueuedTasks()
+        .catch((error) => appLog('ERROR', '恢复微信实例失败', { error: rawErrorMessage(error) }))
     }).catch((error) => appLog('ERROR', '读取登录会话失败', { error: rawErrorMessage(error) }))
 
     app.on('activate', () => { showMainWindow() })

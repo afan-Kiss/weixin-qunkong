@@ -162,47 +162,13 @@ function migrateChatAddCandidatesAccountUnique(database) {
       return false
     }
   }
-  database.exec('BEGIN IMMEDIATE')
-  try {
-    database.exec(`
-      ALTER TABLE chat_add_candidates RENAME TO chat_add_candidates_legacy2;
-      CREATE TABLE chat_add_candidates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        instance_id TEXT NOT NULL,
-        room_id TEXT NOT NULL,
-        sender_wxid TEXT NOT NULL,
-        nickname TEXT,
-        message_preview TEXT,
-        matched_keyword TEXT,
-        status TEXT NOT NULL DEFAULT 'PENDING',
-        created_at TEXT NOT NULL,
-        source_room_id TEXT NOT NULL,
-        source_room_name TEXT,
-        source_instance_port INTEGER,
-        account_wxid TEXT,
-        sender_v3 TEXT,
-        received_at TEXT NOT NULL,
-        UNIQUE(instance_id, sender_wxid, source_room_id)
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_add_cand_account
-        ON chat_add_candidates(account_wxid, sender_wxid, source_room_id)
-        WHERE account_wxid IS NOT NULL AND account_wxid != '';
-      INSERT OR IGNORE INTO chat_add_candidates(
-        id, instance_id, room_id, sender_wxid, nickname, message_preview, matched_keyword, status, created_at,
-        source_room_id, source_room_name, source_instance_port, account_wxid, sender_v3, received_at
-      )
-      SELECT
-        id, instance_id, room_id, sender_wxid, nickname, message_preview, matched_keyword, status, created_at,
-        source_room_id, source_room_name, source_instance_port, account_wxid, sender_v3, received_at
-      FROM chat_add_candidates_legacy2;
-      DROP TABLE chat_add_candidates_legacy2;
-    `)
-    database.exec('COMMIT')
-    return true
-  } catch (error) {
-    database.exec('ROLLBACK')
-    throw error
-  }
+  // 仅补账号级 partial unique；保留表内 UNIQUE(instance_id,sender_wxid,source_room_id) 作空 account 回退
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_add_cand_account
+      ON chat_add_candidates(account_wxid, sender_wxid, source_room_id)
+      WHERE account_wxid IS NOT NULL AND account_wxid != '';
+  `)
+  return true
 }
 
 /**

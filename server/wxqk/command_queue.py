@@ -286,7 +286,7 @@ def peek_pending(device_id: str, limit: int = 20) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT * FROM device_commands
-            WHERE device_id=? AND status IN ('PENDING','DELIVERED') AND expires_at >= ?
+            WHERE device_id=? AND status IN ('PENDING','DELIVERED','RECEIVED') AND expires_at >= ?
             ORDER BY issued_at DESC LIMIT ?
             """,
             (cid, now, max(1, min(int(limit or 20), 100))),
@@ -347,7 +347,11 @@ def ack(
 
 
 def prune_terminal_commands(*, retention_days: float = 30, max_rows: int = 100_000) -> dict[str, int]:
-    """Drop old APPLIED/FAILED/EXPIRED rows; cap total terminal rows."""
+    """Drop old APPLIED/FAILED/EXPIRED rows; cap total terminal rows.
+
+    Excess rows are deleted via subquery LIMIT (single bind) — never expand
+    tens of thousands of placeholders.
+    """
     cutoff = sdb.now_ts() - float(retention_days) * 86400.0
     deleted = 0
     with sdb.transaction():
@@ -368,25 +372,19 @@ def prune_terminal_commands(*, retention_days: float = 30, max_rows: int = 100_0
         )
         if count > int(max_rows):
             excess = count - int(max_rows)
-            ids = [
-                r[0]
-                for r in conn.execute(
-                    """
+            cur2 = conn.execute(
+                """
+                DELETE FROM device_commands
+                WHERE command_id IN (
                     SELECT command_id FROM device_commands
                     WHERE status IN ('APPLIED','FAILED','EXPIRED')
                     ORDER BY COALESCE(applied_at, failed_at, expires_at, issued_at) ASC
                     LIMIT ?
-                    """,
-                    (excess,),
-                ).fetchall()
-            ]
-            if ids:
-                placeholders = ",".join("?" * len(ids))
-                cur2 = conn.execute(
-                    f"DELETE FROM device_commands WHERE command_id IN ({placeholders})",
-                    ids,
                 )
-                deleted += int(cur2.rowcount or 0)
+                """,
+                (excess,),
+            )
+            deleted += int(cur2.rowcount or 0)
     return {"deleted": deleted}
 
 

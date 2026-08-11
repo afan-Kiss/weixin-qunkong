@@ -30,7 +30,9 @@ function resolveTaskItemInstance(item, instanceMap) {
   }
 
   if (!accountWxid) {
-    if (!original) return { ok: false, code: 'MISSING', reason: '实例不在线' }
+    if (!original) {
+      return { ok: false, code: 'MISSING', reason: '历史任务缺少账号身份，无法安全恢复' }
+    }
     return { ok: false, code: 'OFFLINE', reason: '微信尚未登录' }
   }
 

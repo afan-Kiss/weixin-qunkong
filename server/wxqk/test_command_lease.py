@@ -156,6 +156,110 @@ class CommandLeaseTest(unittest.TestCase):
         out = self.cq.prune_terminal_commands(retention_days=30, max_rows=100_000)
         self.assertGreaterEqual(int(out.get("deleted") or 0), 1)
 
+    def test_prune_terminal_max_rows_subquery_no_placeholder_blast(self) -> None:
+        """Cap terminal rows with subquery LIMIT; active rows must survive."""
+        import inspect
+
+        src = inspect.getsource(self.cq.prune_terminal_commands)
+        self.assertNotIn('placeholders = ",".join', src)
+        self.assertIn("LIMIT ?", src)
+
+        conn = self.sdb.get_conn()
+        now = self.sdb.now_ts()
+        # bulk insert terminal rows
+        rows = []
+        for i in range(1500):
+            rows.append(
+                (
+                    f"cmd_term_{i}",
+                    "device_bulk",
+                    "REFRESH_POLICY",
+                    1,
+                    "{}",
+                    now - 10,
+                    now + 3600,
+                    "APPLIED",
+                    1,
+                    "",
+                    now - 10,
+                )
+            )
+        conn.executemany(
+            """
+            INSERT INTO device_commands(
+              command_id, device_id, command_type, policy_epoch,
+              payload_json, issued_at, expires_at, status, delivery_count,
+              server_signature, applied_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            rows,
+        )
+        # active rows that must not be pruned by max_rows
+        for i, st in enumerate(("PENDING", "DELIVERED", "RECEIVED")):
+            conn.execute(
+                """
+                INSERT INTO device_commands(
+                  command_id, device_id, command_type, policy_epoch,
+                  payload_json, issued_at, expires_at, status, delivery_count,
+                  server_signature
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    f"cmd_active_{i}",
+                    "device_bulk",
+                    "START_DESKTOP",
+                    1,
+                    "{}",
+                    now,
+                    now + 3600,
+                    st,
+                    0,
+                    "",
+                ),
+            )
+        conn.commit()
+        out = self.cq.prune_terminal_commands(retention_days=3650, max_rows=1000)
+        self.assertGreaterEqual(int(out.get("deleted") or 0), 500)
+        terminal = conn.execute(
+            "SELECT COUNT(*) FROM device_commands WHERE status IN ('APPLIED','FAILED','EXPIRED')"
+        ).fetchone()[0]
+        self.assertLessEqual(int(terminal), 1000)
+        active = conn.execute(
+            "SELECT COUNT(*) FROM device_commands WHERE status IN ('PENDING','DELIVERED','RECEIVED')"
+        ).fetchone()[0]
+        self.assertEqual(int(active), 3)
+
+    def test_peek_pending_includes_received(self) -> None:
+        cid = "device_peek_received"
+        enq = self.cq.enqueue(cid, "CHECK_CLIENT_UPDATE", {}, policy_epoch=1)
+        cmd_id = enq["commandId"]
+        self.cq.pop_next(cid)
+        self.cq.ack(cid, cmd_id, status="RECEIVED")
+        rows = self.cq.peek_pending(cid, limit=20)
+        ids = [r.get("commandId") for r in rows]
+        self.assertIn(cmd_id, ids)
+
+    def test_prune_security_audit_max_rows_subquery(self) -> None:
+        import inspect
+
+        src = inspect.getsource(self.sa.prune_security_audit)
+        self.assertNotIn('placeholders = ",".join', src)
+        self.assertIn("LIMIT ?", src)
+        conn = self.sdb.get_conn()
+        now = self.sdb.now_ts()
+        for i in range(200):
+            self.sa.emit("test.prune", device_id="d1", reason_code=f"r{i}", detail={"i": i})
+        # force older timestamps for half
+        conn.execute(
+            "UPDATE security_audit SET timestamp=? WHERE rowid <= 120",
+            (now - 10,),
+        )
+        conn.commit()
+        out = self.sa.prune_security_audit(retention_days=3650, max_rows=100)
+        self.assertGreaterEqual(int(out.get("deleted") or 0), 50)
+        count = conn.execute("SELECT COUNT(*) FROM security_audit").fetchone()[0]
+        self.assertLessEqual(int(count), 100)
+
 
 if __name__ == "__main__":
     unittest.main()
