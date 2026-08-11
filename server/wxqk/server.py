@@ -2510,8 +2510,10 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             start, end = 0, size - 1
                 length = max(0, end - start + 1) if size > 0 else 0
+                download_name = um.package_download_filename(DATA_DIR, build_id)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", um.content_disposition_attachment(download_name))
                 self.send_header("Accept-Ranges", "bytes")
                 self.send_header("Content-Length", str(length))
                 if status == 206:

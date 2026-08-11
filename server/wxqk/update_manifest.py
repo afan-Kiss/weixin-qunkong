@@ -425,6 +425,44 @@ def load_package_meta(data_dir: Path, build_id: str) -> dict[str, Any]:
         return {}
 
 
+def package_download_filename(data_dir: Path, build_id: str) -> str:
+    """Original display name for browser downloads (keeps .exe + Chinese product name)."""
+    bid = _safe_build_id(build_id)
+    if not bid:
+        return "package.exe"
+    meta = load_package_meta(data_dir, bid)
+    name = Path(str(meta.get("fileName") or "")).name.strip()
+    if not name:
+        try:
+            man = load_manifest(data_dir) or {}
+            if str(man.get("buildId") or "") == bid:
+                name = Path(str(man.get("fileName") or "")).name.strip()
+        except Exception:
+            name = ""
+    if not name:
+        name = bid + ".exe"
+    # Strip path tricks; force .exe so browsers don't save as bare buildId.
+    name = name.replace("\\", "/").split("/")[-1].strip() or (bid + ".exe")
+    if not name.lower().endswith(".exe"):
+        name = name + ".exe"
+    return name
+
+
+def content_disposition_attachment(filename: str) -> str:
+    """RFC 5987 Content-Disposition so Chinese names download correctly."""
+    from urllib.parse import quote
+
+    raw = Path(str(filename or "package.exe")).name.strip() or "package.exe"
+    if not raw.lower().endswith(".exe"):
+        raw = raw + ".exe"
+    # ASCII fallback for old browsers / broken proxies
+    ascii_name = "".join(ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in raw)
+    if not ascii_name.lower().endswith(".exe"):
+        ascii_name = (ascii_name or "package") + ".exe"
+    encoded = quote(raw, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+
+
 def store_package(data_dir: Path, build_id: str, file_name: str, blob: bytes) -> dict[str, Any]:
     bid = _safe_build_id(build_id)
     if not bid:
