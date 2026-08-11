@@ -1,5 +1,5 @@
 /**
- * 二维码监控群列表：合并 / 规范化（可单测）。
+ * 二维码监控群列表：合并 / 规范化 / 按 accountWxid 安全 rebind（可单测）。
  */
 
 /**
@@ -15,22 +15,24 @@ function monitorRoomKey(instanceId, roomId) {
 /**
  * 规范化监控群条目。
  * @param {unknown} room
- * @returns {{ instanceId: string, roomId: string, name: string } | null}
+ * @returns {{ instanceId: string, accountWxid: string, roomId: string, name: string } | null}
  */
 function normalizeMonitorRoom(room) {
   if (!room || typeof room !== 'object') return null
   const instanceId = String(room.instanceId || '').trim()
+  const accountWxid = String(room.accountWxid || '').trim()
   const roomId = String(room.roomId || '').trim()
   const name = String(room.name || '群聊').trim() || '群聊'
   if (!instanceId || !roomId.endsWith('@chatroom')) return null
-  return { instanceId, roomId, name }
+  return { instanceId, accountWxid, roomId, name }
 }
 
 /**
- * 将新群合并进已有监控列表（按 instanceId+roomId 去重；同 pair 更新 name）。
+ * 将新群合并进已有监控列表（按 instanceId+roomId 去重；同 pair 更新 name/accountWxid）。
+ * 若 incoming 带 accountWxid，且存在同 roomId 的 legacy（无 accountWxid）项，则用新项替换 legacy。
  * @param {unknown[]} existing
  * @param {unknown[]} incoming
- * @returns {{ rooms: Array<{ instanceId: string, roomId: string, name: string }>, added: Array<{ instanceId: string, roomId: string, name: string }> }}
+ * @returns {{ rooms: Array<{ instanceId: string, accountWxid: string, roomId: string, name: string }>, added: Array<{ instanceId: string, accountWxid: string, roomId: string, name: string }> }}
  */
 function mergeMonitorRooms(existing = [], incoming = []) {
   const map = new Map()
@@ -45,17 +47,69 @@ function mergeMonitorRooms(existing = [], incoming = []) {
     const key = monitorRoomKey(room.instanceId, room.roomId)
     const prev = map.get(key)
     if (!prev) {
+      // 替换同 roomId 且无 accountWxid 的 legacy orphan（仅当 incoming 有明确 accountWxid）
+      if (room.accountWxid) {
+        for (const [legacyKey, legacy] of [...map.entries()]) {
+          if (legacy.roomId === room.roomId && !legacy.accountWxid) {
+            map.delete(legacyKey)
+          }
+        }
+      }
       map.set(key, room)
       added.push(room)
       continue
     }
     map.set(key, {
       instanceId: prev.instanceId,
+      accountWxid: room.accountWxid || prev.accountWxid || '',
       roomId: prev.roomId,
       name: room.name && room.name !== '群聊' ? room.name : prev.name,
     })
   }
   return { rooms: [...map.values()], added }
+}
+
+/**
+ * 微信重启后：把同 accountWxid 的监控配置从旧 instanceId 迁到新 instanceId。
+ * @param {Array<{ instanceId: string, accountWxid?: string, roomId: string, name?: string }>} rooms
+ * @param {{ id: string, accountWxid?: string, status?: string }} record 当前 ONLINE 实例
+ * @param {Map<string, { status?: string, accountWxid?: string }>} instanceMap runtime instances
+ * @returns {{ rooms: Array, changed: boolean, rebound: number }}
+ */
+function rebindMonitorRoomsForAccount(rooms, record, instanceMap) {
+  const accountWxid = String(record?.accountWxid || '').trim()
+  const newId = String(record?.id || '').trim()
+  if (!accountWxid || !newId) return { rooms: Array.isArray(rooms) ? rooms : [], changed: false, rebound: 0 }
+  let rebound = 0
+  const next = []
+  for (const raw of Array.isArray(rooms) ? rooms : []) {
+    const room = normalizeMonitorRoom(raw)
+    if (!room) continue
+    let account = room.accountWxid
+    // 历史配置无 accountWxid：若旧 instance 仍在且账号已知，回填
+    if (!account) {
+      const owner = instanceMap?.get?.(room.instanceId)
+      if (owner?.accountWxid) account = String(owner.accountWxid)
+    }
+    if (account !== accountWxid || room.instanceId === newId) {
+      next.push({ ...room, accountWxid: account || room.accountWxid || '' })
+      continue
+    }
+    const oldOwner = instanceMap?.get?.(room.instanceId)
+    const oldStillOnline = oldOwner && String(oldOwner.status || '') === 'ONLINE'
+    if (oldStillOnline) {
+      next.push({ ...room, accountWxid: account })
+      continue
+    }
+    next.push({
+      instanceId: newId,
+      accountWxid: account,
+      roomId: room.roomId,
+      name: room.name,
+    })
+    rebound += 1
+  }
+  return { rooms: next, changed: rebound > 0, rebound }
 }
 
 /**
@@ -100,5 +154,6 @@ module.exports = {
   monitorRoomKey,
   normalizeMonitorRoom,
   mergeMonitorRooms,
+  rebindMonitorRoomsForAccount,
   extractRoomsFromApiRaw,
 }

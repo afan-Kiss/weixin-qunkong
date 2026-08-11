@@ -15,6 +15,7 @@ test('new instances start a fast login probe and status refresh does not depend 
   const refreshBody = page.slice(page.indexOf('async function refresh()'), page.indexOf('async function refreshDirectoryQuietly'))
   assert.doesNotMatch(refreshBody, /refreshDirectory/)
   assert.match(main, /startProbeLoop\(record, 2000\)/)
-  assert.match(main, /setTimeout\(\(\) => probeInstance\(record\), 1000\)/)
+  assert.match(main, /record\.firstProbeTimer = setTimeout/)
+  assert.match(main, /probeInstance\(record\)/)
   assert.match(main, /loggedIn \? 10000 : 2000/)
 })

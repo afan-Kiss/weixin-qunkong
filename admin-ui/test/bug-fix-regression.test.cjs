@@ -489,7 +489,9 @@ test('JSONL log rotation keeps bounded files and redacts secrets', () => {
       appendJsonlLog(dir, { level: 'INFO', message: `line-${i}`, details: { token: 'v4_SUPER_SECRET_VALUE' } }, { maxBytes: 512 })
     }
     const files = fs.readdirSync(dir).filter((name) => name.includes('wechat-control'))
-    assert.ok(files.length <= 5)
+    // main + .1 .. .5 when LOG_MAX_FILES=5
+    assert.ok(files.length <= 6)
+    assert.ok(files.includes('wechat-control.1.jsonl') || files.includes('wechat-control.jsonl'))
     const main = fs.readFileSync(path.join(dir, 'wechat-control.jsonl'), 'utf8')
     assert.doesNotMatch(main, /v4_SUPER_SECRET_VALUE/)
   } finally {

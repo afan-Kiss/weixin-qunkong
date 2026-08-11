@@ -8,6 +8,7 @@ test('directory refresh is keyed single-flight with shared cache and partial tol
   const preload = readFileSync(path.join(__dirname, '..', 'electron', 'preload.cjs'), 'utf8')
   const main = readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
   assert.match(store, /directoryRefreshInflight/)
+  assert.match(store, /directoryInstanceInflight/)
   assert.match(store, /directoryCommitChain/)
   assert.match(store, /commitDirectoryMerge/)
   assert.match(store, /activeDirectoryRefreshCount/)

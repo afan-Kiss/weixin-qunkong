@@ -9,6 +9,7 @@ test('normalizeMonitorRoom rejects invalid entries', () => {
   assert.equal(normalizeMonitorRoom({ instanceId: 'a', roomId: 'x' }), null)
   assert.deepEqual(normalizeMonitorRoom({ instanceId: 'a', roomId: '1@chatroom', name: '测试' }), {
     instanceId: 'a',
+    accountWxid: '',
     roomId: '1@chatroom',
     name: '测试',
   })

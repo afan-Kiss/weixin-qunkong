@@ -39,7 +39,18 @@ const {
   isShortGroupInviteUrl,
   isJoinApplicationPending,
 } = require('./qr-join.cjs')
-const { mergeMonitorRooms, extractRoomsFromApiRaw, monitorRoomKey } = require('./qr-monitor-rooms.cjs')
+const { mergeMonitorRooms, extractRoomsFromApiRaw, monitorRoomKey, rebindMonitorRoomsForAccount, normalizeMonitorRoom } = require('./qr-monitor-rooms.cjs')
+const { pruneDiagnosticReportFiles } = require('./diagnostic-file-prune.cjs')
+const {
+  RECENT_QR_HASH_TTL_MS,
+  RECENT_QR_HASH_MAX,
+  reserveRecentQrContentHash: reserveRecentQrHashInMap,
+  releaseRecentQrContentHash: releaseRecentQrHashInMap,
+} = require('./recent-qr-hash-cache.cjs')
+const {
+  pruneStoppedRuntimeInstances: pruneStoppedRuntimeInMap,
+  pruneStoppedRuntimeForAccount: pruneStoppedRuntimeForAccountInMap,
+} = require('./stopped-instance-prune.cjs')
 const { extractSelfKickedEvent, resolveSelfStillInMembers, canCleanupKickedRoom, isImmediateKickEvidence, isLeaveCallbackEvidence, kickHitFromHistoryMessage } = require('./kicked-group-cleanup.cjs')
 const { scrubLegacyCachesOnStartup } = require('./startup-cache-scrub.cjs')
 const { installServiceCertificateTrust } = require('./service-tls.cjs')
@@ -132,7 +143,9 @@ let qrMonitorConfig = { enabled: false, watchAll: false, rooms: [], outputDir: '
 /** instanceId+roomId → 监控群配置，150+ 群时 O(1) 命中 */
 let qrMonitorRoomByKey = new Map()
 /** 监控去重哈希缓存，避免每张图全表扫库 */
-let qrMonitorContentHashes = null
+let qrMonitorContentHashes = null // legacy unused; realtime uses recentQrContentHashes
+/** 实时监控内容哈希预约缓存（非全库加载）：hash → expiresAt */
+const recentQrContentHashes = new Map()
 /** 非监控群图片忽略日志节流：roomHint → 上次记录时间 */
 const qrMonitorSkipLogAt = new Map()
 /** 每微信实例的监控下载队列：有限并发，避免 150 群同时发图时排成长龙 */
@@ -193,6 +206,11 @@ function cleanupRuntimeTtlMaps(now = Date.now()) {
     deliveryImageHashCache,
     DELIVERY_IMAGE_HASH_TTL_MS,
     DELIVERY_IMAGE_HASH_MAX,
+    recentQrContentHashes,
+    RECENT_QR_HASH_TTL_MS,
+    RECENT_QR_HASH_MAX,
+    chatAddMissLogAt,
+    CHAT_ADD_MISS_LOG_TTL_MS: 600000,
   }, now)
   cleanupDiagnosticIdempotency(now)
 }
@@ -213,11 +231,53 @@ const kickedMutationDone = new Map()
 function rebuildQrMonitorRoomIndex() {
   const map = new Map()
   for (const room of Array.isArray(qrMonitorConfig.rooms) ? qrMonitorConfig.rooms : []) {
-    const instanceId = String(room?.instanceId || '').trim()
-    const roomId = String(room?.roomId || '').trim()
-    if (instanceId && roomId) map.set(monitorRoomKey(instanceId, roomId), room)
+    const normalized = normalizeMonitorRoom(room)
+    if (normalized) map.set(monitorRoomKey(normalized.instanceId, normalized.roomId), normalized)
   }
   qrMonitorRoomByKey = map
+}
+
+/**
+ * 微信 ONLINE 且 accountWxid 明确后：把同账号旧 instance 的监控配置迁到当前实例。
+ * @param {{ id: string, accountWxid?: string, status?: string }} record
+ * @returns {boolean}
+ */
+function rebindQrMonitorRoomsForInstance(record) {
+  if (!record?.id || !record?.accountWxid) return false
+  if (!Array.isArray(qrMonitorConfig.rooms) || !qrMonitorConfig.rooms.length) return false
+  const { rooms, changed, rebound } = rebindMonitorRoomsForAccount(qrMonitorConfig.rooms, record, instances)
+  if (!changed) return false
+  qrMonitorConfig = { ...qrMonitorConfig, rooms }
+  rebuildQrMonitorRoomIndex()
+  try { saveSetting('qrMonitor', qrMonitorConfig) } catch { /* ignore */ }
+  notifyQrMonitorRoomsChanged({ reason: 'instance-rebind', added: [] })
+  appLog('INFO', `群消息监控已绑定到新微信实例（${rebound} 个群）`, {
+    instanceId: record.id, module: '二维码监控', accountWxid: record.accountWxid, rebound,
+  })
+  return true
+}
+
+/**
+ * 启动时回填历史 monitor rooms 的 accountWxid（若旧 instance 仍在）。
+ */
+function migrateQrMonitorAccountWxids() {
+  if (!Array.isArray(qrMonitorConfig.rooms) || !qrMonitorConfig.rooms.length) return
+  let changed = false
+  const rooms = qrMonitorConfig.rooms.map((room) => {
+    const normalized = normalizeMonitorRoom(room)
+    if (!normalized) return room
+    if (normalized.accountWxid) return normalized
+    const owner = instances.get(normalized.instanceId)
+    if (owner?.accountWxid) {
+      changed = true
+      return { ...normalized, accountWxid: String(owner.accountWxid) }
+    }
+    return normalized
+  })
+  if (!changed) return
+  qrMonitorConfig = { ...qrMonitorConfig, rooms }
+  rebuildQrMonitorRoomIndex()
+  try { saveSetting('qrMonitor', qrMonitorConfig) } catch { /* ignore */ }
 }
 
 /**
@@ -315,7 +375,12 @@ async function syncQrMonitorRoomsFromWechat(reason = '同步群列表') {
         }
         for (const row of rows) {
           if (isChatroomBlockedForInstance(record.id, row.roomId)) continue
-          incoming.push({ instanceId: record.id, roomId: row.roomId, name: row.name })
+          incoming.push({
+            instanceId: record.id,
+            accountWxid: String(record.accountWxid || ''),
+            roomId: row.roomId,
+            name: row.name,
+          })
         }
       } catch (error) {
         appLog('WARN', '监控群列表刷新失败', {
@@ -433,6 +498,11 @@ function pumpQrMonitorQueue(instanceId) {
       .then(item.resolve, item.reject)
       .finally(() => {
         state.active -= 1
+        if (!qrMonitorConfig.enabled) {
+          // stop 后不再 pump；active 归零则清 Map
+          if ((state.active || 0) <= 0 && !(state.pending?.length)) qrMonitorQueues.delete(instanceId)
+          return
+        }
         if (!state.pending.length && state.active <= 0) qrMonitorQueues.delete(instanceId)
         else pumpQrMonitorQueue(instanceId)
       })
@@ -440,12 +510,19 @@ function pumpQrMonitorQueue(instanceId) {
 }
 
 /**
- * 监控用内容哈希集合（进程内缓存）。
- * @returns {Set<string>}
+ * 监控用近期内容哈希预约（进程内 TTL）；永久去重以 SQLite hasQrContentHash 为准。
+ * @returns {Map<string, number>}
  */
 function monitorContentHashes() {
-  if (!qrMonitorContentHashes) qrMonitorContentHashes = qrContentHashSet()
-  return qrMonitorContentHashes
+  return recentQrContentHashes
+}
+
+function reserveRecentQrContentHash(hash) {
+  return reserveRecentQrHashInMap(recentQrContentHashes, hash, { hasPersistent: hasQrContentHash })
+}
+
+function releaseRecentQrContentHash(hash) {
+  releaseRecentQrHashInMap(recentQrContentHashes, hash)
 }
 
 function pauseActiveTasks(reason = '管理员已暂停软件运行') {
@@ -550,9 +627,11 @@ async function handleFriendCredentialDiagnosticCommand(message) {
   try {
     const dir = path.join(app.getPath('userData'), 'friend-diagnostics')
     mkdirSync(dir, { recursive: true })
-    const line = `${JSON.stringify({ t: new Date().toISOString(), ...report })}\n`
-    appendFileSync(path.join(dir, 'diagnostics.jsonl'), line, 'utf8')
-    writeFileSync(path.join(dir, `${report.diagnosticId || Date.now()}.json`), JSON.stringify(report, null, 2), 'utf8')
+    const { sanitizeLogEntry } = require('./sensitive-redaction.cjs')
+    const safeReport = sanitizeLogEntry({ t: new Date().toISOString(), ...report })
+    appendJsonlLog(dir, safeReport, { basename: 'diagnostics.jsonl', maxBytes: 10 * 1024 * 1024, maxFiles: 3 })
+    writeFileSync(path.join(dir, `${report.diagnosticId || Date.now()}.json`), JSON.stringify(safeReport, null, 2), 'utf8')
+    pruneDiagnosticReportFiles(dir)
   } catch (error) {
     appLog('WARN', '诊断结果本地落盘失败', { module: '凭证诊断', error: rawErrorMessage(error) })
   }
@@ -900,9 +979,7 @@ async function saveClassifiedQrImage(record, room, sourcePath, message, options)
     recognized.push({ decodedText: normalizeQrText(decodedText) || String(decodedText || '').trim(), qrType, hash })
   }
   const result = { detected: recognized.length, saved: 0, duplicates: 0, expired: 0, types: [] }
-  const existing = options?.existingHashes instanceof Set
-    ? options.existingHashes
-    : qrContentHashSet()
+  const existing = options?.existingHashes instanceof Set ? options.existingHashes : null
   const validateLinks = options?.validateLinks !== false
   const extension = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'].includes(path.extname(sourcePath).toLowerCase())
     ? path.extname(sourcePath).toLowerCase()
@@ -912,15 +989,21 @@ async function saveClassifiedQrImage(record, room, sourcePath, message, options)
   for (const item of recognized) {
     const hash = item.hash
     // 先占位，避免监控并发 2 路同时通过「未存在」检查而各存一份
-    if (existing.has(hash) || hasQrContentHash(hash)) {
+    if (existing) {
+      if (existing.has(hash) || hasQrContentHash(hash)) {
+        existing.add(hash)
+        result.duplicates += 1
+        continue
+      }
       existing.add(hash)
+    } else if (reserveRecentQrContentHash(hash)) {
       result.duplicates += 1
       continue
     }
-    existing.add(hash)
     // 历史批量采集跳过 a8key，避免每张图网络校验把界面卡死；监控实时仍校验
     if (validateLinks && !await isQrLinkCurrentlyValid(record, item.decodedText, item.qrType)) {
-      existing.delete(hash)
+      if (existing) existing.delete(hash)
+      else releaseRecentQrContentHash(hash)
       result.expired += 1
       continue
     }
@@ -2177,7 +2260,12 @@ async function handleQrMonitorEvent(record, event) {
       const roomIds = extractEventRoomIds(event)
       const roomId = roomIds.find((id) => String(id).endsWith('@chatroom'))
       if (roomId) {
-        addQrMonitorRooms([{ instanceId: record.id, roomId, name: '群聊' }], { reason: '新群图片自动纳入' })
+        addQrMonitorRooms([{
+          instanceId: record.id,
+          accountWxid: String(record.accountWxid || ''),
+          roomId,
+          name: '群聊',
+        }], { reason: '新群图片自动纳入' })
         room = qrMonitorRoomByKey.get(monitorRoomKey(record.id, roomId)) || null
       }
     }
@@ -2355,6 +2443,8 @@ function readApi(record, apiPath, body, options = {}) {
 }
 
 async function probeInstance(record) {
+  if (!record || record.stopping) return false
+  if (instances.get(record.id) !== record) return false
   if (record.apiBusy) return true
   if (record.status !== 'STARTING' && record.pid) {
     const executable = await getProcessExecutablePath(record.pid)
@@ -2401,12 +2491,15 @@ async function probeInstance(record) {
     record.accountWxid = observedAccountWxid || record.accountWxid
     if (loggedIn && record.status === 'ONLINE') {
       try { ensureChatAddRuleBound(record) } catch { /* 改绑失败不阻断探测 */ }
+      try { rebindQrMonitorRoomsForInstance(record) } catch { /* rebind 失败不阻断探测 */ }
+      try { pruneStoppedRuntimeForAccount(record) } catch { /* prune 失败不阻断 */ }
     }
     const nextInterval = loggedIn ? 10000 : 2000
     if (record.probeIntervalMs !== nextInterval) startProbeLoop(record, nextInterval)
     upsertInstance({ ...record, pid: record.child?.pid ?? record.pid })
     return true
   } catch (error) {
+    if (instances.get(record.id) !== record) return false
     record.probeFailures = (record.probeFailures || 0) + 1
     if (record.status !== 'STOPPED' && record.probeFailures >= 3) record.status = 'ERROR'
     record.error = record.probeFailures >= 3 ? toUserErrorMessage(error, '检测微信状态失败') : undefined
@@ -4239,11 +4332,16 @@ function publicInstance(value) {
 
 function markInstanceStopped(record, reason = '微信已关闭') {
   if (record.status === 'STOPPED') return
+  if (record.firstProbeTimer) {
+    clearTimeout(record.firstProbeTimer)
+    record.firstProbeTimer = null
+  }
   clearInterval(record.probe)
   record.probe = null
   record.tcpServer?.close()
   record.tcpServer = null
   record.status = 'STOPPED'
+  record.stoppedAt = Date.now()
   record.error = undefined
   record.pid = null
   record.wechatPid = null
@@ -4251,9 +4349,14 @@ function markInstanceStopped(record, reason = '微信已关闭') {
   cleanInstanceMaps(record.id)
   upsertInstance(record)
   appLog('INFO', reason, { instanceId: record.id, module: '微信状态' })
+  pruneStoppedRuntimeInstances()
 }
 
 function markInstanceIdentityMismatch(record) {
+  if (record.firstProbeTimer) {
+    clearTimeout(record.firstProbeTimer)
+    record.firstProbeTimer = null
+  }
   clearInterval(record.probe)
   record.probe = null
   record.tcpServer?.close()
@@ -4278,8 +4381,35 @@ function cleanInstanceMaps(instanceId) {
   for (const [key] of friendCredentialInflight) { if (key.startsWith(`${instanceId}|`)) friendCredentialInflight.delete(key) }
   for (const [key] of qrMonitorRecentEvents) { if (key.startsWith(`${instanceId}|`)) qrMonitorRecentEvents.delete(key) }
   for (const [key] of qrValidityCache) { if (key.startsWith(`${instanceId}|`)) qrValidityCache.delete(key) }
-  for (const [key] of qrMonitorSkipLogAt) { if (key.startsWith(`${instanceId}|`)) qrMonitorSkipLogAt.delete(key) }
+  for (const [key] of qrMonitorSkipLogAt) { if (key.startsWith(`${instanceId}:`) || key.startsWith(`${instanceId}|`)) qrMonitorSkipLogAt.delete(key) }
+  for (const [key] of chatAddMissLogAt) { if (key.startsWith(`${instanceId}:`)) chatAddMissLogAt.delete(key) }
   for (const [key] of kickedMutationDone) { if (key.includes(`|${instanceId}|`)) kickedMutationDone.delete(key) }
+}
+
+const STOPPED_RUNTIME_MAX = 20
+const STOPPED_RUNTIME_TTL_MS = 24 * 60 * 60 * 1000
+
+/**
+ * 清理内存中过旧的 STOPPED runtime（保留 SQLite 历史 metadata）。
+ */
+function pruneStoppedRuntimeInstances() {
+  const before = new Set(instances.keys())
+  pruneStoppedRuntimeInMap(instances, { maxStopped: STOPPED_RUNTIME_MAX, ttlMs: STOPPED_RUNTIME_TTL_MS })
+  for (const id of before) {
+    if (!instances.has(id)) cleanInstanceMaps(id)
+  }
+}
+
+/**
+ * 同账号新实例 ONLINE 后：从 runtime Map 移除同账号旧 STOPPED（SQLite 保留）。
+ * @param {{ id: string, accountWxid?: string }} record
+ */
+function pruneStoppedRuntimeForAccount(record) {
+  const before = new Set(instances.keys())
+  pruneStoppedRuntimeForAccountInMap(instances, record)
+  for (const id of before) {
+    if (!instances.has(id)) cleanInstanceMaps(id)
+  }
 }
 
 async function synchronizeInstanceProcesses() {
@@ -4397,10 +4527,19 @@ async function startWechatInstance() {
       return { ok: false, error: record.error || '微信 DLL 注入失败' }
     }
     startProbeLoop(record, 2000)
-    const firstProbe = setTimeout(() => probeInstance(record), 1000)
-    firstProbe.unref()
+    if (record.firstProbeTimer) clearTimeout(record.firstProbeTimer)
+    record.firstProbeTimer = setTimeout(() => {
+      record.firstProbeTimer = null
+      if (record.stopping || instances.get(record.id) !== record) return
+      void probeInstance(record)
+    }, 1000)
+    if (typeof record.firstProbeTimer.unref === 'function') record.firstProbeTimer.unref()
     return { ok: true, data: publicInstance(record) }
   } catch (error) {
+    if (record?.firstProbeTimer) {
+      clearTimeout(record.firstProbeTimer)
+      record.firstProbeTimer = null
+    }
     clearInterval(record?.probe)
     record?.tcpServer?.close()
     if (record?.child?.pid) await killVerifiedProcessTree(record.child.pid, [record.injectorExe])
@@ -4419,7 +4558,10 @@ function registerIpc() {
   ipcMain.handle('auth:login', async (_event, username, password) => {
     try {
       const account = await softwareAuth.login(username, password)
-      if (instances.size === 0) await restoreInstances()
+      if (instances.size === 0) {
+        await restoreInstances()
+        migrateQrMonitorAccountWxids()
+      }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '登录失败，请稍后重试') } }
@@ -4427,19 +4569,30 @@ function registerIpc() {
   ipcMain.handle('auth:register', async (_event, username, password) => {
     try {
       const account = await softwareAuth.register(username, password)
-      if (instances.size === 0) await restoreInstances()
+      if (instances.size === 0) {
+        await restoreInstances()
+        migrateQrMonitorAccountWxids()
+      }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '注册失败，请稍后重试') } }
   })
   ipcMain.handle('auth:logout', async () => { await softwareAuth.logout(); stopRemoteAgent(); return true })
   ipcMain.handle('system:metrics', () => softwareMetrics())
-  ipcMain.handle('wechat:list-instances', async () => { await synchronizeInstanceProcesses(); return [...instances.values()].map(publicInstance) })
+  ipcMain.handle('wechat:list-instances', async () => {
+    await synchronizeInstanceProcesses()
+    pruneStoppedRuntimeInstances()
+    return [...instances.values()].map(publicInstance)
+  })
   ipcMain.handle('wechat:start-instance', () => { requireRuntime(); return enqueueWechatInstanceStart() })
   ipcMain.handle('wechat:stop-instance', async (_event, id, closeWechat = true) => {
     const record = instances.get(id)
     if (!record) return { ok: false, error: '实例不存在' }
     record.stopping = true
+    if (record.firstProbeTimer) {
+      clearTimeout(record.firstProbeTimer)
+      record.firstProbeTimer = null
+    }
     const targetPid = record.wechatPid ?? record.pid ?? record.child?.pid
     const canCloseWechat = Boolean(closeWechat && record.managed && targetPid)
     if (canCloseWechat && !await killVerifiedProcessTree(targetPid, [record.weixinExe || configuredWeixinExe()])) {
@@ -4450,6 +4603,7 @@ function registerIpc() {
     record.tcpServer?.close()
     instances.delete(id)
     removeInstance(id)
+    cleanInstanceMaps(id)
     return { ok: true, data: { closedWechat: canCloseWechat } }
   })
   ipcMain.handle('wechat:call-api', async (_event, id, apiPath, body, sourceId, timeoutMs) => {
@@ -4810,14 +4964,25 @@ function registerIpc() {
   }))
   ipcMain.handle('qr:monitor-start', (_event, payload) => {
     const outputDir = String(payload?.outputDir || '').trim()
-    const rooms = Array.isArray(payload?.rooms) ? payload.rooms.map((room) => ({ instanceId: String(room.instanceId || ''), roomId: String(room.roomId || ''), name: String(room.name || '群聊') })).filter((room) => room.instanceId && room.roomId.endsWith('@chatroom')) : []
+    const rooms = Array.isArray(payload?.rooms)
+      ? payload.rooms.map((room) => {
+        const instanceId = String(room.instanceId || '')
+        const record = instances.get(instanceId)
+        return {
+          instanceId,
+          accountWxid: String(room.accountWxid || record?.accountWxid || ''),
+          roomId: String(room.roomId || ''),
+          name: String(room.name || '群聊'),
+        }
+      }).filter((room) => room.instanceId && room.roomId.endsWith('@chatroom'))
+      : []
     if (!outputDir || !path.isAbsolute(outputDir)) throw new Error('请先选择二维码保存文件夹')
     if (!rooms.length) throw new Error('请至少选择一个需要监控的群聊')
     mkdirSync(outputDir, { recursive: true })
     const watchAll = Boolean(payload?.watchAll)
     qrMonitorConfig = { enabled: true, watchAll, rooms, outputDir, folder: String(payload?.folder || '默认分组') }
     rebuildQrMonitorRoomIndex()
-    qrMonitorContentHashes = qrContentHashSet()
+    recentQrContentHashes.clear()
     saveSetting('qrMonitor', qrMonitorConfig)
     ensureQrMonitorSyncTimer()
     appLog('INFO', '群消息二维码监控已开启', {
@@ -4837,6 +5002,12 @@ function registerIpc() {
         const item = pending.shift()
         try { item.resolve({ skipped: true }) } catch { /* ignore */ }
       }
+      if ((state.active || 0) <= 0 && !pending.length) {
+        /* map entry cleaned in pump finally */
+      }
+    }
+    for (const [instanceId, state] of [...qrMonitorQueues.entries()]) {
+      if ((state.active || 0) <= 0 && !(state.pending?.length)) qrMonitorQueues.delete(instanceId)
     }
     rebuildQrMonitorRoomIndex()
     saveSetting('qrMonitor', qrMonitorConfig)
@@ -5181,7 +5352,7 @@ app.whenReady().then(async () => {
       }
       rebuildQrMonitorRoomIndex()
       if (qrMonitorConfig.enabled) {
-        qrMonitorContentHashes = qrContentHashSet()
+        recentQrContentHashes.clear()
         ensureQrMonitorSyncTimer()
       }
     }
@@ -5224,7 +5395,10 @@ app.whenReady().then(async () => {
     // 账号校验走网络，绝不 await 挡住启动后续；超时也只影响恢复实例/远程桌面
     void softwareAuth.session().then((account) => {
       if (!account) return
-      restoreInstances().catch((error) => appLog('ERROR', '恢复微信实例失败', { error: rawErrorMessage(error) }))
+      restoreInstances().then(() => {
+        migrateQrMonitorAccountWxids()
+        pruneStoppedRuntimeInstances()
+      }).catch((error) => appLog('ERROR', '恢复微信实例失败', { error: rawErrorMessage(error) }))
       for (const task of listTasks().filter((item) => item.status === 'QUEUED')) setImmediate(() => runTask(task.id))
       startRemoteAgent(remoteAgentOptions(account.username))
         .catch((error) => appLog('ERROR', '设备连接失败', { error: rawErrorMessage(error) }))

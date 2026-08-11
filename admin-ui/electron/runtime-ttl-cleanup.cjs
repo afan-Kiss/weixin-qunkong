@@ -16,6 +16,11 @@ function cleanupRuntimeTtlMaps(maps, now = Date.now()) {
     deliveryImageHashCache,
     DELIVERY_IMAGE_HASH_TTL_MS = 600000,
     DELIVERY_IMAGE_HASH_MAX = 512,
+    recentQrContentHashes,
+    RECENT_QR_HASH_TTL_MS = 600000,
+    RECENT_QR_HASH_MAX = 10000,
+    chatAddMissLogAt,
+    CHAT_ADD_MISS_LOG_TTL_MS = 600000,
   } = maps
 
   if (qrInvitePreviewCache) {
@@ -47,6 +52,30 @@ function cleanupRuntimeTtlMaps(maps, now = Date.now()) {
       if (now - Number(timestamp || 0) >= QR_MONITOR_SKIP_LOG_TTL_MS) {
         qrMonitorSkipLogAt.delete(key)
       }
+    }
+  }
+
+  if (chatAddMissLogAt) {
+    for (const [key, timestamp] of chatAddMissLogAt) {
+      if (now - Number(timestamp || 0) >= CHAT_ADD_MISS_LOG_TTL_MS) {
+        chatAddMissLogAt.delete(key)
+      }
+    }
+  }
+
+  if (recentQrContentHashes) {
+    for (const [key, expiresAt] of recentQrContentHashes) {
+      if (Number(expiresAt || 0) <= now) recentQrContentHashes.delete(key)
+    }
+    while (recentQrContentHashes.size > RECENT_QR_HASH_MAX) {
+      let oldestKey = null
+      let oldestAt = Infinity
+      for (const [key, expiresAt] of recentQrContentHashes) {
+        const at = Number(expiresAt || 0)
+        if (at < oldestAt) { oldestAt = at; oldestKey = key }
+      }
+      if (!oldestKey) break
+      recentQrContentHashes.delete(oldestKey)
     }
   }
 
