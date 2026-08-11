@@ -16,42 +16,124 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
+# GitHub electron zip 常下坏；国内默认走 npmmirror
+if (-not $env:ELECTRON_MIRROR -or -not $env:ELECTRON_MIRROR.Trim()) {
+  $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
+}
+
 if (-not $Password) {
   throw 'Missing password. Pass -Password or set env WXQK_PUBLISH_PASSWORD.'
 }
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
+$script:PackageOutputDir = ''
+
+function Get-PackageDisplayVersion {
+  $pkg = Get-Content -LiteralPath (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  $display = ([string]$pkg.version) -replace '\.0$', ''
+  if ($display -notmatch '^\d+\.\d+$') {
+    if ([string]$pkg.version -match '^(\d+)\.(\d+)') { $display = "$($Matches[1]).$($Matches[2])" }
+  }
+  return @{ Display = $display; Pkg = $pkg }
+}
+
+function Get-DefaultOutputDirName {
+  param($Pkg)
+  $outputDir = 'release-v19'
+  if ($Pkg.build -and $Pkg.build.directories -and $Pkg.build.directories.output) {
+    $outputDir = [string]$Pkg.build.directories.output
+  }
+  return $outputDir
+}
+
+# 若默认 win-unpacked 被占用（常见：Cursor 索引锁住 app.asar），换旁路/时间戳目录。
+function Test-OutputDirWritable {
+  param([string]$DirName)
+  $abs = if ([System.IO.Path]::IsPathRooted($DirName)) { $DirName } else { Join-Path $root $DirName }
+  $asar = Join-Path $abs 'win-unpacked\resources\app.asar'
+  if (Test-Path -LiteralPath $asar) {
+    try {
+      $fs = [System.IO.File]::Open($asar, 'Open', 'ReadWrite', 'None')
+      $fs.Close()
+    } catch {
+      return $false
+    }
+  }
+  $unpacked = Join-Path $abs 'win-unpacked'
+  if (Test-Path -LiteralPath $unpacked) {
+    try {
+      Remove-Item -LiteralPath $unpacked -Recurse -Force -ErrorAction Stop
+    } catch {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Resolve-BuilderOutputDir {
+  param([string]$PreferredName)
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $candidates = @(
+    $PreferredName,
+    ('{0}-build' -f $PreferredName),
+    ('{0}-tmp' -f $PreferredName),
+    ('{0}-{1}' -f $PreferredName, $stamp)
+  )
+  foreach ($name in $candidates) {
+    if (Test-OutputDirWritable -DirName $name) {
+      if ($name -ne $PreferredName) {
+        Write-Host ("== win-unpacked/app.asar locked; using output {0} ==" -f $name)
+      }
+      return $name
+    }
+    Write-Host ("== skip locked output: {0} ==" -f $name)
+  }
+  $outside = Join-Path $env:TEMP ("wxqk-release-{0}" -f $stamp)
+  New-Item -ItemType Directory -Force -Path $outside | Out-Null
+  Write-Host ("== all workspace release dirs locked (often Cursor); using {0} ==" -f $outside)
+  return $outside
+}
 
 function Resolve-LatestPortableExe {
   param([string]$Preferred)
   if ($Preferred -and (Test-Path -LiteralPath $Preferred)) {
     return (Get-Item -LiteralPath $Preferred).FullName
   }
-  $pkg = Get-Content -LiteralPath (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-  $display = ([string]$pkg.version) -replace '\.0$', ''
-  if ($display -notmatch '^\d+\.\d+$') {
-    if ([string]$pkg.version -match '^(\d+)\.(\d+)') { $display = "$($Matches[1]).$($Matches[2])" }
-  }
-  $outputDir = 'release-v19'
-  if ($pkg.build -and $pkg.build.directories -and $pkg.build.directories.output) {
-    $outputDir = [string]$pkg.build.directories.output
-  }
-  $expected = Join-Path $root (Join-Path $outputDir ("微信群控系统v{0}.exe" -f $display))
-  if (Test-Path -LiteralPath $expected) { return (Get-Item -LiteralPath $expected).FullName }
-  # 控制台/脚本编码可能导致中文 Filter 匹配失败，改用版本号回退查找
+  $meta = Get-PackageDisplayVersion
+  $display = $meta.Display
   $versionPattern = ('v{0}\.exe$' -f [regex]::Escape($display))
-  $hit = Get-ChildItem -LiteralPath (Join-Path $root $outputDir) -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Extension -ieq '.exe' -and $_.Name -match $versionPattern } |
+  $dirs = New-Object System.Collections.Generic.List[string]
+  if ($script:PackageOutputDir) { [void]$dirs.Add($script:PackageOutputDir) }
+  [void]$dirs.Add((Get-DefaultOutputDirName -Pkg $meta.Pkg))
+  [void]$dirs.Add('release-v19-build')
+  [void]$dirs.Add('release-v19-tmp')
+  Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'release-v19*' } |
     Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-  if ($hit) { return $hit.FullName }
-  $hit = Get-ChildItem -LiteralPath (Join-Path $root $outputDir) -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Extension -ieq '.exe' -and $_.Name -like '*v*.exe' } |
+    ForEach-Object { [void]$dirs.Add($_.Name) }
+  # 临时目录旁路产物
+  Get-ChildItem -LiteralPath $env:TEMP -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'wxqk-release-*' } |
     Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-  if ($hit) { return $hit.FullName }
-  throw "Portable EXE not found under $outputDir"
+    Select-Object -First 5 |
+    ForEach-Object { [void]$dirs.Add($_.FullName) }
+  $seen = @{}
+  foreach ($name in $dirs) {
+    if (-not $name -or $seen.ContainsKey($name)) { continue }
+    $seen[$name] = $true
+    $dir = if ([System.IO.Path]::IsPathRooted($name)) { $name } else { Join-Path $root $name }
+    if (-not (Test-Path -LiteralPath $dir)) { continue }
+    $expected = Join-Path $dir ("微信群控系统v{0}.exe" -f $display)
+    if (Test-Path -LiteralPath $expected) { return (Get-Item -LiteralPath $expected).FullName }
+    # 控制台/脚本编码可能导致中文 Filter 匹配失败，改用版本号回退查找
+    $hit = Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+      Where-Object { $_.Extension -ieq '.exe' -and $_.Name -match $versionPattern } |
+      Sort-Object LastWriteTime -Descending |
+      Select-Object -First 1
+    if ($hit) { return $hit.FullName }
+  }
+  throw "Portable EXE not found for v$display (searched: $($seen.Keys -join ', '))"
 }
 
 $swAll = [System.Diagnostics.Stopwatch]::StartNew()
@@ -68,13 +150,21 @@ if (-not $SkipPackage) {
   Write-Host '== vite build =='
   npm run build
   if ($LASTEXITCODE -ne 0) { throw "npm run build failed: $LASTEXITCODE" }
-  Write-Host '== electron-builder portable =='
-  npx electron-builder --win portable
+  $meta = Get-PackageDisplayVersion
+  $script:PackageOutputDir = Resolve-BuilderOutputDir -PreferredName (Get-DefaultOutputDirName -Pkg $meta.Pkg)
+  Write-Host ("== electron-builder portable (output={0}, mirror={1}) ==" -f $script:PackageOutputDir, $env:ELECTRON_MIRROR)
+  npx electron-builder --win portable --config.directories.output=$script:PackageOutputDir
   if ($LASTEXITCODE -ne 0) { throw "electron-builder failed: $LASTEXITCODE" }
 }
 
 $exe = Resolve-LatestPortableExe -Preferred $ExePath
 Write-Host "== publish $exe =="
+# IP / 自签证书：未显式传参时默认 InsecureTls
+$useInsecureTls = [bool]$InsecureTls.IsPresent
+if (-not $useInsecureTls -and $BaseUrl -match '://(\d{1,3}\.){3}\d{1,3}([:/]|$)') {
+  $useInsecureTls = $true
+  Write-Host '== TLS: BaseUrl is IP, enabling InsecureTls =='
+}
 $publishArgs = @(
   '-NoProfile', '-ExecutionPolicy', 'Bypass',
   '-File', (Join-Path $PSScriptRoot '_publish-release-once.ps1'),
@@ -85,7 +175,7 @@ $publishArgs = @(
   '-PreferredChunkMB', "$PreferredChunkMB"
 )
 if ($Mandatory) { $publishArgs += '-Mandatory' }
-if ($InsecureTls) { $publishArgs += '-InsecureTls' }
+if ($useInsecureTls) { $publishArgs += '-InsecureTls' }
 & powershell @publishArgs
 if ($LASTEXITCODE -ne 0) { throw "publish failed: $LASTEXITCODE" }
 

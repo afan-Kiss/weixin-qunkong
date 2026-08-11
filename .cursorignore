@@ -1,0 +1,9 @@
+﻿# Build / package artifacts — Cursor indexing locks app.asar and breaks electron-builder
+admin-ui/release-v19/
+admin-ui/release-v19-*/
+admin-ui/**/win-unpacked/
+admin-ui/**/*.asar
+admin-ui/dist/
+admin-ui/test-output.txt
+admin-ui/resources/hook/
+admin-ui/electron/vendor/

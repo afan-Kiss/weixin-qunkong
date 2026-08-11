@@ -10,9 +10,13 @@ lerna-debug.log*
 node_modules
 dist
 release
+release-v19
+release-v19-*
+**/win-unpacked/
 test-results
 dist-ssr
 *.local
+test-output.txt
 
 # Editor directories and files
 .vscode/*
