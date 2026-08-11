@@ -146,6 +146,8 @@ let mainWindow = null
 let splashWindow = null
 let tray = null
 let quitting = false
+/** @type {{ t0: number, bytes0: number, lastT: number, lastBytes: number, speedBps: number } | null} */
+let updateDownloadMeter = null
 let runtimeAllowed = true
 let qrMonitorConfig = { enabled: false, watchAll: false, rooms: [], outputDir: '', folder: '默认分组' }
 /** instanceId+roomId → 监控群配置，150+ 群时 O(1) 命中 */
@@ -4974,9 +4976,25 @@ function registerIpc() {
       onLog: (level, message, details) => appLog(level, message, details),
       onProgress: (downloaded, total) => {
         const percent = total > 0 ? (downloaded * 100) / total : 0
-        sendProgress({ phase: 'download', downloaded, total, percent })
+        const now = Date.now()
+        if (!updateDownloadMeter) updateDownloadMeter = { t0: now, bytes0: 0, lastT: now, lastBytes: 0, speedBps: 0 }
+        const meter = updateDownloadMeter
+        const dt = Math.max(1, now - meter.lastT)
+        if (now - meter.lastT >= 500) {
+          meter.speedBps = ((downloaded - meter.lastBytes) * 1000) / dt
+          meter.lastT = now
+          meter.lastBytes = downloaded
+        }
+        sendProgress({
+          phase: 'download',
+          downloaded,
+          total,
+          percent,
+          speedBps: meter.speedBps,
+        })
       },
     })
+    updateDownloadMeter = null
     if (result.ok) sendProgress({ phase: 'installing', percent: 100, message: result.message || '新版本已启动，正在关闭旧版本…' })
     else sendProgress({ phase: 'error', percent: 0, message: result.message || '更新失败' })
     return result

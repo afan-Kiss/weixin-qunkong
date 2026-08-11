@@ -353,7 +353,7 @@ async function reportUpdate(baseUrl, event, meta, extra = {}) {
 }
 
 /**
- * 单段 Range 下载到指定偏移（支持并发拼包）。
+ * 单段 Range 下载到指定偏移（流式写盘 + 背压，避免 writeSync 拖死带宽）。
  * @param {string} url
  * @param {string} dest
  * @param {number} start
@@ -365,87 +365,104 @@ function downloadRangeToFile(url, dest, start, end, onChunk) {
     const u = new URL(url)
     const lib = u.protocol === 'https:' ? https : http
     const expectedLen = end - start + 1
+    let settled = false
+    const finish = (err, value) => {
+      if (settled) return
+      settled = true
+      if (err) reject(err)
+      else resolve(value)
+    }
     const req = lib.request(url, {
       method: 'GET',
-      headers: { Range: `bytes=${start}-${end}` },
-      timeout: 120000,
+      headers: {
+        Range: `bytes=${start}-${end}`,
+        Connection: 'keep-alive',
+      },
+      timeout: 180000,
+      // 放大接收缓冲，减少系统调用次数，更好吃满窄带
+      highWaterMark: 1024 * 1024,
       ...insecureTlsForService(u.hostname),
     }, (res) => {
       const status = res.statusCode || 0
       if (status === 200) {
         res.resume()
-        reject(Object.assign(new Error('RANGE_UNSUPPORTED'), { code: 'RANGE_UNSUPPORTED' }))
+        finish(Object.assign(new Error('RANGE_UNSUPPORTED'), { code: 'RANGE_UNSUPPORTED' }))
         return
       }
       if (status !== 206) {
         res.resume()
-        reject(new Error(`download http ${status}`))
+        finish(new Error(`download http ${status}`))
         return
       }
       const cr = String(res.headers['content-range'] || '')
       const crMatch = cr.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/)
       if (!crMatch) {
         res.resume()
-        reject(Object.assign(new Error('RANGE_INVALID_CONTENT_RANGE'), { code: 'RANGE_INVALID_CONTENT_RANGE' }))
+        finish(Object.assign(new Error('RANGE_INVALID_CONTENT_RANGE'), { code: 'RANGE_INVALID_CONTENT_RANGE' }))
         return
       }
       const crStart = Number(crMatch[1])
       const crEnd = Number(crMatch[2])
       if (crStart !== start || crEnd !== end) {
         res.resume()
-        reject(new Error(`Content-Range mismatch: expected ${start}-${end}, got ${crStart}-${crEnd}`))
+        finish(new Error(`Content-Range mismatch: expected ${start}-${end}, got ${crStart}-${crEnd}`))
         return
       }
-      const { openSync, writeSync, closeSync } = require('fs')
-      let fd
+      let file
       try {
-        fd = openSync(dest, 'r+')
+        file = createWriteStream(dest, { flags: 'r+', start, highWaterMark: 1024 * 1024 })
       } catch (error) {
         res.resume()
-        reject(error)
+        finish(error)
         return
       }
       let offset = start
+      const fail = (error) => {
+        try { res.destroy() } catch { /* ignore */ }
+        try { req.destroy() } catch { /* ignore */ }
+        try { file.destroy() } catch { /* ignore */ }
+        finish(error)
+      }
       res.on('data', (chunk) => {
-        try {
-          if (offset + chunk.length > end + 1) {
-            try { closeSync(fd) } catch (_) {}
-            res.destroy()
-            req.destroy()
-            reject(Object.assign(new Error('RANGE_BODY_TOO_LARGE'), { code: 'RANGE_BODY_TOO_LARGE' }))
-            return
-          }
-          writeSync(fd, chunk, 0, chunk.length, offset)
-          offset += chunk.length
-          onChunk?.(chunk.length)
-        } catch (error) {
-          try { closeSync(fd) } catch (_) {}
-          reject(error)
-          req.destroy()
-        }
-      })
-      res.on('error', (error) => {
-        try { closeSync(fd) } catch (_) {}
-        reject(error)
-      })
-      res.on('end', () => {
-        try { closeSync(fd) } catch (_) {}
-        const got = offset - start
-        if (got !== expectedLen) {
-          reject(new Error(`Range body length mismatch: expected ${expectedLen}, got ${got}`))
+        if (settled) return
+        if (offset + chunk.length > end + 1) {
+          fail(Object.assign(new Error('RANGE_BODY_TOO_LARGE'), { code: 'RANGE_BODY_TOO_LARGE' }))
           return
         }
-        resolve(got)
+        offset += chunk.length
+        onChunk?.(chunk.length)
+        if (!file.write(chunk)) {
+          res.pause()
+          file.once('drain', () => {
+            try { res.resume() } catch { /* ignore */ }
+          })
+        }
+      })
+      res.on('error', fail)
+      file.on('error', fail)
+      res.on('end', () => {
+        file.end(() => {
+          const got = offset - start
+          if (got !== expectedLen) {
+            finish(new Error(`Range body length mismatch: expected ${expectedLen}, got ${got}`))
+            return
+          }
+          finish(null, got)
+        })
       })
     })
-    req.on('error', reject)
-    req.on('timeout', () => { req.destroy(new Error('timeout')); reject(new Error('timeout')) })
+    req.on('error', (error) => finish(error))
+    req.on('timeout', () => {
+      req.destroy(new Error('timeout'))
+      finish(new Error('timeout'))
+    })
     req.end()
   })
 }
 
 /**
- * 多连接 Range 并发下载 + 断点续传（显著快于单连接慢上行）。
+ * 多连接 Range 并发下载 + 断点续传。
+ * 窄带（如 5Mbps）用 2 并发 + 2MB 分片，避免 4 路 TLS/拥塞互相拖慢。
  * @param {string} url
  * @param {string} dest
  * @param {number} expectedSize
@@ -461,7 +478,8 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
     const res = await new Promise((resolve, reject) => {
       const req = lib.request(url, {
         method: 'GET',
-        timeout: 120000,
+        timeout: 180000,
+        highWaterMark: 1024 * 1024,
         ...insecureTlsForService(u.hostname),
       }, resolve)
       req.on('error', reject)
@@ -473,7 +491,7 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
       throw new Error(`download http ${res.statusCode || 0}`)
     }
     await new Promise((resolve, reject) => {
-      const file = createWriteStream(dest, { flags: 'w' })
+      const file = createWriteStream(dest, { flags: 'w', highWaterMark: 1024 * 1024 })
       let got = 0
       res.on('data', (chunk) => {
         got += chunk.length
@@ -487,8 +505,9 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
     return
   }
 
-  const partSize = 4 * 1024 * 1024
-  const concurrency = 4
+  // 5Mbps≈640KB/s：2 并发通常比 4 并发更稳、更快（少握手/少丢包重传）
+  const partSize = 2 * 1024 * 1024
+  const concurrency = total >= 16 * 1024 * 1024 ? 2 : 1
   const parts = []
   for (let start = 0; start < total; start += partSize) {
     parts.push({ start, end: Math.min(total - 1, start + partSize - 1), done: false })
@@ -535,7 +554,7 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
             return
           }
           if (attempt >= 4) throw error
-          await new Promise((r) => setTimeout(r, 500 * attempt))
+          await new Promise((r) => setTimeout(r, 400 * attempt))
         }
       }
     }
@@ -550,7 +569,8 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
     const res = await new Promise((resolve, reject) => {
       const req = lib.request(url, {
         method: 'GET',
-        timeout: 120000,
+        timeout: 180000,
+        highWaterMark: 1024 * 1024,
         ...insecureTlsForService(u.hostname),
       }, resolve)
       req.on('error', reject)
@@ -562,7 +582,7 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
       throw new Error(`download fallback http ${res.statusCode || 0}`)
     }
     await new Promise((resolve, reject) => {
-      const file = createWriteStream(dest, { flags: 'w' })
+      const file = createWriteStream(dest, { flags: 'w', highWaterMark: 1024 * 1024 })
       res.on('data', (chunk) => {
         downloaded += chunk.length
         onProgress?.(downloaded, total)

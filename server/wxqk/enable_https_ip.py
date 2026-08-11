@@ -56,6 +56,11 @@ server {{
         client_max_body_size 250m;
         proxy_request_buffering off;
         proxy_buffering off;
+        # 大文件下载：关闭缓冲、拉长超时，让客户端尽量吃满上行带宽
+        proxy_max_temp_file_size 0;
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
         add_header Cache-Control "no-store";
     }}
 }}

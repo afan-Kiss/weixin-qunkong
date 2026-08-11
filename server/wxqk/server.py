@@ -2518,15 +2518,35 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                with pkg.open("rb") as f:
-                    f.seek(start)
-                    left = length
-                    while left > 0:
-                        chunk = f.read(min(1024 * 1024, left))
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        left -= len(chunk)
+                # Prefer sendfile through plain TCP to nginx (TLS terminated upstream).
+                # Falls back to large buffered copies when sendfile is unavailable.
+                sent_ok = False
+                try:
+                    import os as _os
+                    sock = getattr(self, "connection", None)
+                    if sock is not None and length > 0 and hasattr(_os, "sendfile"):
+                        with pkg.open("rb") as f:
+                            offset = start
+                            left = length
+                            while left > 0:
+                                n = _os.sendfile(sock.fileno(), f.fileno(), offset, min(left, 1024 * 1024))
+                                if not n:
+                                    break
+                                offset += n
+                                left -= n
+                        sent_ok = left == 0
+                except Exception:
+                    sent_ok = False
+                if not sent_ok:
+                    with pkg.open("rb") as f:
+                        f.seek(start)
+                        left = length
+                        while left > 0:
+                            chunk = f.read(min(1024 * 1024, left))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            left -= len(chunk)
                 try:
                     self.wfile.flush()
                 except Exception:

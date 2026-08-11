@@ -106,19 +106,30 @@ async function runClientUpdateModal(
   setProgressVisible(true)
   if (hint) hint.textContent = '正在下载；完成后再自动替换、启动新版本并关闭旧版（下载中不会关闭）'
 
-  const onProgress = (ev: { phase?: string; downloaded?: number; total?: number; percent?: number; message?: string }) => {
+  const onProgress = (ev: { phase?: string; downloaded?: number; total?: number; percent?: number; speedBps?: number; message?: string }) => {
     const phase = String(ev?.phase || '')
     const percent = Math.max(0, Math.min(100, Number(ev?.percent) || 0))
     if (bar) bar.style.width = `${percent.toFixed(1)}%`
     if (phase === 'download') {
       const loaded = Number(ev?.downloaded) || 0
       const total = Number(ev?.total) || 0
+      const speed = Number(ev?.speedBps) || 0
+      const speedText = speed > 0
+        ? (speed >= 1024 * 1024
+          ? `${(speed / (1024 * 1024)).toFixed(2)} MB/s`
+          : `${(speed / 1024).toFixed(0)} KB/s`)
+        : ''
       if (pctEl) {
-        pctEl.textContent = total > 0
+        const sizeText = total > 0
           ? `${percent.toFixed(1)}%（${fmtBytes(loaded)} / ${fmtBytes(total)}）`
           : `${percent.toFixed(1)}%`
+        pctEl.textContent = speedText ? `${sizeText} · ${speedText}` : sizeText
       }
-      if (hint) hint.textContent = '下载中，请勿关闭；完成后才会启动新版本并关闭旧版'
+      if (hint) {
+        hint.textContent = speedText
+          ? `下载中 ${speedText}；完成后才会启动新版本并关闭旧版`
+          : '下载中，请勿关闭；完成后才会启动新版本并关闭旧版'
+      }
     } else if (phase === 'installing') {
       if (pctEl) pctEl.textContent = '100% · 新版本已启动，正在关闭旧版…'
       if (hint) hint.textContent = String(ev?.message || '请稍候，旧版本即将关闭')

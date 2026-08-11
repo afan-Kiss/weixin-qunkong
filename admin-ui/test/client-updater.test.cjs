@@ -195,6 +195,10 @@ test('downloadRangeToFile rejects HTTP 200 with RANGE_UNSUPPORTED', () => {
   assert.match(src, /Content-Range mismatch/)
   assert.match(src, /Range body length mismatch/)
   assert.match(src, /content-range/)
+  assert.match(src, /createWriteStream\(dest, \{ flags: 'r\+', start/)
+  assert.match(src, /concurrency = total >= 16 \* 1024 \* 1024 \? 2 : 1/)
+  assert.match(src, /partSize = 2 \* 1024 \* 1024/)
+  assert.doesNotMatch(src, /writeSync\(fd, chunk/)
 })
 
 test('downloadWithResume falls back to single-connection on RANGE_UNSUPPORTED', () => {
