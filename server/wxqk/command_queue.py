@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import secrets
-import threading
 from typing import Any
 
 import security_db as sdb
@@ -40,7 +39,8 @@ _PRIORITY = {
     "SHOW_ANNOUNCEMENT": 10,
 }
 
-_lock = threading.RLock()
+_lock = sdb.db_lock
+COMMAND_DELIVERY_LEASE_SEC = 30
 DEFAULT_TTL_SEC = 24 * 3600
 
 
@@ -100,43 +100,49 @@ def enqueue(
         "delivery_count": 0,
         "server_signature": "",
     }
-    with _lock:
+    with sdb.transaction():
         conn = sdb.get_conn()
         if ctype == "REVOKE_RUNTIME":
-            # Expire lower-priority pending/delivered commands for this device
             conn.execute(
                 """
                 UPDATE device_commands
                 SET status='EXPIRED', failed_at=?, failure_reason='superseded_by_revoke'
-                WHERE device_id=? AND status IN ('PENDING','DELIVERED')
+                WHERE device_id=? AND status IN ('PENDING','DELIVERED','RECEIVED')
                   AND command_type != 'REVOKE_RUNTIME'
                 """,
                 (now, cid),
             )
         elif ctype == "REFRESH_POLICY":
-            # Allow must supersede stale revoke/suspend, otherwise a queued deny_run
-            # still pops first after admin re-allows and kills the client.
             conn.execute(
                 """
                 UPDATE device_commands
                 SET status='EXPIRED', failed_at=?, failure_reason='superseded_by_refresh'
-                WHERE device_id=? AND status IN ('PENDING','DELIVERED')
+                WHERE device_id=? AND status IN ('PENDING','DELIVERED','RECEIVED')
                   AND command_type IN ('REVOKE_RUNTIME','SUSPEND_RUNTIME')
                   AND policy_epoch <= ?
                 """,
                 (now, cid, int(policy_epoch or 0)),
             )
         elif ctype == "START_DESKTOP":
-            # Newer start cancels pending stop *and* older start — otherwise stall-kick
-            # floods PENDING START_DESKTOP rows (delivery_count stays 0 forever).
             conn.execute(
                 """
                 UPDATE device_commands
                 SET status='EXPIRED', failed_at=?, failure_reason='superseded_by_start_desktop'
-                WHERE device_id=? AND status IN ('PENDING','DELIVERED')
+                WHERE device_id=? AND status IN ('PENDING','DELIVERED','RECEIVED')
                   AND command_type IN ('STOP_DESKTOP', 'START_DESKTOP')
                 """,
                 (now, cid),
+            )
+        elif ctype == "STOP_DESKTOP":
+            conn.execute(
+                """
+                UPDATE device_commands
+                SET status='EXPIRED', failed_at=?, failure_reason='superseded_by_stop_desktop'
+                WHERE device_id=? AND status IN ('PENDING','DELIVERED','RECEIVED')
+                  AND command_type = 'START_DESKTOP'
+                  AND issued_at <= ?
+                """,
+                (now, cid, now),
             )
         conn.execute(
             """
@@ -151,7 +157,6 @@ def enqueue(
                 0, "",
             ),
         )
-        conn.commit()
     return {"ok": True, "commandId": cmd_id, "commandType": ctype, "policyEpoch": int(policy_epoch or 0)}
 
 
@@ -162,7 +167,6 @@ def _row_to_wire(r: Any) -> dict[str, Any]:
     except Exception:
         payload = {}
     ctype = r["command_type"]
-    # Legacy wire shapes for old clients via pop_command bridge
     legacy_type = {
         "REVOKE_RUNTIME": "deny_run",
         "SUSPEND_RUNTIME": "deny_run",
@@ -196,24 +200,32 @@ def _row_to_wire(r: Any) -> dict[str, Any]:
 
 
 def pop_next(device_id: str) -> dict[str, Any] | None:
-    """Deliver highest-priority pending command (REVOKE first). Marks DELIVERED."""
+    """Deliver highest-priority command; redeliver after lease if un-acked."""
     cid = str(device_id or "").strip()
     if not cid or cid == "unknown":
         return None
     now = sdb.now_ts()
-    with _lock:
+    lease_cutoff = now - COMMAND_DELIVERY_LEASE_SEC
+    with sdb.transaction():
         conn = sdb.get_conn()
         conn.execute(
             """
             UPDATE device_commands SET status='EXPIRED', failed_at=?, failure_reason='expired'
-            WHERE device_id=? AND status IN ('PENDING','DELIVERED') AND expires_at < ?
+            WHERE device_id=? AND status IN ('PENDING','DELIVERED','RECEIVED') AND expires_at < ?
             """,
             (now, cid, now),
         )
         rows = conn.execute(
             """
             SELECT * FROM device_commands
-            WHERE device_id=? AND status='PENDING'
+            WHERE device_id=? AND expires_at >= ?
+              AND (
+                status='PENDING'
+                OR (
+                  status IN ('DELIVERED','RECEIVED')
+                  AND (last_delivery_at IS NULL OR last_delivery_at <= ?)
+                )
+              )
             ORDER BY
               CASE command_type
                 WHEN 'REVOKE_RUNTIME' THEN 0
@@ -228,10 +240,9 @@ def pop_next(device_id: str) -> dict[str, Any] | None:
               issued_at ASC
             LIMIT 1
             """,
-            (cid,),
+            (cid, now, lease_cutoff),
         ).fetchall()
         if not rows:
-            conn.commit()
             return None
         r = rows[0]
         conn.execute(
@@ -242,8 +253,27 @@ def pop_next(device_id: str) -> dict[str, Any] | None:
             """,
             (now, r["command_id"]),
         )
-        conn.commit()
         return _row_to_wire(r)
+
+
+def mark_delivery_send_failed(device_id: str, command_id: str) -> None:
+    """Backdate last_delivery_at so pop_next can retry after a send failure."""
+    cid = str(device_id or "").strip()
+    cmd_id = str(command_id or "").strip()
+    if not cid or not cmd_id:
+        return
+    now = sdb.now_ts()
+    with sdb.transaction():
+        conn = sdb.get_conn()
+        conn.execute(
+            """
+            UPDATE device_commands
+            SET last_delivery_at=?
+            WHERE command_id=? AND device_id=?
+              AND status IN ('PENDING','DELIVERED','RECEIVED')
+            """,
+            (now - COMMAND_DELIVERY_LEASE_SEC, cmd_id, cid),
+        )
 
 
 def peek_pending(device_id: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -251,7 +281,7 @@ def peek_pending(device_id: str, limit: int = 20) -> list[dict[str, Any]]:
     if not cid:
         return []
     now = sdb.now_ts()
-    with _lock:
+    with sdb.db_lock:
         conn = sdb.get_conn()
         rows = conn.execute(
             """
@@ -280,7 +310,7 @@ def ack(
     if st not in ("RECEIVED", "APPLIED", "FAILED"):
         st = "APPLIED"
     now = sdb.now_ts()
-    with _lock:
+    with sdb.transaction():
         conn = sdb.get_conn()
         row = conn.execute(
             "SELECT * FROM device_commands WHERE command_id=? AND device_id=?",
@@ -290,11 +320,6 @@ def ack(
             return {"ok": False, "message": "command_not_found"}
         if row["status"] in ("APPLIED", "FAILED", "EXPIRED"):
             return {"ok": True, "duplicate": True, "status": row["status"]}
-        fields = {
-            "RECEIVED": ("received_at",),
-            "APPLIED": ("received_at", "applied_at"),
-            "FAILED": ("failed_at",),
-        }
         if st == "RECEIVED":
             conn.execute(
                 "UPDATE device_commands SET status=?, received_at=?, client_ack_signature=? WHERE command_id=?",
@@ -318,8 +343,51 @@ def ack(
                 """,
                 (st, now, str(failure_reason or "")[:200], str(client_ack_signature or "")[:200], cmd_id),
             )
-        conn.commit()
     return {"ok": True, "status": st, "commandId": cmd_id}
+
+
+def prune_terminal_commands(*, retention_days: float = 30, max_rows: int = 100_000) -> dict[str, int]:
+    """Drop old APPLIED/FAILED/EXPIRED rows; cap total terminal rows."""
+    cutoff = sdb.now_ts() - float(retention_days) * 86400.0
+    deleted = 0
+    with sdb.transaction():
+        conn = sdb.get_conn()
+        cur = conn.execute(
+            """
+            DELETE FROM device_commands
+            WHERE status IN ('APPLIED','FAILED','EXPIRED')
+              AND COALESCE(applied_at, failed_at, expires_at, issued_at) < ?
+            """,
+            (cutoff,),
+        )
+        deleted += int(cur.rowcount or 0)
+        count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM device_commands WHERE status IN ('APPLIED','FAILED','EXPIRED')"
+            ).fetchone()[0]
+        )
+        if count > int(max_rows):
+            excess = count - int(max_rows)
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    """
+                    SELECT command_id FROM device_commands
+                    WHERE status IN ('APPLIED','FAILED','EXPIRED')
+                    ORDER BY COALESCE(applied_at, failed_at, expires_at, issued_at) ASC
+                    LIMIT ?
+                    """,
+                    (excess,),
+                ).fetchall()
+            ]
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                cur2 = conn.execute(
+                    f"DELETE FROM device_commands WHERE command_id IN ({placeholders})",
+                    ids,
+                )
+                deleted += int(cur2.rowcount or 0)
+    return {"deleted": deleted}
 
 
 def legacy_wire_to_enqueue(device_id: str, cmd: dict[str, Any], policy_epoch: int = 0) -> dict[str, Any]:

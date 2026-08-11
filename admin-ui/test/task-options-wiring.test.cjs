@@ -71,10 +71,11 @@ test('send retry uses configured count and delay but stops on uncertain results'
   const main = read('electron/main.cjs')
   assert.match(page, /retryMinutes: Number\(retryMinutes\.value\)/)
   assert.match(page, /skipSame: Boolean\(skipSame\.value\)/)
-  assert.match(main, /task\?\.config\?\.autoRetry/)
-  assert.match(main, /task\.config\.retryTimes/)
+  // SEND_* 禁止可能已送达后的自动重发；仅 ADD_FRIEND 允许有限重试
+  assert.match(main, /retryCount = item\.action_type === 'ADD_FRIEND' \? 1 : 0/)
   assert.match(main, /task\?\.config\?\.retryMinutes/)
   assert.match(main, /请求结果不确定，为避免重复发送已停止任务/)
+  assert.match(main, /UNSAFE_RESUME/)
 })
 
 test('all task pacing uses the per-task fixed intervalMs', () => {

@@ -44,7 +44,9 @@ function initStorage(userDataPath) {
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS wechat_instances (id TEXT PRIMARY KEY, api_port INTEGER UNIQUE NOT NULL, tcp_port INTEGER UNIQUE NOT NULL, pid INTEGER, account_wxid TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS wechat_instances (id TEXT PRIMARY KEY, api_port INTEGER NOT NULL, tcp_port INTEGER NOT NULL, pid INTEGER, account_wxid TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_wechat_instances_api_port ON wechat_instances(api_port);
+    CREATE INDEX IF NOT EXISTS idx_wechat_instances_tcp_port ON wechat_instances(tcp_port);
     CREATE TABLE IF NOT EXISTS wechat_api_compatibility (source_id INTEGER PRIMARY KEY, api_path TEXT NOT NULL, adapter_version TEXT NOT NULL, status TEXT NOT NULL, accepted_field TEXT, verified_at TEXT, note TEXT);
     CREATE TABLE IF NOT EXISTS wechat_api_runtime_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, source_id INTEGER, api_path TEXT NOT NULL, request_json TEXT, response_json TEXT, http_status INTEGER, duration_ms INTEGER, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS contacts (wxid TEXT NOT NULL, source_instance_id TEXT NOT NULL, nickname TEXT, remark TEXT, alias TEXT, avatar TEXT, is_group INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(wxid,source_instance_id));
@@ -63,7 +65,7 @@ function initStorage(userDataPath) {
     CREATE INDEX IF NOT EXISTS idx_qr_join_daily_attempts_account_date ON qr_join_daily_attempts(account_wxid,local_date);
     CREATE TABLE IF NOT EXISTS delivered_content_history (account_wxid TEXT NOT NULL, target_id TEXT NOT NULL, content_hash TEXT NOT NULL, first_item_id TEXT NOT NULL, delivered_at TEXT NOT NULL, PRIMARY KEY(account_wxid,target_id,content_hash));
     CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL, config_json TEXT NOT NULL, total INTEGER NOT NULL DEFAULT 0, success INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS task_items (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, instance_id TEXT NOT NULL, target_key TEXT NOT NULL, action_type TEXT NOT NULL, status TEXT NOT NULL, request_json TEXT, response_json TEXT, error TEXT, started_at TEXT, finished_at TEXT, UNIQUE(task_id, target_key, action_type), FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS task_items (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, instance_id TEXT NOT NULL, account_wxid TEXT, target_key TEXT NOT NULL, action_type TEXT NOT NULL, status TEXT NOT NULL, request_json TEXT, response_json TEXT, error TEXT, started_at TEXT, finished_at TEXT, UNIQUE(task_id, instance_id, target_key, action_type), FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS risk_events (id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, risk_type TEXT NOT NULL, evidence TEXT NOT NULL, resolved INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, level TEXT NOT NULL, instance_id TEXT, module TEXT, message TEXT NOT NULL, details_json TEXT);
     CREATE TABLE IF NOT EXISTS backend_session_cache (id TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -119,6 +121,8 @@ function initStorage(userDataPath) {
     );
   `)
   migrateDirectoryOwnership(db)
+  const { runStorageSchemaMigrations } = require('./storage-schema-migrations.cjs')
+  runStorageSchemaMigrations(db)
   // 历史已确认清理的被踢群，迁移进永久屏蔽表（按微信号，重启实例仍生效）
   try {
     db.prepare(`INSERT OR IGNORE INTO blocked_chatrooms(account_wxid,room_id,room_name,reason,evidence,source_instance_id,created_at,updated_at)
@@ -207,7 +211,8 @@ function listStoredInstances() {
 }
 
 function removeInstance(id) { database().prepare('DELETE FROM wechat_instances WHERE id=?').run(id) }
-function removeInactiveInstancesByPorts(apiPort, tcpPort) { database().prepare('DELETE FROM wechat_instances WHERE api_port=? OR tcp_port=?').run(apiPort, tcpPort) }
+/** @deprecated 端口不是历史身份；保留空操作兼容旧调用，不再 DELETE metadata */
+function removeInactiveInstancesByPorts(_apiPort, _tcpPort) { /* no-op: ports are runtime-only */ }
 
 function saveLog(entry) {
   database().prepare('INSERT INTO logs(time,level,instance_id,module,message,details_json) VALUES(?,?,?,?,?,?)').run(entry.time, entry.level, entry.instanceId ?? null, entry.module ?? null, entry.message, JSON.stringify(entry.details ?? entry))
@@ -532,23 +537,64 @@ function listFriendAddStatuses(targets = []) {
 function createTask(task, items) {
   const now = new Date().toISOString()
   let inserted = 0
+  let duplicates = 0
   database().exec('BEGIN IMMEDIATE')
   try {
     database().prepare('INSERT INTO tasks(id,name,type,status,config_json,total,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)').run(task.id, task.name, task.type, task.status, JSON.stringify(task.config), 0, now, now)
-    const insert = database().prepare('INSERT INTO task_items(id,task_id,instance_id,target_key,action_type,status,request_json) VALUES(?,?,?,?,?,?,?)')
+    const insert = database().prepare('INSERT INTO task_items(id,task_id,instance_id,account_wxid,target_key,action_type,status,request_json) VALUES(?,?,?,?,?,?,?,?)')
     for (const item of items) {
-      insert.run(item.id, task.id, item.instanceId, item.targetKey, item.actionType, item.status, JSON.stringify(item.request ?? null))
-      inserted += 1
+      const accountWxid = String(item.accountWxid || item.account_wxid || '').trim()
+        || String(database().prepare('SELECT COALESCE(account_wxid,\'\') AS a FROM wechat_instances WHERE id=?').get(item.instanceId)?.a || '').trim()
+      try {
+        insert.run(item.id, task.id, item.instanceId, accountWxid || null, item.targetKey, item.actionType, item.status, JSON.stringify(item.request ?? null))
+        inserted += 1
+      } catch (error) {
+        if (String(error?.message || error).includes('UNIQUE')) {
+          duplicates += 1
+          continue
+        }
+        throw error
+      }
     }
     if (!inserted) {
       database().prepare('DELETE FROM tasks WHERE id=?').run(task.id)
       database().exec('COMMIT')
-      return { inserted, duplicates: 0 }
+      return { inserted, duplicates }
     }
     database().prepare('UPDATE tasks SET total=? WHERE id=?').run(inserted, task.id)
     database().exec('COMMIT')
-    return { inserted, duplicates: 0 }
+    return { inserted, duplicates }
   } catch (error) { database().exec('ROLLBACK'); throw error }
+}
+
+function updateTaskItemInstanceId(itemId, newInstanceId) {
+  const id = String(itemId || '')
+  const next = String(newInstanceId || '')
+  if (!id || !next) return false
+  database().prepare('UPDATE task_items SET instance_id=? WHERE id=?').run(next, id)
+  return true
+}
+
+function releaseFriendDailyAttempt(itemId) {
+  const id = String(itemId || '')
+  if (!id) return false
+  return database().prepare('DELETE FROM friend_daily_attempts WHERE item_id=?').run(id).changes > 0
+}
+
+function releaseQrJoinDailyAttempt(itemId) {
+  const id = String(itemId || '')
+  if (!id) return false
+  return database().prepare('DELETE FROM qr_join_daily_attempts WHERE item_id=?').run(id).changes > 0
+}
+
+function migrateDirectorySnapshotToInstance(oldInstanceId, newInstanceId) {
+  const { migrateDirectorySnapshotOwnership } = require('./storage-schema-migrations.cjs')
+  return migrateDirectorySnapshotOwnership(database(), oldInstanceId, newInstanceId)
+}
+
+function rebindChatAddCandidatesForAccount(accountWxid, newInstanceId, onlineInstanceIds) {
+  const { rebindPendingChatAddCandidates } = require('./storage-schema-migrations.cjs')
+  return rebindPendingChatAddCandidates(database(), accountWxid, newInstanceId, onlineInstanceIds)
 }
 
 function listTasks() {
@@ -676,7 +722,7 @@ function cancelTask(taskId) {
   `).run(now, id)
   const row = database().prepare(`
     SELECT SUM(status IN ('COMPLETED','SUBMITTED','REQUEST_SENT')) success,
-           SUM(status IN ('FAILED','FREQUENT','RESOLUTION_FAILED')) failed,
+           SUM(status IN ('FAILED','FREQUENT','RESOLUTION_FAILED','UNSAFE_RESUME')) failed,
            SUM(status IN ('SKIPPED','CANCELLED')) skipped
     FROM task_items WHERE task_id=?
   `).get(id)
@@ -705,7 +751,7 @@ function setTaskItemStarted(id) { database().prepare("UPDATE task_items SET stat
 function setTaskItemResult(id, status, response, error) {
   database().prepare('UPDATE task_items SET status=?,response_json=?,error=?,finished_at=? WHERE id=?').run(status, JSON.stringify(response ?? null), error ?? null, new Date().toISOString(), id)
   // FREQUENT 不计 success；CANCELLED 计入 skipped，避免取消后进度对不上
-  const row = database().prepare(`SELECT SUM(status IN ('COMPLETED','SUBMITTED','REQUEST_SENT')) success,SUM(status IN ('FAILED','FREQUENT','RESOLUTION_FAILED')) failed,SUM(status IN ('SKIPPED','CANCELLED')) skipped FROM task_items WHERE task_id=(SELECT task_id FROM task_items WHERE id=?)`).get(id)
+  const row = database().prepare(`SELECT SUM(status IN ('COMPLETED','SUBMITTED','REQUEST_SENT')) success,SUM(status IN ('FAILED','FREQUENT','RESOLUTION_FAILED','UNSAFE_RESUME')) failed,SUM(status IN ('SKIPPED','CANCELLED')) skipped FROM task_items WHERE task_id=(SELECT task_id FROM task_items WHERE id=?)`).get(id)
   database().prepare('UPDATE tasks SET success=?,failed=?,skipped=?,updated_at=? WHERE id=(SELECT task_id FROM task_items WHERE id=?)').run(Number(row.success), Number(row.failed), Number(row.skipped), new Date().toISOString(), id)
 }
 
@@ -730,10 +776,10 @@ function repairConfirmedSendTextResults() {
     if (response?.errCode === 1 || response?.code === 1) { update.run(row.id); affected.add(row.task_id) }
   }
   const summarize = database().prepare(`UPDATE tasks SET
-    success=(SELECT COUNT(*) FROM task_items WHERE task_id=tasks.id AND status='COMPLETED'),
-    failed=(SELECT COUNT(*) FROM task_items WHERE task_id=tasks.id AND status='FAILED'),
-    skipped=(SELECT COUNT(*) FROM task_items WHERE task_id=tasks.id AND status='SKIPPED'),
-    status=CASE WHEN (SELECT COUNT(*) FROM task_items WHERE task_id=tasks.id AND status='FAILED')=0 THEN 'COMPLETED' ELSE 'PARTIAL_FAILED' END,
+    success=(SELECT COUNT(*) FROM task_items WHERE task_id=tasks.id AND status IN ('COMPLETED','SUBMITTED','REQUEST_SENT')),
+    failed=(SELECT COUNT(*) FROM task_items WHERE task_id=tasks.id AND status IN ('FAILED','FREQUENT','RESOLUTION_FAILED','UNSAFE_RESUME')),
+    skipped=(SELECT COUNT(*) FROM task_items WHERE task_id=tasks.id AND status IN ('SKIPPED','CANCELLED')),
+    status=CASE WHEN (SELECT COUNT(*) FROM task_items WHERE task_id=tasks.id AND status IN ('FAILED','FREQUENT','RESOLUTION_FAILED','UNSAFE_RESUME'))=0 THEN 'COMPLETED' ELSE 'PARTIAL_FAILED' END,
     updated_at=? WHERE id=?`)
   for (const taskId of affected) summarize.run(new Date().toISOString(), taskId)
   return affected.size
@@ -1287,8 +1333,12 @@ function listChatAddCandidates(filters = {}) {
     params.push(String(filters.status))
   }
   if (filters.instanceId) {
-    clauses.push('instance_id=?')
-    params.push(String(filters.instanceId))
+    clauses.push('(instance_id=? OR (account_wxid!=\'\' AND account_wxid=(SELECT COALESCE(account_wxid,\'\') FROM wechat_instances WHERE id=?)))')
+    params.push(String(filters.instanceId), String(filters.instanceId))
+  }
+  if (filters.accountWxid) {
+    clauses.push('account_wxid=?')
+    params.push(String(filters.accountWxid))
   }
   if (Array.isArray(filters.roomIds)) {
     const roomIds = [...new Set(filters.roomIds.map(String).filter(Boolean))]
@@ -1596,7 +1646,7 @@ module.exports = {
   initStorage, database, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts,
   saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, sanitizeApiSampleValue, saveEvent, listMessageEventsForKickScan, recordMemberJoin, listMemberJoins, listFriendAddStatuses,
   createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks,
-  repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent,
+  repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, releaseFriendDailyAttempt, releaseQrJoinDailyAttempt, updateTaskItemInstanceId, migrateDirectorySnapshotToInstance, rebindChatAddCandidatesForAccount, hasDeliveredContent, recordDeliveredContent,
   hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType,
   getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates,
   upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms,

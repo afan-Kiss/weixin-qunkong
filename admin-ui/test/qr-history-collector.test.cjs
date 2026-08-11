@@ -199,7 +199,7 @@ test('QR history UI supports multi-room collection and offline decoding', () => 
   assert.match(page, /maxImages: 0/)
   assert.doesNotMatch(page, /每群最多检查图片/)
   assert.match(main, /unlimited \? 0/)
-  assert.match(main, /limitSql/)
+  assert.match(main, /buildHistoryImagePageSql|pageSize = 300/)
   assert.match(collector, /cdnmidImgUrl/)
   assert.match(main, /qr:collect-progress/)
   assert.match(main, /historyCollectRunning/)

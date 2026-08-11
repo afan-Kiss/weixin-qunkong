@@ -6,10 +6,12 @@ import sqlite3
 import atexit
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 _lock = threading.RLock()
+db_lock = _lock
 _conn: sqlite3.Connection | None = None
 _db_path: Path | None = None
 
@@ -78,9 +80,31 @@ def configure(data_dir: Path) -> Path:
 
 
 def get_conn() -> sqlite3.Connection:
+    """Return the shared SQLite connection.
+
+    Readers may call get_conn() directly; writers must hold ``db_lock`` or use
+    ``transaction()`` so commits roll back correctly on error.
+    """
     if _conn is None:
         raise RuntimeError("security_db not configured")
     return _conn
+
+
+@contextmanager
+def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """Acquire ``db_lock``, optionally BEGIN IMMEDIATE, yield conn, commit/rollback."""
+    with _lock:
+        conn = get_conn()
+        if immediate:
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            conn.execute("BEGIN")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def now_ts() -> float:

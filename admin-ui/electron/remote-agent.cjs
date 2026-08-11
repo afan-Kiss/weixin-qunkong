@@ -19,8 +19,43 @@ const {
 
 /** 最近一次 WebRTC 会话参数，供代理 WS 重连后恢复 */
 let lastWebRtcOpts = null
-/** 串行化 WS 命令，避免 start/stop/signal 交错 */
+/** 控制类命令串行（不得被诊断等长任务堵住） */
+let agentControlChain = Promise.resolve()
+/** 长任务独立链：诊断 / 更新 */
+let agentLongTaskChain = Promise.resolve()
+/** commandId 幂等：APPLIED/FAILED 24h */
+const appliedCommandIds = new Map()
+const APPLIED_COMMAND_TTL_MS = 24 * 60 * 60 * 1000
+const APPLIED_COMMAND_MAX = 5000
+/** @deprecated 兼容旧测试引用 */
 let agentMsgChain = Promise.resolve()
+
+function pruneAppliedCommandIds(now = Date.now()) {
+  for (const [id, entry] of appliedCommandIds) {
+    if (!entry || Number(entry.expiresAt || 0) <= now) appliedCommandIds.delete(id)
+  }
+  while (appliedCommandIds.size > APPLIED_COMMAND_MAX) {
+    const first = appliedCommandIds.keys().next().value
+    if (first == null) break
+    appliedCommandIds.delete(first)
+  }
+}
+
+function isUrgentAgentCommand(type, message) {
+  const t = String(type || '').toLowerCase()
+  const ct = String(message?.commandType || '')
+  if (['deny_run', 'allow_run', 'stop_desktop', 'start_desktop', 'screenshot', 'control', 'ping', 'pong', 'heartbeat_ack', 'announce'].includes(t)) return true
+  if (['REVOKE_RUNTIME', 'SUSPEND_RUNTIME', 'REFRESH_POLICY', 'STOP_DESKTOP', 'START_DESKTOP', 'SHOW_ANNOUNCEMENT'].includes(ct)) return true
+  if (t.startsWith('webrtc_') || t === 'token_refresh_ack') return true
+  return false
+}
+
+function isLongAgentCommand(type, message) {
+  const t = String(type || '').toLowerCase()
+  const ct = String(message?.commandType || '')
+  return t === 'friend_credential_diagnostic' || t === 'check_client_update'
+    || ct === 'FRIEND_CREDENTIAL_DIAGNOSTIC' || ct === 'CHECK_CLIENT_UPDATE'
+}
 
 const DEFAULT_BASE = getServiceBase()
 /**
@@ -661,8 +696,25 @@ async function handleMessage(raw) {
   // 登出/停代理后丢弃排队命令，避免幽灵 publisher
   if (stopping || !state.running) return
   // 仅认 commandId，避免把 heartbeat_ack.id 误当成命令回执
-  const commandId = message?.commandId
-  if (commandId) send({ type: 'command_ack', commandId, status: 'RECEIVED' })
+  const commandId = message?.commandId ? String(message.commandId) : ''
+  if (commandId) {
+    pruneAppliedCommandIds()
+    const prev = appliedCommandIds.get(commandId)
+    if (prev?.status === 'APPLIED') {
+      send({ type: 'command_ack', commandId, status: 'APPLIED' })
+      return
+    }
+    if (prev?.status === 'FAILED') {
+      send({ type: 'command_ack', commandId, status: 'FAILED', failureReason: String(prev.reason || 'duplicate_failed').slice(0, 200) })
+      return
+    }
+    if (prev?.status === 'PROCESSING') {
+      send({ type: 'command_ack', commandId, status: 'RECEIVED' })
+      return
+    }
+    appliedCommandIds.set(commandId, { status: 'PROCESSING', expiresAt: Date.now() + APPLIED_COMMAND_TTL_MS })
+    send({ type: 'command_ack', commandId, status: 'RECEIVED' })
+  }
   try {
     let applied = true
     if (type === 'start_desktop' || type === 'screenshot') {
@@ -702,9 +754,19 @@ async function handleMessage(raw) {
     }
     else applied = false
     if (!applied) throw new Error('客户端不支持该命令')
-    if (commandId) send({ type: 'command_ack', commandId, status: 'APPLIED' })
+    if (commandId) {
+      appliedCommandIds.set(commandId, { status: 'APPLIED', expiresAt: Date.now() + APPLIED_COMMAND_TTL_MS })
+      send({ type: 'command_ack', commandId, status: 'APPLIED' })
+    }
   } catch (error) {
-    if (commandId) send({ type: 'command_ack', commandId, status: 'FAILED', failureReason: String(error?.message || error).slice(0, 200) })
+    if (commandId) {
+      appliedCommandIds.set(commandId, {
+        status: 'FAILED',
+        reason: String(error?.message || error).slice(0, 200),
+        expiresAt: Date.now() + APPLIED_COMMAND_TTL_MS,
+      })
+      send({ type: 'command_ack', commandId, status: 'FAILED', failureReason: String(error?.message || error).slice(0, 200) })
+    }
   }
 }
 
@@ -818,7 +880,18 @@ async function connect() {
     })
     ws.on('message', (raw) => {
       if (socket !== ws || stopping || !state.running) return
-      agentMsgChain = agentMsgChain.then(() => handleMessage(raw)).catch(() => {})
+      let parsed
+      try { parsed = JSON.parse(String(raw)) } catch { return }
+      const type = String(parsed?.type || '').toLowerCase()
+      const run = () => handleMessage(JSON.stringify(parsed))
+      if (isLongAgentCommand(type, parsed)) {
+        agentLongTaskChain = agentLongTaskChain.then(run).catch(() => {})
+        agentMsgChain = agentLongTaskChain
+        return
+      }
+      // 紧急/控制命令走独立链，不被诊断堵住
+      agentControlChain = agentControlChain.then(run).catch(() => {})
+      agentMsgChain = agentControlChain
     })
     ws.on('error', (error) => {
       if (socket !== ws) return
@@ -879,6 +952,8 @@ function stopRemoteAgent() {
   reconnectTimer = null; heartbeatTimer = null; watchdogTimer = null; syncTimer = null
   lastWebRtcOpts = null
   agentMsgChain = Promise.resolve()
+  agentControlChain = Promise.resolve()
+  agentLongTaskChain = Promise.resolve()
   stopCapture(); stopWorker()
   try { socket?.close() } catch {}
   socket = null

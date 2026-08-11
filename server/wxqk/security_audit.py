@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import json
 import secrets
-import threading
 from typing import Any
 
 import security_db as sdb
-
-_lock = threading.Lock()
 
 
 def emit(
@@ -28,7 +25,6 @@ def emit(
     now = sdb.now_ts()
     detail_json = ""
     if detail:
-        # Never persist secrets
         safe = {
             k: v for k, v in detail.items()
             if str(k).lower() not in ("password", "token", "authorization", "cookie", "signature")
@@ -37,7 +33,7 @@ def emit(
             detail_json = json.dumps(safe, ensure_ascii=False, separators=(",", ":"))[:2000]
         except Exception:
             detail_json = ""
-    with _lock:
+    with sdb.transaction():
         conn = sdb.get_conn()
         conn.execute(
             """
@@ -55,5 +51,39 @@ def emit(
                 str(reason_code or "")[:80], detail_json,
             ),
         )
-        conn.commit()
     return eid
+
+
+def prune_security_audit(*, retention_days: float = 90, max_rows: int = 500_000) -> dict[str, int]:
+    """Drop old audit rows; cap total row count."""
+    cutoff = sdb.now_ts() - float(retention_days) * 86400.0
+    deleted = 0
+    with sdb.transaction():
+        conn = sdb.get_conn()
+        cur = conn.execute(
+            "DELETE FROM security_audit WHERE timestamp < ?",
+            (cutoff,),
+        )
+        deleted += int(cur.rowcount or 0)
+        count = int(conn.execute("SELECT COUNT(*) FROM security_audit").fetchone()[0])
+        if count > int(max_rows):
+            excess = count - int(max_rows)
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    """
+                    SELECT event_id FROM security_audit
+                    ORDER BY timestamp ASC
+                    LIMIT ?
+                    """,
+                    (excess,),
+                ).fetchall()
+            ]
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                cur2 = conn.execute(
+                    f"DELETE FROM security_audit WHERE event_id IN ({placeholders})",
+                    ids,
+                )
+                deleted += int(cur2.rowcount or 0)
+    return {"deleted": deleted}

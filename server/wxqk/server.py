@@ -193,6 +193,16 @@ _ip_log_rotator = (
     if ThrottledRotator
     else None
 )
+_friend_diag_rotator = (
+    ThrottledRotator(
+        trigger_bytes=40 * 1024 * 1024,
+        target_bytes=20 * 1024 * 1024,
+        interval_sec=120.0,
+        event_threshold=100,
+    )
+    if ThrottledRotator
+    else None
+)
 
 # --- realtime desktop WS hubs ---
 _agent_ws: dict[str, Any] = {}   # clientId -> socket
@@ -344,16 +354,78 @@ def list_wx_sync() -> list[dict[str, Any]]:
     return rows
 
 
+def _redact_friend_diagnostic_value(value: Any) -> Any:
+    """Recursively redact strings that may contain credentials or secrets."""
+    if isinstance(value, dict):
+        return {k: _redact_friend_diagnostic_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_friend_diagnostic_value(v) for v in value]
+    if isinstance(value, str):
+        lower = value.lower()
+        if (
+            "v3_" in lower
+            or "v4_" in lower
+            or "bearer " in lower
+            or "authorization" in lower
+            or "token" in lower
+            or "cookie" in lower
+            or "secret" in lower
+        ):
+            return "[REDACTED]"
+        return value
+    return value
+
+
+def prune_friend_diagnostics(*, max_files: int = 1000, retention_days: float = 30) -> dict[str, int]:
+    """Remove old friend diagnostic JSON files; keep at most max_files newest."""
+    removed = 0
+    if not FRIEND_DIAG_DIR.exists():
+        return {"removed": 0}
+    cutoff = now_ts() - float(retention_days) * 86400.0
+    files = sorted(
+        (p for p in FRIEND_DIAG_DIR.glob("*.json") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    keep = set(files[: max(0, int(max_files))])
+    for path in files:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if path in keep and mtime >= cutoff:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            pass
+    index_path = FRIEND_DIAG_DIR / "index.jsonl"
+    if _friend_diag_rotator is not None:
+        _friend_diag_rotator.maybe_rotate(index_path)
+    elif index_path.exists():
+        try:
+            from text_rotate import rotate_keep_tail_bytes
+            rotate_keep_tail_bytes(
+                index_path,
+                trigger_bytes=40 * 1024 * 1024,
+                target_bytes=20 * 1024 * 1024,
+            )
+        except Exception:
+            pass
+    return {"removed": removed}
+
+
 def save_friend_diagnostic(report: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(report, dict):
         return {"ok": False, "message": "bad_report"}
     diagnostic_id = str(report.get("diagnosticId") or secrets.token_hex(8)).strip()
     client_id = safe_id(report.get("clientId") or "")
-    # Never persist full V3/V4 if a buggy client sends them
-    cleaned = dict(report)
+    cleaned = _redact_friend_diagnostic_value(dict(report))
     for key in ("v3", "v4", "_v3", "_v4", "_keepV3", "_keepV4"):
-        cleaned.pop(key, None)
-    probes = cleaned.get("probes")
+        if isinstance(cleaned, dict):
+            cleaned.pop(key, None)
+    probes = cleaned.get("probes") if isinstance(cleaned, dict) else None
     if isinstance(probes, list):
         safe_probes = []
         for probe in probes:
@@ -370,7 +442,8 @@ def save_friend_diagnostic(report: dict[str, Any]) -> dict[str, Any]:
     FRIEND_DIAG_DIR.mkdir(parents=True, exist_ok=True)
     path = FRIEND_DIAG_DIR / f"{diagnostic_id}.json"
     path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
-    with (FRIEND_DIAG_DIR / "index.jsonl").open("a", encoding="utf-8") as f:
+    index_path = FRIEND_DIAG_DIR / "index.jsonl"
+    with index_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps({
             "t": cleaned["savedAt"],
             "diagnosticId": diagnostic_id,
@@ -380,6 +453,13 @@ def save_friend_diagnostic(report: dict[str, Any]) -> dict[str, Any]:
             "accountWxid": cleaned.get("accountWxid"),
             "targetUserName": cleaned.get("targetUserName"),
         }, ensure_ascii=False, separators=(",", ":")) + "\n")
+    if _friend_diag_rotator is not None:
+        _friend_diag_rotator.note_append()
+        _friend_diag_rotator.maybe_rotate(index_path)
+    try:
+        prune_friend_diagnostics()
+    except Exception:
+        pass
     return {"ok": True, "diagnosticId": diagnostic_id}
 
 

@@ -3,7 +3,7 @@ const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, clipboard,
 // 部分机器 GPU/驱动异常会导致进程在但窗口不显示/白屏
 try { app.disableHardwareAcceleration() } catch {}
 const { createHash, randomUUID } = require('crypto')
-const { createReadStream, createWriteStream, existsSync, mkdirSync, appendFileSync, readFileSync, writeFileSync, unlinkSync, statSync } = require('fs')
+const { createReadStream, createWriteStream, existsSync, mkdirSync, appendFileSync, readFileSync, writeFileSync, unlinkSync, statSync, readdirSync } = require('fs')
 const { readdir, stat } = require('fs/promises')
 const { pipeline } = require('stream/promises')
 const { spawn, execFile } = require('child_process')
@@ -12,7 +12,7 @@ const net = require('net')
 const http = require('http')
 const https = require('https')
 const path = require('path')
-const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms, markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, loadDirectoryExcludedRoomIdSetForInstance, listBlockedChatrooms, hasQrContentHash } = require('./storage.cjs')
+const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, releaseFriendDailyAttempt, releaseQrJoinDailyAttempt, updateTaskItemInstanceId, migrateDirectorySnapshotToInstance, rebindChatAddCandidatesForAccount, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms, markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, loadDirectoryExcludedRoomIdSetForInstance, listBlockedChatrooms, hasQrContentHash } = require('./storage.cjs')
 const { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, hasFrequentEvidence, isVerifiedSuccess, buildAddFriendRequest, evaluateFriendAddResult, isRetryableFriendCredentialFailure } = require('./protocol.cjs')
 const { createSerialExecutor, parseInjectorOutput, decodeInjectorChunks, waitForInjectorClose } = require('./instance-runtime.cjs')
 const { rawErrorMessage, toUserErrorMessage } = require('./user-error.cjs')
@@ -20,6 +20,9 @@ const { parseProfileCredentials, rawStructure } = require('./friend-profile.cjs'
 const { resolveFriendProfileCredentials } = require('./friend-credential-resolve.cjs')
 const { requestWechatRead, clearInstanceCache, invalidateInstanceApi, getReadBrokerStats, resetAllStats, READ_API_WHITELIST } = require('./wechat-read-broker.cjs')
 const { runFriendCredentialDiagnostic } = require('./friend-credential-diagnostic.cjs')
+const { resolveTaskItemInstance } = require('./task-instance-resolve.cjs')
+const { resolveIpcApiTimeout } = require('./ipc-api-timeout.cjs')
+const { buildHistoryImagePageSql } = require('./qr-history-pagination.cjs')
 const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
 const softwareAuth = require('./software-auth.cjs')
 const { safeFolderName, classifyQrText, qrTypeLabel, contentHash, messageTableName, rowsFromApi, valueOf, fieldString, existingImagePath, cdnDownloadRequest, downloadRequest, decodeNativeImages, accurateFileName, prepareHistoryMessageRow, yieldMain, normalizeQrText } = require('./qr-collector.cjs')
@@ -246,8 +249,27 @@ function rebindQrMonitorRoomsForInstance(record) {
   if (!record?.id || !record?.accountWxid) return false
   if (!Array.isArray(qrMonitorConfig.rooms) || !qrMonitorConfig.rooms.length) return false
   const { rooms, changed, rebound } = rebindMonitorRoomsForAccount(qrMonitorConfig.rooms, record, instances)
-  if (!changed) return false
-  qrMonitorConfig = { ...qrMonitorConfig, rooms }
+  // 最终按 pair 去重，避免 AAA-room1 与 BBB-room1 并存或重复
+  const dedup = new Map()
+  for (const room of rooms) {
+    const normalized = normalizeMonitorRoom(room)
+    if (!normalized) continue
+    const key = monitorRoomKey(normalized.instanceId, normalized.roomId)
+    const prev = dedup.get(key)
+    if (!prev) {
+      dedup.set(key, normalized)
+      continue
+    }
+    dedup.set(key, {
+      ...prev,
+      accountWxid: normalized.accountWxid || prev.accountWxid || '',
+      name: (normalized.name && normalized.name !== '群聊') ? normalized.name : prev.name,
+    })
+  }
+  const nextRooms = [...dedup.values()]
+  const dedupChanged = JSON.stringify(nextRooms) !== JSON.stringify(qrMonitorConfig.rooms || [])
+  if (!changed && !dedupChanged) return false
+  qrMonitorConfig = { ...qrMonitorConfig, rooms: nextRooms }
   rebuildQrMonitorRoomIndex()
   try { saveSetting('qrMonitor', qrMonitorConfig) } catch { /* ignore */ }
   notifyQrMonitorRoomsChanged({ reason: 'instance-rebind', added: [] })
@@ -284,6 +306,70 @@ function migrateQrMonitorAccountWxids() {
  * 向渲染进程广播监控群列表变化（用于 UI 自增长显示）。
  * @param {{ added?: Array<{ instanceId: string, roomId: string, name: string }>, reason?: string }} [detail]
  */
+
+
+const CLIPBOARD_IMAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const CLIPBOARD_IMAGE_MAX = 200
+
+function collectProtectedClipboardPaths() {
+  const protectedPaths = new Set()
+  try {
+    for (const task of listTasks()) {
+      if (!['QUEUED', 'RUNNING', 'PAUSED', 'COOLING_DOWN', 'WAITING_CONFIRMATION'].includes(String(task.status || ''))) continue
+      for (const item of getTaskItems(task.id)) {
+        if (String(item.action_type || '') !== 'SEND_IMAGE') continue
+        if (!['QUEUED', 'RUNNING', 'PAUSED', 'COOLING_DOWN', 'WAITING_CONFIRMATION', 'PROFILE_PENDING', 'CREDENTIALS_READY'].includes(String(item.status || ''))) continue
+        let req = {}
+        try { req = JSON.parse(item.request_json || '{}') } catch { req = {} }
+        const fp = String(req.filepath || req.imagePath || req.filePath || req.path || '').trim()
+        if (fp) protectedPaths.add(path.normalize(fp))
+      }
+    }
+  } catch { /* ignore */ }
+  return protectedPaths
+}
+
+function pruneClipboardImageCache(folder) {
+  try {
+    if (!existsSync(folder)) return
+    const protectedPaths = collectProtectedClipboardPaths()
+    const now = Date.now()
+    const files = readdirSync(folder)
+      .filter((name) => /^clipboard-.*\.png$/i.test(name))
+      .map((name) => {
+        const full = path.join(folder, name)
+        let mtimeMs = 0
+        try { mtimeMs = statSync(full).mtimeMs } catch { mtimeMs = 0 }
+        return { full, mtimeMs }
+      })
+      .sort((a, b) => a.mtimeMs - b.mtimeMs)
+    for (const file of files) {
+      if (protectedPaths.has(path.normalize(file.full))) continue
+      if (now - file.mtimeMs > CLIPBOARD_IMAGE_TTL_MS) {
+        try { unlinkSync(file.full) } catch { /* ignore */ }
+      }
+    }
+    const remaining = files.filter((file) => existsSync(file.full) && !protectedPaths.has(path.normalize(file.full)))
+    while (remaining.length > CLIPBOARD_IMAGE_MAX) {
+      const oldest = remaining.shift()
+      if (!oldest) break
+      try { unlinkSync(oldest.full) } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+function safeBroadcast(channel, payload) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    try {
+      if (!win || win.isDestroyed()) continue
+      if (!win.webContents || win.webContents.isDestroyed()) continue
+      win.webContents.send(channel, payload)
+    } catch {
+      /* 绝不能 appLog，避免广播失败递归 */
+    }
+  }
+}
+
 function notifyQrMonitorRoomsChanged(detail = {}) {
   const payload = {
     enabled: Boolean(qrMonitorConfig.enabled),
@@ -293,9 +379,7 @@ function notifyQrMonitorRoomsChanged(detail = {}) {
     added: Array.isArray(detail.added) ? detail.added : [],
     reason: String(detail.reason || ''),
   }
-  for (const win of BrowserWindow.getAllWindows()) {
-    try { win.webContents.send('qr:monitor-rooms-changed', payload) } catch { /* ignore */ }
-  }
+  safeBroadcast('qr:monitor-rooms-changed', payload)
 }
 
 /**
@@ -827,7 +911,7 @@ function appLog(level, message, details = {}) {
     appendJsonlLog(logDir, entry)
   } catch {}
   try { saveLog(entry) } catch {}
-  for (const win of BrowserWindow.getAllWindows()) win.webContents.send('wechat:log', entry)
+  safeBroadcast('wechat:log', entry)
 }
 
 const apiOperationLabels = {
@@ -895,41 +979,60 @@ async function collectRoomQrImages(record, room, options, context) {
     const selectCols = ['local_id', 'server_id', 'message_content', typeColumn, orderColumn].filter(Boolean)
       .filter((name, index, arr) => arr.findIndex((item) => String(item).toLowerCase() === String(name).toLowerCase()) === index)
       .map((name) => quoteSqlIdentifier(name))
-    const limitSql = limit > 0 ? ` LIMIT ${limit}` : ''
-    const sql = `SELECT ${selectCols.join(', ')} FROM ${quoteSqlIdentifier(table)} WHERE ${quoteSqlIdentifier(typeColumn)}=3${orderColumn ? ` ORDER BY ${quoteSqlIdentifier(orderColumn)} DESC` : ''}${limitSql}`
-    const messagesResult = await requestApi(record, '/api/sqlite3_exec', { db_name: databaseName, sql_fmt: sql }, 20000)
-    if (!messagesResult.response.ok) continue
-    const rows = rowsFromApi(messagesResult.raw)
-    await yieldMain()
-    for (const rawRow of rows) {
-      result.checked += 1
-      if (typeof options.onProgress === 'function') {
-        try { options.onProgress({ roomName: room.name, checked: result.checked, total: rows.length, saved: result.saved }) } catch { /* ignore */ }
-      }
-      const row = prepareHistoryMessageRow(rawRow)
-      const temporaryFolder = path.join(app.getPath('temp'), 'wx-group-qr-collector')
-      mkdirSync(temporaryFolder, { recursive: true })
-      const temporaryPath = path.join(temporaryFolder, `${randomUUID()}.jpg`)
-      // 历史采集只用 CDN（单次超时），避免 download_img 长时间挂起导致假死
-      const viaCdn = await tryDownloadQrImageViaCdn(record, row, temporaryPath, { timeoutMs: 8000, maxAttempts: 1 })
-      if (!viaCdn) {
-        deleteTemporaryImage(temporaryPath)
-        result.unavailable += 1
-        await yieldMain()
-        continue
-      }
-      const classified = await saveClassifiedQrImage(record, room, temporaryPath, row, {
-        ...options,
-        validateLinks: false,
-        decodeMode: 'fast',
-        existingHashes,
+    const pageSize = 300
+    let remaining = unlimited ? null : limit
+    let afterLocalId = null
+    const orderKey = orderColumn || 'local_id'
+    while (remaining == null || remaining > 0) {
+      const page = buildHistoryImagePageSql({
+        table,
+        typeColumn,
+        orderColumn: orderKey,
+        pageSize,
+        afterLocalId,
+        maxRemaining: remaining,
       })
-      result.saved += classified.saved
-      result.duplicates += classified.duplicates
-      result.expired += classified.expired || 0
-      if (!classified.detected) result.nonQr += 1
-      deleteTemporaryImage(temporaryPath)
+      const sql = page.sql.replace(/^SELECT \*/, `SELECT ${selectCols.join(', ')}`)
+      const messagesResult = await requestApi(record, '/api/sqlite3_exec', {
+        db_name: databaseName,
+        sql_fmt: sql,
+      }, 20000)
+      if (!messagesResult.response.ok) break
+      const rows = rowsFromApi(messagesResult.raw)
+      if (!rows.length) break
       await yieldMain()
+      for (const rawRow of rows) {
+        result.checked += 1
+        if (typeof options.onProgress === 'function') {
+          try { options.onProgress({ roomName: room.name, checked: result.checked, pageSize, saved: result.saved }) } catch { /* ignore */ }
+        }
+        const row = prepareHistoryMessageRow(rawRow)
+        afterLocalId = valueOf(rawRow, [orderKey, 'local_id', 'server_id']) ?? afterLocalId
+        const temporaryFolder = path.join(app.getPath('temp'), 'wx-group-qr-collector')
+        mkdirSync(temporaryFolder, { recursive: true })
+        const temporaryPath = path.join(temporaryFolder, `${randomUUID()}.jpg`)
+        const viaCdn = await tryDownloadQrImageViaCdn(record, row, temporaryPath, { timeoutMs: 8000, maxAttempts: 1 })
+        if (!viaCdn) {
+          deleteTemporaryImage(temporaryPath)
+          result.unavailable += 1
+          await yieldMain()
+          continue
+        }
+        const classified = await saveClassifiedQrImage(record, room, temporaryPath, row, {
+          ...options,
+          validateLinks: false,
+          decodeMode: 'fast',
+          existingHashes,
+        })
+        result.saved += classified.saved
+        result.duplicates += classified.duplicates
+        result.expired += classified.expired || 0
+        if (!classified.detected) result.nonQr += 1
+        deleteTemporaryImage(temporaryPath)
+        await yieldMain()
+      }
+      if (remaining != null) remaining -= rows.length
+      if (rows.length < page.limit) break
     }
   }
   return result
@@ -1244,9 +1347,7 @@ function handleChatAddFriendEvent(record, event) {
       senderWxid: matched.hit.senderWxid,
       matchedKeyword: matched.hit.matchedKeyword || '(全量)',
     })
-    for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send('chat-add:candidate', { instanceId: record.id, candidateId: saved.id, hit: matched.hit })
-    }
+    safeBroadcast('chat-add:candidate', { instanceId: record.id, candidateId: saved.id, hit: matched.hit })
   }
   return saved
 }
@@ -1291,16 +1392,12 @@ function formatKickCleanupMessage(input) {
 }
 
 function notifyDirectoryBlockedChanged(instanceId, roomId, roomName, action = 'exclude') {
-  for (const win of BrowserWindow.getAllWindows()) {
-    try {
-      win.webContents.send('directory:blocked-changed', {
-        instanceId,
-        roomId,
-        roomName: roomName || '',
-        action: action === 'restore' ? 'restore' : 'exclude',
-      })
-    } catch { /* ignore */ }
-  }
+  safeBroadcast('directory:blocked-changed', {
+    instanceId,
+    roomId,
+    roomName: roomName || '',
+    action: action === 'restore' ? 'restore' : 'exclude',
+  })
 }
 
 /**
@@ -2243,7 +2340,7 @@ async function processQrMonitorImage(record, room, event, type) {
       queuePending: qrMonitorQueues.get(record.id)?.pending?.length || 0,
       ...result,
     })
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send('qr:monitor-result', { roomName: room.name, ...result })
+    safeBroadcast('qr:monitor-result', { roomName: room.name, ...result })
   }
 }
 
@@ -2397,11 +2494,7 @@ function startTcpReceiver(record) {
         } catch (error) { appLog('ERROR', '回调入库失败', { instanceId: record.id, error: error.message }) }
         if (record.events.length > 1000) record.events.shift()
         const eventPayload = safeCloneForIpc({ instanceId: record.id, event }, { instanceId: record.id, event: { type: 'opaque' } })
-        for (const win of BrowserWindow.getAllWindows()) {
-          try { win.webContents.send('wechat:event', eventPayload) } catch (error) {
-            appLog('ERROR', '推送微信事件失败', { instanceId: record.id, error: rawErrorMessage(error) })
-          }
-        }
+        safeBroadcast('wechat:event', eventPayload)
         void handleQrMonitorEvent(record, event)
         try { handleChatAddFriendEvent(record, event) } catch (error) { appLog('ERROR', '群聊发言加好友处理失败', { instanceId: record.id, error: error.message }) }
         try { handleKickedGroupEvent(record, event) } catch (error) { appLog('ERROR', '被踢群检测失败', { instanceId: record.id, error: error.message }) }
@@ -2492,6 +2585,18 @@ async function probeInstance(record) {
     if (loggedIn && record.status === 'ONLINE') {
       try { ensureChatAddRuleBound(record) } catch { /* 改绑失败不阻断探测 */ }
       try { rebindQrMonitorRoomsForInstance(record) } catch { /* rebind 失败不阻断探测 */ }
+      try {
+        for (const old of [...instances.values()]) {
+          if (old.id === record.id) continue
+          if (old.status !== 'STOPPED') continue
+          if (String(old.accountWxid || '') !== String(record.accountWxid || '')) continue
+          try { migrateDirectorySnapshotToInstance(old.id, record.id) } catch { /* ignore */ }
+        }
+      } catch { /* ignore */ }
+      try {
+        const onlineIds = [...instances.values()].filter((x) => x.status === 'ONLINE').map((x) => x.id)
+        rebindChatAddCandidatesForAccount(record.accountWxid, record.id, onlineIds)
+      } catch { /* ignore */ }
       try { pruneStoppedRuntimeForAccount(record) } catch { /* prune 失败不阻断 */ }
     }
     const nextInterval = loggedIn ? 10000 : 2000
@@ -3271,6 +3376,7 @@ async function applyQrOptions(record, task, item, decodedText, taskId, helpers =
     return { skippedLimit: true, reason }
   }
   if (isTaskStopRequested(taskId)) {
+    try { releaseQrJoinDailyAttempt(item.id) } catch { /* ignore */ }
     return { cancelled: true, reason: '任务已取消', preview }
   }
 
@@ -3703,9 +3809,19 @@ async function runTask(taskId) {
         setTaskItemResult(item.id, 'UNSAFE_RESUME', null, '暂停或中断时该项结果不确定，为避免重复操作已跳过')
         continue
       }
-      const record = instances.get(item.instance_id)
-      if (!record) { setTaskItemResult(item.id, 'FAILED', null, '实例不在线'); continue }
-      if (record.status !== 'ONLINE') { setTaskItemResult(item.id, 'FAILED', null, '微信尚未登录'); continue }
+      const resolved = resolveTaskItemInstance(item, instances)
+      if (!resolved.ok) {
+        setTaskItemResult(item.id, 'FAILED', null, resolved.reason || '实例不在线')
+        continue
+      }
+      const record = resolved.record
+      if (resolved.rebound) {
+        try { updateTaskItemInstanceId(item.id, record.id) } catch { /* ignore */ }
+        item.instance_id = record.id
+        appLog('INFO', '任务项已绑定到同账号新微信实例', {
+          taskId, itemId: item.id, accountWxid: item.account_wxid || record.accountWxid, instanceId: record.id,
+        })
+      }
       if (item.action_type === 'QR_SCAN' && qrFrequentInstanceIds.has(String(item.instance_id || ''))) {
         setTaskItemResult(item.id, 'SKIPPED', null, '该微信本任务内已触发加群频繁，剩余进群已跳过')
         continue
@@ -3907,15 +4023,16 @@ async function runTask(taskId) {
         }
         contentHash = item.action_type === 'SEND_TEXT' || item.action_type === 'SEND_IMAGE' ? deliveryContentHash(item.action_type, request) : ''
         if (contentHash && task?.config?.skipSame && record.accountWxid && hasDeliveredContent(record.accountWxid, item.target_key, contentHash)) {
+          if (item.action_type === 'ADD_FRIEND') {
+            try { releaseFriendDailyAttempt(item.id) } catch { /* ignore */ }
+          }
           setTaskItemResult(item.id, 'SKIPPED', null, '该微信已向此对象发送过相同内容')
           continue
         }
         setTaskItemStarted(item.id)
         const isSend = item.action_type === 'SEND_TEXT' || item.action_type === 'SEND_IMAGE'
-        // 加好友：凭证偶发失效时自动刷新重试 1 次（不依赖用户手动重跑）
-        const retryCount = isSend && task?.config?.autoRetry
-          ? Math.max(Number(task.config.retryTimes) || 0, 0)
-          : (item.action_type === 'ADD_FRIEND' ? 1 : 0)
+        // SEND_*：禁止可能已送达后的自动重发；仅 ADD_FRIEND 允许凭证刷新重试 1 次
+        const retryCount = item.action_type === 'ADD_FRIEND' ? 1 : 0
         const retryWaitMs = item.action_type === 'ADD_FRIEND'
           ? 800
           : Math.max(Number(task?.config?.retryMinutes) || 1, 1) * 60000
@@ -3973,7 +4090,12 @@ async function runTask(taskId) {
           continue
         }
         for (let attempt = 0; attempt <= retryCount; attempt += 1) {
-          if (item.action_type === 'ADD_FRIEND' && blockMutationForTaskStop(taskId, item.id)) break
+          if ((item.action_type === 'ADD_FRIEND' || isSend) && blockMutationForTaskStop(taskId, item.id)) {
+            if (item.action_type === 'ADD_FRIEND') {
+              try { releaseFriendDailyAttempt(item.id) } catch { /* ignore */ }
+            }
+            break
+          }
           const startedAt = Date.now()
           const { response, raw } = await requestApi(record, apiPath, request)
           const durationMs = Date.now() - startedAt
@@ -4257,7 +4379,12 @@ function createLocalTask(payload) {
         request = item.request
       }
       const itemStatus = actionType === 'ADD_FRIEND' && item.status === 'PROFILE_PENDING' ? 'PROFILE_PENDING' : 'QUEUED'
-      return { id: randomUUID(), instanceId, targetKey, actionType, status: itemStatus, request }
+      const runtime = instances.get(instanceId)
+      const accountWxid = String(item.accountWxid || runtime?.accountWxid || '').trim()
+      if (!accountWxid && ['SEND_TEXT', 'SEND_IMAGE', 'ADD_FRIEND', 'QR_SCAN', 'KICKED_GROUP_CLEANUP'].includes(actionType)) {
+        throw new Error('微信账号身份未就绪，请等待登录资料读取完成后再创建任务')
+      }
+      return { id: randomUUID(), instanceId, accountWxid, targetKey, actionType, status: itemStatus, request }
     })
     if (isSendTask) {
       const hasText = items.some((item) => item.actionType === 'SEND_TEXT')
@@ -4618,7 +4745,7 @@ function registerIpc() {
         await new Promise((resolve) => setTimeout(resolve, record.apiReadyAt - Date.now()))
       }
       const startedAt = Date.now()
-      const timeout = Math.min(Math.max(Number(timeoutMs) || 30000, 500), 30000)
+      const timeout = resolveIpcApiTimeout(apiPath, timeoutMs)
       const isReadApi = READ_API_WHITELIST.has(apiPath)
       const { response, raw } = isReadApi
         ? await readApi(record, apiPath, body, { timeout })
@@ -4770,9 +4897,7 @@ function registerIpc() {
   ipcMain.handle('update:apply', async (event) => {
     const sendProgress = (payload) => {
       try { event.sender.send('update:progress', payload) } catch { /* ignore */ }
-      for (const win of BrowserWindow.getAllWindows()) {
-        try { win.webContents.send('update:progress', payload) } catch { /* ignore */ }
-      }
+      safeBroadcast('update:progress', payload)
     }
     sendProgress({ phase: 'download', downloaded: 0, total: 0, percent: 0 })
     const result = await ipcApplyClientUpdate({
@@ -5043,9 +5168,20 @@ function registerIpc() {
     if (png.length > 20 * 1024 * 1024) return { ok: false, error: '粘贴的图片超过20 MB，请压缩后再试' }
     const folder = path.join(app.getPath('userData'), 'cache', 'clipboard-images')
     mkdirSync(folder, { recursive: true })
+    pruneClipboardImageCache(folder)
     const imagePath = path.join(folder, `clipboard-${Date.now()}-${randomUUID()}.png`)
     writeFileSync(imagePath, png)
-    return { ok: true, path: imagePath, dataUrl: image.toDataURL() }
+    let previewDataUrl = ''
+    try {
+      const size = image.getSize()
+      const maxEdge = 800
+      const scale = Math.min(1, maxEdge / Math.max(size.width || 1, size.height || 1))
+      const preview = scale < 1
+        ? image.resize({ width: Math.max(1, Math.round(size.width * scale)), height: Math.max(1, Math.round(size.height * scale)) })
+        : image
+      previewDataUrl = preview.toDataURL()
+    } catch { previewDataUrl = '' }
+    return { ok: true, path: imagePath, dataUrl: previewDataUrl, previewDataUrl }
   })
   ipcMain.handle('files:select-directory', async (_event, defaultPath) => {
     const result = await dialog.showOpenDialog({ defaultPath: typeof defaultPath === 'string' && defaultPath ? defaultPath : undefined, properties: ['openDirectory', 'createDirectory'] })
@@ -5386,9 +5522,7 @@ app.whenReady().then(async () => {
       isPackaged: app.isPackaged,
       onLog: (level, message, details) => appLog(level, message, details),
       onRequestStartupCheck: () => {
-        for (const win of BrowserWindow.getAllWindows()) {
-          try { win.webContents.send('update:startup-check') } catch { /* ignore */ }
-        }
+        safeBroadcast('update:startup-check')
       },
     })
 
