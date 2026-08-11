@@ -22,7 +22,7 @@ const saveContact = ref(true)
 const creating = ref(false)
 const folder = ref('默认分组')
 const outputDir = ref('')
-const selectedGroupIds = ref<string[]>([])
+const selectedMonitorRoomKeys = ref<string[]>([])
 /** 通讯录尚未刷到的监控群：保留 instanceId，禁止绑定「第一个在线微信」 */
 const orphanMonitorRoomsByKey = ref<Record<string, { instanceId: string; roomId: string; name: string }>>({})
 const groupSearch = useSelectSearchQuery(120)
@@ -127,7 +127,7 @@ const historyGroupOptions = computed(() => groups.value.map((item) => ({ label: 
 /** 当前勾选的群名，便于确认实时监控目标。 */
 const selectedGroupNames = computed(() => {
   const map = new Map(historyGroupOptions.value.map((item) => [item.value, item.label]))
-  return selectedGroupIds.value.map((id) => map.get(id) || id)
+  return selectedMonitorRoomKeys.value.map((id) => map.get(id) || id)
 })
 const monitorTargetText = computed(() => {
   if (!monitorEnabled.value) return '未开启实时监控：发图不会自动采集，请先勾选目标群并点「开启群消息监控」。'
@@ -143,16 +143,16 @@ const monitorTargetText = computed(() => {
 const visibleHistoryGroupOptions = computed(() => filterSelectOptions(
   historyGroupOptions.value,
   groupSearch.query.value,
-  selectedGroupIds.value,
+  selectedMonitorRoomKeys.value,
   groupSearch.query.value.trim() ? SELECT_OPTION_LIMIT_SEARCH : undefined,
 ))
 /** 一键全选采集/监控群聊。 */
 function selectAllHistoryGroups() {
-  selectedGroupIds.value = historyGroupOptions.value.map((item) => item.value)
+  selectedMonitorRoomKeys.value = historyGroupOptions.value.map((item) => item.value)
 }
 /** 清空已选群聊。 */
 function clearHistoryGroups() {
-  selectedGroupIds.value = []
+  selectedMonitorRoomKeys.value = []
 }
 
 /** 拉取监控下载队列状态，便于 150+ 群时感知积压。 */
@@ -211,10 +211,10 @@ async function revealQrImage(row: Record<string, unknown>) {
  * 采集勾选群的历史图片二维码；按队列逐群下载，不限制群数量。
  */
 async function collectHistory() {
-  if (!selectedGroupIds.value.length) return ElMessage.warning('请至少选择一个群聊')
+  if (!selectedMonitorRoomKeys.value.length) return ElMessage.warning('请至少选择一个群聊')
   if (!outputDir.value) return ElMessage.warning('请先选择二维码保存文件夹')
   const selectedRooms = groups.value
-    .filter((item) => selectedGroupIds.value.includes(item.id))
+    .filter((item) => selectedMonitorRoomKeys.value.includes(item.id))
     .map((item) => ({ instanceId: item.sourceInstanceId, roomId: item.roomId, name: item.name }))
   collecting.value = true
   collectProgressText.value = `队列准备中，共 ${selectedRooms.length} 个群…`
@@ -250,22 +250,15 @@ function monitorRoomKey(instanceId: string, roomId: string) {
 }
 
 function selectedRooms() {
-  const byId = groups.value.filter((item) => selectedGroupIds.value.includes(item.id))
-  const knownKeys = new Set(byId.map((item) => monitorRoomKey(item.sourceInstanceId, item.roomId)))
-  const orphanRooms = selectedGroupIds.value
-    .filter((id) => String(id).endsWith('@chatroom'))
-    .map((roomId) => {
-      const fromDirectory = byId.find((item) => item.roomId === roomId)
-      if (fromDirectory) {
-        return { instanceId: fromDirectory.sourceInstanceId, roomId, name: fromDirectory.name }
-      }
-      const hit = Object.values(orphanMonitorRoomsByKey.value).find((item) => item.roomId === roomId)
-      return hit ? { instanceId: hit.instanceId, roomId: hit.roomId, name: hit.name || '群聊' } : null
-    })
-    .filter((item): item is { instanceId: string; roomId: string; name: string } => Boolean(item?.instanceId))
+  const keySet = new Set(selectedMonitorRoomKeys.value)
+  const fromDirectory = groups.value.filter((item) => keySet.has(item.id))
+  const knownKeys = new Set(fromDirectory.map((item) => item.id))
+  const orphanRooms = selectedMonitorRoomKeys.value
+    .map((key) => orphanMonitorRoomsByKey.value[key])
+    .filter((item): item is { instanceId: string; roomId: string; name: string } => Boolean(item?.instanceId && item?.roomId))
     .filter((item) => !knownKeys.has(monitorRoomKey(item.instanceId, item.roomId)))
   return [
-    ...byId.map((item) => ({ instanceId: item.sourceInstanceId, roomId: item.roomId, name: item.name })),
+    ...fromDirectory.map((item) => ({ instanceId: item.sourceInstanceId, roomId: item.roomId, name: item.name })),
     ...orphanRooms,
   ]
 }
@@ -282,22 +275,27 @@ function applyMonitorRoomsToSelection(rooms: Array<{ roomId: string; instanceId?
     }))
     .filter((room) => room.instanceId && room.roomId.endsWith('@chatroom'))
   if (!normalized.length) return
-  const roomIds = new Set(normalized.map((room) => room.roomId))
-  const matched = groups.value.filter((group) => roomIds.has(group.roomId)).map((group) => group.id)
+  const normalizedKeys = new Set(normalized.map((room) => monitorRoomKey(room.instanceId, room.roomId)))
+  const matched = groups.value
+    .filter((group) => normalizedKeys.has(monitorRoomKey(group.sourceInstanceId, group.roomId)))
+    .map((group) => group.id)
   const orphans = normalized.filter((room) => !groups.value.some((group) => group.sourceInstanceId === room.instanceId && group.roomId === room.roomId))
   for (const room of orphans) {
     orphanMonitorRoomsByKey.value[monitorRoomKey(room.instanceId, room.roomId)] = room
   }
-  selectedGroupIds.value = [...new Set([...matched, ...orphans.map((room) => room.roomId)])]
-  monitorWatchedCount.value = Math.max(roomIds.size, selectedGroupIds.value.length)
+  selectedMonitorRoomKeys.value = [...new Set([
+    ...matched,
+    ...orphans.map((room) => monitorRoomKey(room.instanceId, room.roomId)),
+  ])]
+  monitorWatchedCount.value = normalized.length
 }
 
 async function startMonitor() {
-  if (!selectedGroupIds.value.length) return ElMessage.warning('请至少选择一个需要监控的群聊')
+  if (!selectedMonitorRoomKeys.value.length) return ElMessage.warning('请至少选择一个需要监控的群聊')
   if (!outputDir.value) return ElMessage.warning('请先选择二维码保存文件夹')
   try {
     const rooms = selectedRooms()
-    const selectedSet = new Set(selectedGroupIds.value)
+    const selectedSet = new Set(selectedMonitorRoomKeys.value)
     const allCurrentSelected = historyGroupOptions.value.length > 0
       && historyGroupOptions.value.every((option) => selectedSet.has(option.value))
     const watchAll = monitorWatchAll.value || allCurrentSelected
@@ -806,13 +804,13 @@ onBeforeUnmount(() => {
           <div class="field-label-row">
             <span>选择群聊（可搜索）</span>
             <span class="field-select-actions">
-              <span class="muted select-hint">已选 {{ selectedGroupIds.length }} / {{ historyGroupOptions.length }}</span>
+              <span class="muted select-hint">已选 {{ selectedMonitorRoomKeys.length }} / {{ historyGroupOptions.length }}</span>
               <el-button class="field-select-all" link type="primary" :disabled="!historyGroupOptions.length" @click.stop="selectAllHistoryGroups">全选</el-button>
-              <el-button link type="info" :disabled="!selectedGroupIds.length" @click.stop="clearHistoryGroups">全不选</el-button>
+              <el-button link type="info" :disabled="!selectedMonitorRoomKeys.length" @click.stop="clearHistoryGroups">全不选</el-button>
             </span>
           </div>
           <el-select
-            v-model="selectedGroupIds"
+            v-model="selectedMonitorRoomKeys"
             multiple
             filterable
             collapse-tags
@@ -825,8 +823,8 @@ onBeforeUnmount(() => {
           >
             <el-option v-for="item in visibleHistoryGroupOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
-          <span v-if="selectedGroupIds.length" class="muted select-hint">
-            {{ selectedGroupNames.slice(0, 2).join('、') }}<template v-if="selectedGroupIds.length > 2"> 等 {{ selectedGroupIds.length }} 个</template>
+          <span v-if="selectedMonitorRoomKeys.length" class="muted select-hint">
+            {{ selectedGroupNames.slice(0, 2).join('、') }}<template v-if="selectedMonitorRoomKeys.length > 2"> 等 {{ selectedMonitorRoomKeys.length }} 个</template>
           </span>
           <span v-if="historyGroupOptions.length > visibleHistoryGroupOptions.length" class="muted select-hint">下拉仅渲染部分项防卡顿，继续输入可精确匹配全部 {{ historyGroupOptions.length }} 个</span>
         </div>
@@ -835,8 +833,8 @@ onBeforeUnmount(() => {
       </div>
       <div class="toolbar-left" style="margin-top:12px; flex-wrap: wrap; gap: 8px">
         <el-checkbox v-model="monitorWatchAll">监控全部群（含新进群自动扩容）</el-checkbox>
-        <el-button type="primary" :loading="collecting" :disabled="!selectedGroupIds.length || !outputDir" @click="collectHistory">采集历史图片</el-button>
-        <el-button v-if="!monitorEnabled" type="success" :disabled="!selectedGroupIds.length || !outputDir" @click="startMonitor">开启群消息监控</el-button>
+        <el-button type="primary" :loading="collecting" :disabled="!selectedMonitorRoomKeys.length || !outputDir" @click="collectHistory">采集历史图片</el-button>
+        <el-button v-if="!monitorEnabled" type="success" :disabled="!selectedMonitorRoomKeys.length || !outputDir" @click="startMonitor">开启群消息监控</el-button>
         <el-button v-else type="danger" plain @click="stopMonitor">停止群消息监控</el-button>
         <el-button v-if="monitorEnabled && monitorWatchAll" plain @click="syncMonitorRoomsNow">立即同步新群</el-button>
         <StatusTag :text="monitorEnabled ? (monitorWatchAll ? '监控中·自动扩容' : '监控中') : '未监控'" />

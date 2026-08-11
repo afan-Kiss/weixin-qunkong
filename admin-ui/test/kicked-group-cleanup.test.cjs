@@ -272,7 +272,7 @@ test('main process quits only after safe gates', () => {
   assert.match(loadLive, /readApi\(/)
   assert.match(loadLive, /return null/)
   assert.match(main, /LIVE_LIST_UNAVAILABLE/)
-  const prepare = main.slice(main.indexOf('async function prepareKickedGroupCleanupTask'), main.indexOf('function bindQrMonitorRoom'))
+  const prepare = main.slice(main.indexOf('async function prepareKickedGroupCleanupTask'), main.indexOf('function resolveQrMonitorRoom'))
   assert.match(prepare, /REQUEUE_STILL_IN_ROOM_LIST/)
   assert.match(prepare, /loadBlockedRoomIdSet/)
   assert.match(prepare, /loadLiveRoomIdsForKickGate/)

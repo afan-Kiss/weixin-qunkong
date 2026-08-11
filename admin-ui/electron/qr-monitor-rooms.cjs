@@ -3,6 +3,16 @@
  */
 
 /**
+ * 监控群唯一键：instanceId + roomId（多微信可拥有相同 roomId）。
+ * @param {string} instanceId
+ * @param {string} roomId
+ * @returns {string}
+ */
+function monitorRoomKey(instanceId, roomId) {
+  return `${String(instanceId || '').trim()}\u0000${String(roomId || '').trim()}`
+}
+
+/**
  * 规范化监控群条目。
  * @param {unknown} room
  * @returns {{ instanceId: string, roomId: string, name: string } | null}
@@ -17,7 +27,7 @@ function normalizeMonitorRoom(room) {
 }
 
 /**
- * 将新群合并进已有监控列表（按 roomId 去重；已存在则更新 instanceId/name）。
+ * 将新群合并进已有监控列表（按 instanceId+roomId 去重；同 pair 更新 name）。
  * @param {unknown[]} existing
  * @param {unknown[]} incoming
  * @returns {{ rooms: Array<{ instanceId: string, roomId: string, name: string }>, added: Array<{ instanceId: string, roomId: string, name: string }> }}
@@ -26,22 +36,22 @@ function mergeMonitorRooms(existing = [], incoming = []) {
   const map = new Map()
   for (const item of Array.isArray(existing) ? existing : []) {
     const room = normalizeMonitorRoom(item)
-    if (room) map.set(room.roomId, room)
+    if (room) map.set(monitorRoomKey(room.instanceId, room.roomId), room)
   }
   const added = []
   for (const item of Array.isArray(incoming) ? incoming : []) {
     const room = normalizeMonitorRoom(item)
     if (!room) continue
-    const prev = map.get(room.roomId)
+    const key = monitorRoomKey(room.instanceId, room.roomId)
+    const prev = map.get(key)
     if (!prev) {
-      map.set(room.roomId, room)
+      map.set(key, room)
       added.push(room)
       continue
     }
-    // 微信重启后 instanceId 会变；名称以非空新名为准
-    map.set(room.roomId, {
-      instanceId: room.instanceId || prev.instanceId,
-      roomId: room.roomId,
+    map.set(key, {
+      instanceId: prev.instanceId,
+      roomId: prev.roomId,
       name: room.name && room.name !== '群聊' ? room.name : prev.name,
     })
   }
@@ -75,8 +85,9 @@ function extractRoomsFromApiRaw(raw) {
         row.nickName || row.nickname || row.nick_name || row.displayName
         || row.remark || row.roomName || row.name || '群聊',
       ).trim() || '群聊'
-      if (!found.has(roomId) || (name && name !== '群聊' && found.get(roomId).name === '群聊')) {
-        found.set(roomId, { roomId, name })
+      const key = roomId
+      if (!found.has(key) || (name && name !== '群聊' && found.get(key).name === '群聊')) {
+        found.set(key, { roomId, name })
       }
     }
     for (const child of Object.values(row)) walk(child, depth + 1)
@@ -86,6 +97,7 @@ function extractRoomsFromApiRaw(raw) {
 }
 
 module.exports = {
+  monitorRoomKey,
   normalizeMonitorRoom,
   mergeMonitorRooms,
   extractRoomsFromApiRaw,

@@ -336,22 +336,7 @@ function listTaskItemDiagnostics(limit = 300) {
 }
 
 const SENSITIVE_SAMPLE_KEY_RE = /^(v3|v4|encryptusername|encryptedusername|antispamticket|antispamticket|cookie|authorization|password|secret|token|accesstoken|refreshtoken)$/i
-
-function sanitizeApiSampleValue(value, depth = 0) {
-  if (depth > 8) return '[depth]'
-  if (value == null || typeof value !== 'object') return value
-  if (Array.isArray(value)) return value.map((item) => sanitizeApiSampleValue(item, depth + 1))
-  const out = {}
-  for (const [key, nested] of Object.entries(value)) {
-    if (SENSITIVE_SAMPLE_KEY_RE.test(String(key))) {
-      const text = String(nested ?? '')
-      out[key] = { redacted: true, prefix: text.slice(0, 4), length: text.length }
-    } else {
-      out[key] = sanitizeApiSampleValue(nested, depth + 1)
-    }
-  }
-  return out
-}
+const { sanitizeApiSampleValue, sanitizeSensitiveString } = require('./sensitive-redaction.cjs')
 
 let apiSampleWrites = 0
 const API_SAMPLE_MAX = 8000

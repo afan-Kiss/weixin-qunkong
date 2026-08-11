@@ -155,6 +155,10 @@ function verifyCertPin(hostname, cert) {
 function setCertPins(hostname, pins) {
   const host = String(hostname || '').toLowerCase()
   if (!host) return
+  const oldAgent = pinnedAgentsByHost.get(host)
+  if (oldAgent) {
+    try { oldAgent.destroy() } catch { /* ignore */ }
+  }
   CERT_PINS.set(host, Array.isArray(pins) ? pins : [])
   pinnedAgentsByHost.delete(host)
   if (pins && pins.length) pinEnforcementEnabled = true
@@ -301,6 +305,9 @@ function installServiceCertificateTrust(sess) {
 }
 
 function resetTlsStateForTests() {
+  for (const agent of pinnedAgentsByHost.values()) {
+    try { agent.destroy() } catch { /* ignore */ }
+  }
   CERT_PINS.clear()
   pinnedAgentsByHost.clear()
   extraTrustedHosts.clear()

@@ -2,7 +2,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
-const { mergeMonitorRooms, extractRoomsFromApiRaw, normalizeMonitorRoom } = require('../electron/qr-monitor-rooms.cjs')
+const { mergeMonitorRooms, extractRoomsFromApiRaw, normalizeMonitorRoom, monitorRoomKey } = require('../electron/qr-monitor-rooms.cjs')
 
 test('normalizeMonitorRoom rejects invalid entries', () => {
   assert.equal(normalizeMonitorRoom(null), null)
@@ -14,22 +14,38 @@ test('normalizeMonitorRoom rejects invalid entries', () => {
   })
 })
 
-test('mergeMonitorRooms grows list and dedupes by roomId', () => {
-  const first = mergeMonitorRooms([], [
-    { instanceId: 'ins1', roomId: '100@chatroom', name: '群A' },
-    { instanceId: 'ins1', roomId: '101@chatroom', name: '群B' },
+test('mergeMonitorRooms keeps A-roomX and B-roomX as separate pairs', () => {
+  const roomX = 'room-x@chatroom'
+  const merged = mergeMonitorRooms([], [
+    { instanceId: 'wechat-a', roomId: roomX, name: 'A群' },
+    { instanceId: 'wechat-b', roomId: roomX, name: 'B群' },
   ])
-  assert.equal(first.rooms.length, 2)
-  assert.equal(first.added.length, 2)
+  assert.equal(merged.rooms.length, 2)
+  assert.equal(merged.added.length, 2)
+  const a = merged.rooms.find((item) => item.instanceId === 'wechat-a')
+  const b = merged.rooms.find((item) => item.instanceId === 'wechat-b')
+  assert.equal(a?.name, 'A群')
+  assert.equal(b?.name, 'B群')
+})
 
-  const second = mergeMonitorRooms(first.rooms, [
-    { instanceId: 'ins1', roomId: '101@chatroom', name: '群B改名' },
-    { instanceId: 'ins1', roomId: '102@chatroom', name: '新进群' },
+test('mergeMonitorRooms rename updates only same instance pair', () => {
+  const roomX = 'room-x@chatroom'
+  const base = mergeMonitorRooms([], [
+    { instanceId: 'wechat-a', roomId: roomX, name: '旧名' },
+    { instanceId: 'wechat-b', roomId: roomX, name: 'B群' },
   ])
-  assert.equal(second.rooms.length, 3)
-  assert.equal(second.added.length, 1)
-  assert.equal(second.added[0].roomId, '102@chatroom')
-  assert.equal(second.rooms.find((item) => item.roomId === '101@chatroom').name, '群B改名')
+  const updated = mergeMonitorRooms(base.rooms, [
+    { instanceId: 'wechat-a', roomId: roomX, name: '新名' },
+  ])
+  assert.equal(updated.rooms.length, 2)
+  assert.equal(updated.added.length, 0)
+  assert.equal(updated.rooms.find((item) => item.instanceId === 'wechat-a')?.name, '新名')
+  assert.equal(updated.rooms.find((item) => item.instanceId === 'wechat-b')?.name, 'B群')
+})
+
+test('monitorRoomKey is stable pair identity', () => {
+  const key = monitorRoomKey('inst-a', 'room@chatroom')
+  assert.equal(key, 'inst-a\u0000room@chatroom')
 })
 
 test('extractRoomsFromApiRaw finds nested chatroom ids', () => {
@@ -47,20 +63,16 @@ test('extractRoomsFromApiRaw finds nested chatroom ids', () => {
   assert.ok(rows.some((item) => item.roomId === 'bbb@chatroom' && item.name === '乙群'))
 })
 
-test('qr monitor auto-grow wiring exists in main/preload/ui', () => {
+test('qr monitor pair-key wiring exists in main/preload/ui', () => {
   const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
   const preload = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.cjs'), 'utf8')
   const page = fs.readFileSync(path.join(__dirname, '..', 'src', 'pages', 'QrTasksPage.vue'), 'utf8')
 
-  assert.match(main, /watchAll/)
-  assert.match(main, /addQrMonitorRooms/)
-  assert.match(main, /syncQrMonitorRoomsFromWechat/)
-  assert.match(main, /qr:monitor-rooms-changed/)
-  assert.match(main, /二维码进群成功/)
+  assert.match(main, /qrMonitorRoomByKey/)
+  assert.match(main, /monitorRoomKey/)
+  assert.doesNotMatch(main, /function bindQrMonitorRoom/)
+  assert.match(main, /resolveQrMonitorRoom/)
   assert.match(preload, /onQrMonitorRoomsChanged/)
-  assert.match(preload, /syncQrMonitorRooms/)
-  assert.match(page, /monitorWatchAll/)
-  assert.match(page, /监控全部群/)
-  assert.match(page, /syncMonitorRoomsNow/)
-  assert.match(page, /applyMonitorRoomsToSelection/)
+  assert.match(page, /selectedMonitorRoomKeys/)
+  assert.match(page, /orphanMonitorRoomsByKey/)
 })

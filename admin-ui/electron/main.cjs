@@ -39,7 +39,7 @@ const {
   isShortGroupInviteUrl,
   isJoinApplicationPending,
 } = require('./qr-join.cjs')
-const { mergeMonitorRooms, extractRoomsFromApiRaw } = require('./qr-monitor-rooms.cjs')
+const { mergeMonitorRooms, extractRoomsFromApiRaw, monitorRoomKey } = require('./qr-monitor-rooms.cjs')
 const { extractSelfKickedEvent, resolveSelfStillInMembers, canCleanupKickedRoom, isImmediateKickEvidence, isLeaveCallbackEvidence, kickHitFromHistoryMessage } = require('./kicked-group-cleanup.cjs')
 const { scrubLegacyCachesOnStartup } = require('./startup-cache-scrub.cjs')
 const { installServiceCertificateTrust } = require('./service-tls.cjs')
@@ -129,8 +129,8 @@ let tray = null
 let quitting = false
 let runtimeAllowed = true
 let qrMonitorConfig = { enabled: false, watchAll: false, rooms: [], outputDir: '', folder: '默认分组' }
-/** roomId → 监控群配置，150+ 群时 O(1) 命中 */
-let qrMonitorRoomById = new Map()
+/** instanceId+roomId → 监控群配置，150+ 群时 O(1) 命中 */
+let qrMonitorRoomByKey = new Map()
 /** 监控去重哈希缓存，避免每张图全表扫库 */
 let qrMonitorContentHashes = null
 /** 非监控群图片忽略日志节流：roomHint → 上次记录时间 */
@@ -171,6 +171,14 @@ const deliveryImageHashCache = new Map()
 const DELIVERY_IMAGE_HASH_TTL_MS = 10 * 60 * 1000
 const DELIVERY_IMAGE_HASH_MAX = 512
 const { cleanupRuntimeTtlMaps: sweepRuntimeTtlMaps } = require('./runtime-ttl-cleanup.cjs')
+const { appendJsonlLog } = require('./jsonl-log-writer.cjs')
+const {
+  hasDiagnosticIdempotency,
+  markDiagnosticProcessing,
+  markDiagnosticDone,
+  clearDiagnosticProcessing,
+  cleanupDiagnosticIdempotency,
+} = require('./diagnostic-idempotency.cjs')
 const RUNTIME_CACHE_CLEANUP_INTERVAL_MS = 60000
 let runtimeCacheCleanupTimer = null
 
@@ -186,6 +194,7 @@ function cleanupRuntimeTtlMaps(now = Date.now()) {
     DELIVERY_IMAGE_HASH_TTL_MS,
     DELIVERY_IMAGE_HASH_MAX,
   }, now)
+  cleanupDiagnosticIdempotency(now)
 }
 
 function startRuntimeCacheCleanupTimer() {
@@ -204,10 +213,11 @@ const kickedMutationDone = new Map()
 function rebuildQrMonitorRoomIndex() {
   const map = new Map()
   for (const room of Array.isArray(qrMonitorConfig.rooms) ? qrMonitorConfig.rooms : []) {
+    const instanceId = String(room?.instanceId || '').trim()
     const roomId = String(room?.roomId || '').trim()
-    if (roomId) map.set(roomId, room)
+    if (instanceId && roomId) map.set(monitorRoomKey(instanceId, roomId), room)
   }
-  qrMonitorRoomById = map
+  qrMonitorRoomByKey = map
 }
 
 /**
@@ -218,7 +228,7 @@ function notifyQrMonitorRoomsChanged(detail = {}) {
   const payload = {
     enabled: Boolean(qrMonitorConfig.enabled),
     watchAll: Boolean(qrMonitorConfig.watchAll),
-    watchedCount: qrMonitorRoomById.size,
+    watchedCount: qrMonitorRoomByKey.size,
     rooms: Array.isArray(qrMonitorConfig.rooms) ? qrMonitorConfig.rooms : [],
     added: Array.isArray(detail.added) ? detail.added : [],
     reason: String(detail.reason || ''),
@@ -252,7 +262,7 @@ function addQrMonitorRooms(rooms, options = {}) {
       operation: '自动扩容',
       reason: options.reason || '',
       added: added.slice(0, 5).map((item) => item.roomId),
-      watchedCount: qrMonitorRoomById.size,
+      watchedCount: qrMonitorRoomByKey.size,
       watchAll: Boolean(qrMonitorConfig.watchAll),
     })
     notifyQrMonitorRoomsChanged({ added, reason: options.reason || '' })
@@ -294,8 +304,11 @@ async function syncQrMonitorRoomsFromWechat(reason = '同步群列表') {
         const listRes = await readApi(record, '/api/get_chatroom_list', {})
         const listRooms = extractRoomsFromApiRaw(listRes.response.ok ? listRes.raw : null)
         const rows = [...listRooms]
-        const knownIds = new Set([...qrMonitorRoomById.keys()])
-        const hasNewUnnamed = listRooms.some((r) => !knownIds.has(r.roomId) || (!r.name || r.name === '群聊'))
+        const knownKeys = new Set([...qrMonitorRoomByKey.keys()])
+        const hasNewUnnamed = listRooms.some((r) => {
+          const key = monitorRoomKey(record.id, r.roomId)
+          return !knownKeys.has(key) || (!r.name || r.name === '群聊')
+        })
         if (hasNewUnnamed) {
           const detailRes = await readApi(record, '/api/get_all_room_detail', {}, { force: true })
           rows.push(...extractRoomsFromApiRaw(detailRes.response.ok ? detailRes.raw : null))
@@ -342,18 +355,23 @@ function extractEventRoomIds(event) {
 }
 
 /**
- * 深遍历一次事件，命中任一监控 roomId 即返回（用于字段缺失的回调形态）。
+ * 深遍历一次事件，严格按 instanceId+roomId 命中监控配置。
+ * @param {{ id: string }} record
  * @param {unknown} event
  * @returns {{ instanceId: string, roomId: string, name: string } | null}
  */
-function findMonitoredRoomDeep(event) {
-  if (!qrMonitorRoomById.size) return null
+function findMonitoredRoomDeep(record, event) {
+  if (!qrMonitorRoomByKey.size) return null
   const seen = new Set()
   let found = null
   const walk = (value) => {
     if (found || value == null) return
     if (typeof value === 'string') {
-      if (qrMonitorRoomById.has(value)) found = qrMonitorRoomById.get(value)
+      const text = String(value).trim()
+      if (text.endsWith('@chatroom')) {
+        const hit = qrMonitorRoomByKey.get(monitorRoomKey(record.id, text))
+        if (hit) found = hit
+      }
       return
     }
     if (typeof value !== 'object' || seen.has(value)) return
@@ -387,6 +405,7 @@ function looksLikeImageEvent(event) {
  * @returns {Promise<unknown>}
  */
 function enqueueQrMonitorJob(instanceId, job) {
+  if (!qrMonitorConfig.enabled) return Promise.resolve({ skipped: true })
   let state = qrMonitorQueues.get(instanceId)
   if (!state) {
     state = { active: 0, pending: [] }
@@ -403,6 +422,7 @@ function enqueueQrMonitorJob(instanceId, job) {
  * @param {string} instanceId
  */
 function pumpQrMonitorQueue(instanceId) {
+  if (!qrMonitorConfig.enabled) return
   const state = qrMonitorQueues.get(instanceId)
   if (!state) return
   while (state.active < QR_MONITOR_CONCURRENCY && state.pending.length) {
@@ -460,8 +480,6 @@ function remoteAgentOptions(account, baseUrl = DEFAULT_BASE) {
   }
 }
 
-const diagnosticIdempotency = new Set()
-
 async function postDiagnosticReport(baseUrl, report) {
   const url = `${String(baseUrl || DEFAULT_BASE).replace(/\/$/, '')}/api/friend-diagnostic/report`
   const body = JSON.stringify(report)
@@ -486,16 +504,21 @@ async function handleFriendCredentialDiagnosticCommand(message) {
     idempotencyKey: String(message.idempotencyKey || message.payload?.idempotencyKey || ''),
   }
   if (payload.idempotencyKey) {
-    if (diagnosticIdempotency.has(payload.idempotencyKey)) {
+    if (hasDiagnosticIdempotency(payload.idempotencyKey)) {
       appLog('WARN', 'FRIEND_CREDENTIAL_DIAGNOSTIC 幂等跳过', { module: '凭证诊断', idempotencyKey: payload.idempotencyKey })
       return
     }
-    diagnosticIdempotency.add(payload.idempotencyKey)
+    if (!markDiagnosticProcessing(payload.idempotencyKey)) {
+      appLog('WARN', 'FRIEND_CREDENTIAL_DIAGNOSTIC 幂等跳过', { module: '凭证诊断', idempotencyKey: payload.idempotencyKey })
+      return
+    }
   }
   const selfId = String(getRemoteAgentStatus()?.clientId || '')
   if (payload.targetClientId && selfId && payload.targetClientId !== selfId) {
+    if (payload.idempotencyKey) clearDiagnosticProcessing(payload.idempotencyKey)
     throw new Error('targetClientId 与本机不符')
   }
+  try {
   const record = [...instances.values()].find((item) => item.id === payload.targetInstanceId)
     || [...instances.values()].find((item) => String(item.accountWxid || '') === payload.targetAccountWxid && item.status === 'ONLINE')
   let dllPath = ''
@@ -575,6 +598,11 @@ async function handleFriendCredentialDiagnosticCommand(message) {
     })
   }
   await postDiagnosticReport(DEFAULT_BASE, report)
+  if (payload.idempotencyKey) markDiagnosticDone(payload.idempotencyKey)
+  } catch (error) {
+    if (payload.idempotencyKey) clearDiagnosticProcessing(payload.idempotencyKey)
+    throw error
+  }
 }
 
 async function handleRemoteCheckClientUpdate(message) {
@@ -717,8 +745,7 @@ function appLog(level, message, details = {}) {
   const entry = { time: new Date().toISOString(), level, message, ...details }
   try {
     const logDir = path.join(app.getPath('userData'), 'logs')
-    mkdirSync(logDir, { recursive: true })
-    appendFileSync(path.join(logDir, 'wechat-control.jsonl'), `${JSON.stringify(entry)}\n`, 'utf8')
+    appendJsonlLog(logDir, entry)
   } catch {}
   try { saveLog(entry) } catch {}
   for (const win of BrowserWindow.getAllWindows()) win.webContents.send('wechat:log', entry)
@@ -2063,38 +2090,20 @@ async function prepareKickedGroupCleanupTask(reason = '手动创建被踢群清�
 }
 
 /**
- * 绑定监控群到当前微信实例（重启后 instanceId 会变）。
- * @param {{ id: string }} record
- * @param {{ instanceId: string, roomId: string, name: string } | null} room
- * @returns {{ instanceId: string, roomId: string, name: string } | null}
- */
-function bindQrMonitorRoom(record, room) {
-  if (!room) return null
-  if (room.instanceId !== record.id) {
-    room.instanceId = record.id
-    try { saveSetting('qrMonitor', qrMonitorConfig) } catch { /* 回写失败不阻断采集 */ }
-    appLog('INFO', '群消息二维码监控已自动绑定到当前微信实例', {
-      instanceId: record.id, module: '二维码监控', roomId: room.roomId, roomName: room.name,
-    })
-  }
-  return room
-}
-
-/**
- * 解析监控配置中的目标群：先按常见字段 O(1) 查索引；仅必要时深遍历。
+ * 解析监控配置中的目标群：严格匹配 instanceId+roomId。
  * @param {{ id: string }} record 当前微信实例
  * @param {unknown} event TCP 回调事件
  * @param {{ allowDeep?: boolean }} [options]
  * @returns {{ instanceId: string, roomId: string, name: string } | null}
  */
 function resolveQrMonitorRoom(record, event, options = {}) {
-  if (!qrMonitorRoomById.size) return null
+  if (!qrMonitorRoomByKey.size) return null
   for (const roomId of extractEventRoomIds(event)) {
-    const hit = qrMonitorRoomById.get(roomId)
-    if (hit) return bindQrMonitorRoom(record, hit)
+    const hit = qrMonitorRoomByKey.get(monitorRoomKey(record.id, roomId))
+    if (hit) return hit
   }
   if (options.allowDeep === false) return null
-  return bindQrMonitorRoom(record, findMonitoredRoomDeep(event))
+  return findMonitoredRoomDeep(record, event)
 }
 
 /**
@@ -2169,7 +2178,7 @@ async function handleQrMonitorEvent(record, event) {
       const roomId = roomIds.find((id) => String(id).endsWith('@chatroom'))
       if (roomId) {
         addQrMonitorRooms([{ instanceId: record.id, roomId, name: '群聊' }], { reason: '新群图片自动纳入' })
-        room = qrMonitorRoomById.get(roomId) || null
+        room = qrMonitorRoomByKey.get(monitorRoomKey(record.id, roomId)) || null
       }
     }
     if (!room) {
@@ -2188,7 +2197,7 @@ async function handleQrMonitorEvent(record, event) {
             instanceId: record.id,
             module: '二维码监控',
             roomHint,
-            watchedCount: qrMonitorRoomById.size,
+            watchedCount: qrMonitorRoomByKey.size,
             msgType: type,
           })
         }
@@ -4792,7 +4801,7 @@ function registerIpc() {
   ipcMain.handle('qr:monitor-status', () => ({
     ...qrMonitorConfig,
     watchAll: Boolean(qrMonitorConfig.watchAll),
-    watchedCount: qrMonitorRoomById.size,
+    watchedCount: qrMonitorRoomByKey.size,
     queueStats: [...qrMonitorQueues.entries()].map(([instanceId, state]) => ({
       instanceId,
       active: state.active || 0,
@@ -4818,10 +4827,17 @@ function registerIpc() {
       watchAll,
       concurrency: QR_MONITOR_CONCURRENCY,
     })
-    return { ...qrMonitorConfig, watchedCount: qrMonitorRoomById.size }
+    return { ...qrMonitorConfig, watchedCount: qrMonitorRoomByKey.size }
   })
   ipcMain.handle('qr:monitor-stop', () => {
     qrMonitorConfig = { ...qrMonitorConfig, enabled: false }
+    for (const [, state] of qrMonitorQueues) {
+      const pending = state?.pending || []
+      while (pending.length) {
+        const item = pending.shift()
+        try { item.resolve({ skipped: true }) } catch { /* ignore */ }
+      }
+    }
     rebuildQrMonitorRoomIndex()
     saveSetting('qrMonitor', qrMonitorConfig)
     ensureQrMonitorSyncTimer()
@@ -4834,7 +4850,7 @@ function registerIpc() {
     await syncQrMonitorRoomsFromWechat('手动同步')
     return {
       ...qrMonitorConfig,
-      watchedCount: qrMonitorRoomById.size,
+      watchedCount: qrMonitorRoomByKey.size,
     }
   })
   ipcMain.handle('qr:delete', (_event, ids) => { deleteQrItems(Array.isArray(ids) ? ids : []); return listQrItems() })

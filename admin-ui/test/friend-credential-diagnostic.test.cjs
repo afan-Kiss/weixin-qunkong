@@ -62,8 +62,10 @@ test('credential meta never includes full secret', () => {
 
 test('redactPreview masks v3/v4', () => {
   const text = redactPreview({ v3: 'v3_LONGSECRETVALUE', ticket: 'v4_ANOTHERSECRET' })
-  assert.match(text, /v3_LONGSECRE/)
+  assert.match(text, /v3_\[REDACTED:/)
+  assert.match(text, /v4_\[REDACTED:/)
   assert.doesNotMatch(text, /LONGSECRETVALUE/)
+  assert.doesNotMatch(text, /ANOTHERSECRET/)
 })
 
 test('allowlist contains search and group routes', () => {

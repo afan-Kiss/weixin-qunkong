@@ -358,3 +358,219 @@ test('pause gate blocks add_friend and kicked destructive mutations before submi
   const kick = main.slice(main.indexOf('async function cleanupOneKickedGroupRoom'), main.indexOf('async function prepareKickedGroupCleanupTask'))
   assert.ok((kick.match(/isTaskStopRequested\(taskId\)/g) || []).length >= 2)
 })
+
+// --- directory lost update behavioral simulation ---
+function simulateDirectoryStore() {
+  let contacts = [{ sourceInstanceId: 'A', wxid: 'oldA', nickname: 'oldA' }, { sourceInstanceId: 'B', wxid: 'oldB', nickname: 'oldB' }]
+  let groups = [{ sourceInstanceId: 'A', roomId: 'ga@chatroom', name: 'oldGA' }, { sourceInstanceId: 'B', roomId: 'gb@chatroom', name: 'oldGB' }]
+  let commitChain = Promise.resolve()
+
+  function commitMerge(payload) {
+    commitChain = commitChain.then(() => {
+      if (payload.refreshedContactInstanceIds.size) {
+        contacts = [
+          ...contacts.filter((row) => !payload.refreshedContactInstanceIds.has(row.sourceInstanceId)),
+          ...[...payload.contactsByInstance.values()].flat(),
+        ]
+      }
+      if (payload.refreshedGroupInstanceIds.size) {
+        groups = [
+          ...groups.filter((row) => !payload.refreshedGroupInstanceIds.has(row.sourceInstanceId)),
+          ...[...payload.groupsByInstance.values()].flat(),
+        ]
+      }
+    })
+    return commitChain
+  }
+
+  async function refreshScope(scope, result, delayMs) {
+    await new Promise((r) => setTimeout(r, delayMs))
+    await commitMerge({
+      refreshedContactInstanceIds: new Set(result.contact ? [scope] : []),
+      refreshedGroupInstanceIds: new Set(result.group ? [scope] : []),
+      contactsByInstance: result.contact ? new Map([[scope, [{ sourceInstanceId: scope, wxid: result.contact, nickname: result.contact }]]]) : new Map(),
+      groupsByInstance: result.group ? new Map([[scope, [{ sourceInstanceId: scope, roomId: `${scope}-room@chatroom`, name: result.group }]]]) : new Map(),
+    })
+  }
+
+  return {
+    get contacts() { return contacts },
+    get groups() { return groups },
+    refreshScope,
+  }
+}
+
+test('directory concurrent A/B refresh preserves both new results (A finishes first)', async () => {
+  const store = simulateDirectoryStore()
+  await Promise.all([
+    store.refreshScope('A', { contact: 'newA', group: 'newGA' }, 20),
+    store.refreshScope('B', { contact: 'newB', group: 'newGB' }, 40),
+  ])
+  assert.equal(store.contacts.find((row) => row.sourceInstanceId === 'A')?.nickname, 'newA')
+  assert.equal(store.contacts.find((row) => row.sourceInstanceId === 'B')?.nickname, 'newB')
+  assert.equal(store.groups.find((row) => row.sourceInstanceId === 'A')?.name, 'newGA')
+  assert.equal(store.groups.find((row) => row.sourceInstanceId === 'B')?.name, 'newGB')
+})
+
+test('directory concurrent A/B refresh preserves both new results (B finishes first)', async () => {
+  const store = simulateDirectoryStore()
+  await Promise.all([
+    store.refreshScope('A', { contact: 'newA', group: 'newGA' }, 50),
+    store.refreshScope('B', { contact: 'newB', group: 'newGB' }, 10),
+  ])
+  assert.equal(store.contacts.find((row) => row.sourceInstanceId === 'A')?.nickname, 'newA')
+  assert.equal(store.contacts.find((row) => row.sourceInstanceId === 'B')?.nickname, 'newB')
+})
+
+test('directory partial failure keeps previous groups for same instance', async () => {
+  const store = simulateDirectoryStore()
+  await store.refreshScope('A', { contact: 'newA' }, 0)
+  assert.equal(store.contacts.find((row) => row.sourceInstanceId === 'A')?.nickname, 'newA')
+  assert.equal(store.groups.find((row) => row.sourceInstanceId === 'A')?.name, 'oldGA')
+})
+
+test('directory force=true still joins same-scope inflight', () => {
+  const inflight = new Map()
+  let calls = 0
+  function refreshDirectory(scope, force) {
+    const refreshKey = scope
+    if (inflight.has(refreshKey)) return inflight.get(refreshKey)
+    const promise = Promise.resolve().then(() => { calls += 1 })
+    inflight.set(refreshKey, promise)
+    return promise
+  }
+  const p1 = refreshDirectory('A', true)
+  const p2 = refreshDirectory('A', true)
+  assert.equal(p1, p2)
+  return p1.then(() => assert.equal(calls, 1))
+})
+
+test('sanitizeSensitiveString redacts embedded v3/v4/bearer without breaking normal URLs', () => {
+  const { sanitizeSensitiveString } = require('../electron/sensitive-redaction.cjs')
+  const xml = '<xml><x>v3_REAL_SECRET_ABCDEFG</x></xml>'
+  const mixed = 'abc v4_REAL_SECRET xyz'
+  const bearer = 'Authorization: Bearer abcdefghijk'
+  const url = 'https://example.com/path'
+  assert.doesNotMatch(sanitizeSensitiveString(xml), /v3_REAL_SECRET_ABCDEFG/)
+  assert.match(sanitizeSensitiveString(xml), /v3_\[REDACTED:/)
+  assert.doesNotMatch(sanitizeSensitiveString(mixed), /v4_REAL_SECRET/)
+  assert.doesNotMatch(sanitizeSensitiveString(bearer), /abcdefghijk/)
+  assert.equal(sanitizeSensitiveString(url), url)
+})
+
+test('API sample string XML stores redacted v3 only', () => {
+  const storage = require('../electron/storage.cjs')
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-sample-str-'))
+  try {
+    storage.initStorage(folder)
+    storage.saveApiSample({
+      instanceId: 'inst-1',
+      sourceId: 1,
+      path: '/api/add_friend',
+      request: { raw: '<xml><x>v3_REAL_SECRET_ABCDEFG</x></xml>' },
+      response: { ok: true },
+      httpStatus: 200,
+      durationMs: 1,
+    })
+    const row = storage.database().prepare('SELECT request_json FROM wechat_api_runtime_samples ORDER BY id DESC LIMIT 1').get()
+    assert.doesNotMatch(String(row.request_json), /v3_REAL_SECRET_ABCDEFG/)
+  } finally {
+    storage.database().close()
+    fs.rmSync(folder, { recursive: true, force: true })
+  }
+})
+
+test('JSONL log rotation keeps bounded files and redacts secrets', () => {
+  const { appendJsonlLog, resetLogWriterStateForTests } = require('../electron/jsonl-log-writer.cjs')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-jsonl-'))
+  resetLogWriterStateForTests()
+  try {
+    for (let i = 0; i < 40; i += 1) {
+      appendJsonlLog(dir, { level: 'INFO', message: `line-${i}`, details: { token: 'v4_SUPER_SECRET_VALUE' } }, { maxBytes: 512 })
+    }
+    const files = fs.readdirSync(dir).filter((name) => name.includes('wechat-control'))
+    assert.ok(files.length <= 5)
+    const main = fs.readFileSync(path.join(dir, 'wechat-control.jsonl'), 'utf8')
+    assert.doesNotMatch(main, /v4_SUPER_SECRET_VALUE/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+    resetLogWriterStateForTests()
+  }
+})
+
+test('diagnostic idempotency PROCESSING failure allows retry; DONE dedupes', () => {
+  const diag = require('../electron/diagnostic-idempotency.cjs')
+  diag.resetDiagnosticIdempotencyForTests()
+  const key = 'diag-key-1'
+  assert.equal(diag.markDiagnosticProcessing(key), true)
+  assert.equal(diag.hasDiagnosticIdempotency(key), true)
+  diag.clearDiagnosticProcessing(key)
+  assert.equal(diag.hasDiagnosticIdempotency(key), false)
+  assert.equal(diag.markDiagnosticProcessing(key), true)
+  diag.markDiagnosticDone(key)
+  assert.equal(diag.hasDiagnosticIdempotency(key), true)
+})
+
+test('diagnostic idempotency respects MAX after many keys', () => {
+  const diag = require('../electron/diagnostic-idempotency.cjs')
+  diag.resetDiagnosticIdempotencyForTests()
+  for (let i = 0; i < 10050; i += 1) {
+    const key = `k-${i}`
+    diag.markDiagnosticProcessing(key)
+    diag.markDiagnosticDone(key)
+  }
+  diag.cleanupDiagnosticIdempotency()
+  assert.ok(diag.getDiagnosticIdempotencySizeForTests() <= diag.DIAGNOSTIC_MAX)
+})
+
+test('TLS setCertPins destroys previous agent', () => {
+  const tls = require('../electron/service-tls.cjs')
+  tls.resetTlsStateForTests()
+  tls.addTrustedHostForTests('127.0.0.1')
+  tls.setCertPins('127.0.0.1', ['sha256/dummy-a'])
+  let destroyed = false
+  const agent = tls.getPinnedHttpsAgent('127.0.0.1')
+  agent.destroy = () => { destroyed = true }
+  tls.setCertPins('127.0.0.1', ['sha256/dummy-b'])
+  assert.equal(destroyed, true)
+  tls.resetTlsStateForTests()
+})
+
+test('loading stays true until both directory and member operations finish', async () => {
+  let activeDirectory = 0
+  let activeMember = 0
+  let loading = false
+  const sync = () => { loading = activeDirectory > 0 || activeMember > 0 }
+
+  activeDirectory += 1; sync()
+  const dir = (async () => {
+    await new Promise((r) => setTimeout(r, 30))
+    activeDirectory = Math.max(0, activeDirectory - 1); sync()
+  })()
+
+  activeMember += 1; sync()
+  const member = (async () => {
+    await new Promise((r) => setTimeout(r, 10))
+    activeMember = Math.max(0, activeMember - 1); sync()
+  })()
+
+  await member
+  assert.equal(loading, true)
+  await dir
+  assert.equal(loading, false)
+})
+
+test('QR monitor resolve uses strict instance+room key in main', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
+  const resolveFn = main.slice(main.indexOf('function resolveQrMonitorRoom'), main.indexOf('async function processQrMonitorImage'))
+  assert.match(resolveFn, /monitorRoomKey\(record\.id, roomId\)/)
+  assert.match(resolveFn, /qrMonitorRoomByKey\.get/)
+  assert.doesNotMatch(resolveFn, /bindQrMonitorRoom/)
+})
+
+test('QR monitor stop cancels pending queue jobs', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
+  const stopFn = main.slice(main.indexOf("ipcMain.handle('qr:monitor-stop'"), main.indexOf("ipcMain.handle('qr:monitor-sync'"))
+  assert.match(stopFn, /skipped: true/)
+  assert.match(main.slice(main.indexOf('function enqueueQrMonitorJob'), main.indexOf('function pumpQrMonitorQueue')), /!qrMonitorConfig\.enabled/)
+})

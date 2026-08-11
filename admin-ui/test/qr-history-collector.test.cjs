@@ -147,7 +147,7 @@ test('QR history UI supports multi-room collection and offline decoding', () => 
   assert.match(page, /collectProgressText|onQrCollectProgress/)
   assert.match(page, /队列准备中|队列 \$\{detail\.roomIndex/)
   assert.match(page, /formatCacheTime|cacheTime/)
-  assert.match(page, /selectedGroupIds.*multiple/s)
+  assert.match(page, /selectedMonitorRoomKeys.*multiple/s)
   assert.match(main, /queueRooms/)
   assert.match(main, /byInstance/)
   assert.match(main, /Promise\.all/)

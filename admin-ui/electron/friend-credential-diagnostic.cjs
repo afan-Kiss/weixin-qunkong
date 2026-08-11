@@ -3,6 +3,7 @@
  * V3/V4 永不输出全文，只上报存在性、前缀、长度、SHA-256 前 16 位。
  */
 const { createHash } = require('crypto')
+const { sanitizeSensitiveString } = require('./sensitive-redaction.cjs')
 const { readString, payloadLayers, parseProfileCredentials, rawStructure } = require('./friend-profile.cjs')
 
 const ALLOWED_ENDPOINTS = Object.freeze([
@@ -28,10 +29,7 @@ function isRecord(value) {
 function redactPreview(raw) {
   let text
   try { text = typeof raw === 'string' ? raw : JSON.stringify(raw) } catch { text = String(raw) }
-  return text
-    .replace(/v3_[^"'\s<>]+/gi, (v) => `${v.slice(0, 12)}...[${v.length}]`)
-    .replace(/v4_[^"'\s<>]+/gi, (v) => `${v.slice(0, 12)}...[${v.length}]`)
-    .slice(0, MAX_PREVIEW)
+  return sanitizeSensitiveString(text).slice(0, MAX_PREVIEW)
 }
 
 function credentialMeta(value) {
