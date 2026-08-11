@@ -11,6 +11,8 @@ test('group row viewing and checkbox selection use independent actions', () => {
   assert.match(source, /<el-checkbox[^>]+@click\.stop[^>]+@change="toggleGroup/)
   assert.match(source, /function selectAllGroups/)
   assert.match(source, /function clearSelectedGroups/)
+  assert.match(source, /实例集合未变时不要动群勾选/)
+  assert.match(source, /目录尚未刷出时 valid 为空/)
 })
 
 test('friend task defers credentials to execution (PROFILE_PENDING)', () => {

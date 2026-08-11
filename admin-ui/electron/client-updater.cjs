@@ -19,6 +19,7 @@ const {
   isLegacyBrandDownloadUrl,
   isLegacyBrandFileName,
 } = require('./secure-config.cjs')
+const { insecureTlsForService } = require('./service-tls.cjs')
 
 const DEFAULT_BASE = getServiceBase()
 const BUILTIN_PUBLISH_PUBLIC_KEY_B64 = getPublishPublicKeyB64()
@@ -245,6 +246,7 @@ function httpGet(url, options = {}) {
       method: 'GET',
       headers: options.headers || {},
       timeout: options.timeoutMs || 60000,
+      ...insecureTlsForService(u.hostname),
     }, (res) => {
       const chunks = []
       res.on('data', (c) => chunks.push(c))
@@ -277,12 +279,13 @@ async function fetchManifest(baseUrl, clientId = '') {
   } else if (!signature) {
     throw new Error('UPDATE_SIGNATURE_MISSING')
   } else if (!verifyManifestSignature(man, signature)) {
+    // 仅信任客户端内置公钥；响应里的 publicKey 不能作为验签根（可被同响应伪造）
     throw new Error('UPDATE_SIGNATURE_INVALID')
   }
-  if (!String(man.buildId || '').trim() && !String(man.version || '').trim()) {
+  if (!String(man.buildId || '').trim() && !String(man.version || '').trim() && !Number(man.releaseSequence || 0)) {
     throw new Error('missing buildId')
   }
-  return { manifest: man, signature }
+  return { manifest: man, signature, publicKey: String(wrap.publicKey || '').trim() }
 }
 
 /**
@@ -339,6 +342,7 @@ async function reportUpdate(baseUrl, event, meta, extra = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
         timeout: 8000,
+        ...insecureTlsForService(u.hostname),
       }, (res) => { res.resume(); res.on('end', resolve) })
       req.on('error', () => resolve())
       req.on('timeout', () => { req.destroy(); resolve() })
@@ -349,7 +353,67 @@ async function reportUpdate(baseUrl, event, meta, extra = {}) {
 }
 
 /**
- * 支持 Range 断点续传的下载。
+ * 单段 Range 下载到指定偏移（支持并发拼包）。
+ * @param {string} url
+ * @param {string} dest
+ * @param {number} start
+ * @param {number} end inclusive
+ * @param {(n: number) => void} [onChunk]
+ */
+function downloadRangeToFile(url, dest, start, end, onChunk) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url)
+    const lib = u.protocol === 'https:' ? https : http
+    const req = lib.request(url, {
+      method: 'GET',
+      headers: { Range: `bytes=${start}-${end}` },
+      timeout: 120000,
+      ...insecureTlsForService(u.hostname),
+    }, (res) => {
+      const status = res.statusCode || 0
+      if (status !== 206 && status !== 200) {
+        res.resume()
+        reject(new Error(`download http ${status}`))
+        return
+      }
+      const { openSync, writeSync, closeSync } = require('fs')
+      let fd
+      try {
+        fd = openSync(dest, 'r+')
+      } catch (error) {
+        res.resume()
+        reject(error)
+        return
+      }
+      let offset = start
+      res.on('data', (chunk) => {
+        try {
+          writeSync(fd, chunk, 0, chunk.length, offset)
+          offset += chunk.length
+          onChunk?.(chunk.length)
+        } catch (error) {
+          try { closeSync(fd) } catch (_) {}
+          reject(error)
+          req.destroy()
+        }
+      })
+      res.on('error', (error) => {
+        try { closeSync(fd) } catch (_) {}
+        reject(error)
+      })
+      res.on('end', () => {
+        try { closeSync(fd) } catch (_) {}
+        resolve(offset - start)
+      })
+    })
+    req.on('error', reject)
+    req.on('timeout', () => { req.destroy(new Error('timeout')); reject(new Error('timeout')) })
+    req.end()
+  })
+}
+
+/**
+ * 多连接 Range 并发下载 + 断点续传（显著快于单连接慢上行）。
  * @param {string} url
  * @param {string} dest
  * @param {number} expectedSize
@@ -357,53 +421,88 @@ async function reportUpdate(baseUrl, event, meta, extra = {}) {
  */
 async function downloadWithResume(url, dest, expectedSize, onProgress) {
   mkdirSync(path.dirname(dest), { recursive: true })
-  let start = 0
-  if (existsSync(dest)) {
-    start = statSync(dest).size
-    if (expectedSize > 0 && start > expectedSize) {
-      unlinkSync(dest)
-      start = 0
-    }
-    if (expectedSize > 0 && start === expectedSize) {
-      onProgress?.(expectedSize, expectedSize)
-      return
-    }
-  }
-  const headers = {}
-  if (start > 0) headers.Range = `bytes=${start}-`
-  const u = new URL(url)
-  const lib = u.protocol === 'https:' ? https : http
-  const res = await new Promise((resolve, reject) => {
-    const req = lib.request(url, { method: 'GET', headers, timeout: 120000 }, resolve)
-    req.on('error', reject)
-    req.on('timeout', () => { req.destroy(new Error('timeout')); reject(new Error('timeout')) })
-    req.end()
-  })
-  const status = res.statusCode || 0
-  if (status >= 300 && status !== 206) {
-    res.resume()
-    throw new Error(`download http ${status}`)
-  }
-  const append = start > 0 && status === 206
-  if (!append) start = 0
-  const flags = append ? 'a' : 'w'
-  const file = createWriteStream(dest, { flags })
-  let total = expectedSize
-  if (total <= 0 && Number(res.headers['content-length'] || 0) > 0) {
-    total = start + Number(res.headers['content-length'])
-  }
-  onProgress?.(start, total)
-  let got = 0
-  await new Promise((resolve, reject) => {
-    res.on('data', (chunk) => {
-      got += chunk.length
-      onProgress?.(start + got, total)
+  const total = Number(expectedSize || 0) || 0
+  if (total <= 0) {
+    // 未知大小：退回单连接整包
+    const u = new URL(url)
+    const lib = u.protocol === 'https:' ? https : http
+    const res = await new Promise((resolve, reject) => {
+      const req = lib.request(url, {
+        method: 'GET',
+        timeout: 120000,
+        ...insecureTlsForService(u.hostname),
+      }, resolve)
+      req.on('error', reject)
+      req.on('timeout', () => { req.destroy(new Error('timeout')); reject(new Error('timeout')) })
+      req.end()
     })
-    res.on('error', reject)
-    file.on('error', reject)
-    file.on('finish', resolve)
-    res.pipe(file)
-  })
+    if ((res.statusCode || 0) >= 300) {
+      res.resume()
+      throw new Error(`download http ${res.statusCode || 0}`)
+    }
+    await new Promise((resolve, reject) => {
+      const file = createWriteStream(dest, { flags: 'w' })
+      let got = 0
+      res.on('data', (chunk) => {
+        got += chunk.length
+        onProgress?.(got, 0)
+      })
+      res.on('error', reject)
+      file.on('error', reject)
+      file.on('finish', resolve)
+      res.pipe(file)
+    })
+    return
+  }
+
+  const partSize = 4 * 1024 * 1024
+  const concurrency = 4
+  const parts = []
+  for (let start = 0; start < total; start += partSize) {
+    parts.push({ start, end: Math.min(total - 1, start + partSize - 1), done: false })
+  }
+  // 已有完整文件
+  if (existsSync(dest) && statSync(dest).size === total) {
+    onProgress?.(total, total)
+    return
+  }
+  // 预分配
+  const { openSync, ftruncateSync, closeSync } = require('fs')
+  const fd = openSync(dest, 'w')
+  try { ftruncateSync(fd, total) } finally { closeSync(fd) }
+
+  let downloaded = 0
+  onProgress?.(0, total)
+  let cursor = 0
+  async function worker() {
+    while (true) {
+      const idx = cursor
+      cursor += 1
+      if (idx >= parts.length) return
+      const part = parts[idx]
+      let attempt = 0
+      while (attempt < 4) {
+        attempt += 1
+        let partGot = 0
+        try {
+          await downloadRangeToFile(url, dest, part.start, part.end, (n) => {
+            partGot += n
+            downloaded += n
+            onProgress?.(Math.min(total, downloaded), total)
+          })
+          part.done = true
+          break
+        } catch (error) {
+          downloaded = Math.max(0, downloaded - partGot)
+          onProgress?.(Math.min(total, downloaded), total)
+          if (attempt >= 4) throw error
+          await new Promise((r) => setTimeout(r, 500 * attempt))
+        }
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  if (statSync(dest).size !== total) throw new Error('UPDATE_SIZE_MISMATCH')
 }
 
 /**
@@ -527,12 +626,21 @@ async function applyUpdate(options) {
 
     let url = String(man.downloadURL || '').trim()
     const packageUrl = `${baseUrl.replace(/\/$/, '')}/api/update/package/${man.buildId}`
-    // 清单若仍指向旧品牌路径，强制回退到当前服务基址
-    if (!url || isLegacyBrandDownloadUrl(url)) {
+    // 只从当前服务基址拉包；清单若指到其它主机/旧品牌路径则忽略
+    let sameHost = false
+    try {
+      sameHost = !!(url && new URL(url).hostname.toLowerCase() === new URL(baseUrl).hostname.toLowerCase())
+    } catch (_) { sameHost = false }
+    if (!url || isLegacyBrandDownloadUrl(url) || !sameHost) {
       url = packageUrl
     }
-    const urlGate = validateDownloadURL(url)
-    if (!urlGate.ok) throw new Error(urlGate.code || 'UPDATE_URL_INVALID')
+    const candidates = []
+    for (const candidate of [packageUrl, url]) {
+      if (!candidate || candidates.includes(candidate)) continue
+      if (validateDownloadURL(candidate).ok) candidates.push(candidate)
+    }
+    if (!candidates.length) throw new Error('UPDATE_URL_HOST_DENIED')
+    url = candidates[0]
 
     probeDirWritable(installDir)
     const workDir = path.join(require('os').tmpdir(), getUpdateWorkDirName())
@@ -540,8 +648,19 @@ async function applyUpdate(options) {
     const downloadPath = path.join(workDir, destName)
 
     await reportUpdate(baseUrl, 'DOWNLOAD_STARTED', meta, { buildId: man.buildId, version: man.version })
-    await downloadWithResume(url, downloadPath, Number(man.fileSize || 0) || 0, options.onProgress)
-    await reportUpdate(baseUrl, 'DOWNLOAD_COMPLETED', meta, { buildId: man.buildId })
+    let downloadError = null
+    for (const candidate of candidates) {
+      try {
+        await downloadWithResume(candidate, downloadPath, Number(man.fileSize || 0) || 0, options.onProgress)
+        url = candidate
+        downloadError = null
+        break
+      } catch (error) {
+        downloadError = error
+      }
+    }
+    if (downloadError) throw downloadError
+    await reportUpdate(baseUrl, 'DOWNLOAD_COMPLETED', meta, { buildId: man.buildId, downloadURL: url })
     await verifyPackageFile(downloadPath, man)
 
     await reportUpdate(baseUrl, 'INSTALL_STARTED', meta, { buildId: man.buildId, version: man.version })

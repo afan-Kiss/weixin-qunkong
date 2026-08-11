@@ -534,7 +534,18 @@ watch(() => selectedGroups.value[0], (roomId) => {
     void refreshMembers(roomId)
   }
 })
-watch(selectedInstances, () => {
+watch(selectedInstances, (ids, prevIds) => {
+  const nextKey = [...ids].map(String).sort().join('\0')
+  const prevKey = [...(prevIds || [])].map(String).sort().join('\0')
+  // refresh() 里 filter 会换新数组引用；实例集合未变时不要动群勾选
+  if (nextKey === prevKey) return
+  if (!ids.length) {
+    selectedGroups.value = []
+    activeGroupId.value = ''
+    return
+  }
+  // 目录尚未刷出时 valid 为空，禁止把已全选/已勾选冲掉
+  if (!mergedGroups.value.length) return
   const valid = new Set(mergedGroups.value.map((item) => item.id))
   selectedGroups.value = selectedGroups.value.filter((id) => valid.has(id))
   if (activeGroupId.value && !valid.has(activeGroupId.value)) activeGroupId.value = selectedGroups.value[0] || ''
@@ -636,8 +647,8 @@ onBeforeUnmount(() => {
           <el-switch v-model="onlyLatestJoins" active-text="开" inactive-text="关" />
         </div>
         <div class="filter-item">
-          <label>随机间隔（秒）</label>
-          <div class="muted">使用系统设置中的全局随机间隔</div>
+          <label>执行间隔（毫秒）</label>
+          <div class="muted">在任务中心确认执行时单独设置，单位毫秒</div>
         </div>
         <div class="filter-item filter-item--wide">
           <label>排除规则（WXID / 昵称）</label>

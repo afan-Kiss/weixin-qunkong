@@ -1,14 +1,15 @@
 #Requires -Version 5.1
 # One-command release: bump (optional) → package portable → publish to update channel.
 param(
-  [string]$BaseUrl = 'https://xiangyuzhubao.xyz/wxqk',
+  [string]$BaseUrl = 'https://120.27.219.138:8443/wxqk',
   [string]$Password = $env:WXQK_PUBLISH_PASSWORD,
   [switch]$Mandatory,
   [switch]$SkipBump,
   [switch]$SkipPackage,
   [string]$ExePath = '',
   [int]$Concurrency = 4,
-  [int]$PreferredChunkMB = 4
+  [int]$PreferredChunkMB = 4,
+  [switch]$InsecureTls
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,6 +85,7 @@ $publishArgs = @(
   '-PreferredChunkMB', "$PreferredChunkMB"
 )
 if ($Mandatory) { $publishArgs += '-Mandatory' }
+if ($InsecureTls) { $publishArgs += '-InsecureTls' }
 & powershell @publishArgs
 if ($LASTEXITCODE -ne 0) { throw "publish failed: $LASTEXITCODE" }
 

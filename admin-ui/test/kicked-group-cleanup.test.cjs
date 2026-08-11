@@ -198,6 +198,12 @@ test('main process quits only after safe gates', () => {
   assert.match(main, /markChatroomBlocked/)
   assert.match(main, /\/api\/remov_chatroom_to_contact/)
   assert.match(main, /\/api\/quit_and_del_chat_room/)
+  assert.match(main, /\/api\/del_contact/)
+  assert.match(main, /buildKickRoomMutationBody/)
+  assert.match(main, /quitAndClearKickedRoomSession/)
+  assert.match(main, /QUIT_STILL_IN_ROOM_LIST/)
+  assert.match(main, /REQUEUE_STILL_IN_ROOM_LIST/)
+  assert.match(main, /username: id/)
   assert.match(main, /isImmediateKickEvidence/)
   assert.match(main, /isLeaveCallbackEvidence/)
   assert.match(main, /手动创建被踢群清理任务/)
@@ -220,30 +226,66 @@ test('main process quits only after safe gates', () => {
   assert.match(main, /kickedGroupCleanupPreparing/)
   assert.match(main, /fullyCleaned/)
   assert.match(main, /rebindKickedGroupPendingToInstance/)
+  assert.doesNotMatch(main, /HISTORY_ROOM_CAP|historyRoomAttempts/)
+  assert.doesNotMatch(main, /RESIDUAL_CAP|RESIDUAL_COOLDOWN_MS/)
+  assert.match(main, /扫描被踢群时间较长|kickedGroupCleanupPreparing = false/)
   assert.doesNotMatch(main, /ensureKickedGroupCleanupTimer|KICKED_GROUP_CLEANUP_INTERVAL|定时巡检/)
   assert.doesNotMatch(main, /runKickedGroupCleanupSweep|kickedGroupCleanupRunning/)
   const discover = main.slice(main.indexOf('async function discoverKickedGroupsFromHistory'), main.indexOf('async function loadLiveRoomIdsForKickGate'))
   assert.match(discover, /HISTORY_TAIL\s*=\s*10/)
   assert.match(discover, /LIMIT \$\{HISTORY_TAIL\}/)
+  assert.doesNotMatch(discover, /HISTORY_ROOM_CAP/)
   assert.match(discover, /instanceId: record\.id/)
   assert.doesNotMatch(discover, /WHERE .+ IN \(10000,10002\).+LIMIT 40/s)
   assert.match(discover, /typeNum !== 10000 && typeNum !== 10002/)
+  assert.match(discover, /hideKickedRoomFromDirectory/)
+  assert.match(discover, /isImmediateKickEvidence\(hit\.evidence\)/)
+  assert.match(main, /function hideKickedRoomFromDirectory/)
+  assert.match(main, /function restoreKickedRoomToDirectory/)
+  assert.match(main, /action: action === 'restore' \? 'restore' : 'exclude'/)
+  assert.match(main, /DEFAULT_TASK_PACE_INTERVAL_MS/)
+  assert.match(main, /loadDirectoryExcludedRoomIdSetForInstance/)
+  assert.match(main, /directory:blocked-room-ids[\s\S]*loadDirectoryExcludedRoomIdSetForInstance/)
   const cleanup = main.slice(main.indexOf('async function cleanupOneKickedGroupRoom'), main.indexOf('async function prepareKickedGroupCleanupTask'))
+  assert.match(cleanup, /restoreKickedRoomToDirectory/)
+  assert.match(cleanup, /hideKickedRoomFromDirectory\(record, roomId, roomLabel\)/)
   assert.match(cleanup, /isImmediateKickEvidence/)
   assert.match(cleanup, /isLeaveCallbackEvidence/)
-  assert.match(cleanup, /quit_and_del_chat_room/)
+  assert.match(cleanup, /quitAndClearKickedRoomSession/)
   assert.match(cleanup, /formatKickCleanupMessage/)
   assert.match(cleanup, /kickStatus/)
   assert.match(main, /群昵称：\$\{roomName\}｜被踢状态：/)
   assert.ok(cleanup.includes('CANCELLED'))
-  assert.ok(cleanup.indexOf('fullyCleaned') < cleanup.indexOf("status: 'DONE'"))
+  assert.ok(cleanup.includes('fullyCleaned'))
+  assert.ok(cleanup.includes("status: 'DONE'"))
+  assert.match(cleanup, /markChatroomBlocked/)
+  const quitClear = main.slice(main.indexOf('async function quitAndClearKickedRoomSession'), main.indexOf('async function discoverKickedGroupsFromHistory'))
+  assert.match(quitClear, /\/api\/quit_and_del_chat_room/)
+  assert.match(quitClear, /\/api\/del_contact/)
+  assert.match(quitClear, /\/api\/remov_chatroom_to_contact/)
+  assert.match(quitClear, /buildKickRoomMutationBody/)
+  assert.match(quitClear, /loadLiveRoomIdsForKickGate/)
+  assert.match(quitClear, /stillPresent/)
+  assert.match(quitClear, /retry < 2/)
+  assert.match(quitClear, /runQuitAndDel/)
+  const loadLive = main.slice(main.indexOf('async function loadLiveRoomIdsForKickGate'), main.indexOf('async function cleanupOneKickedGroupRoom'))
+  assert.match(loadLive, /两边都没拉到有效群/)
+  assert.match(loadLive, /return null/)
+  assert.match(main, /LIVE_LIST_UNAVAILABLE/)
   const prepare = main.slice(main.indexOf('async function prepareKickedGroupCleanupTask'), main.indexOf('function bindQrMonitorRoom'))
+  assert.match(prepare, /REQUEUE_STILL_IN_ROOM_LIST/)
+  assert.match(prepare, /loadBlockedRoomIdSet/)
+  assert.match(prepare, /loadLiveRoomIdsForKickGate/)
   assert.match(prepare, /rebindKickedGroupPendingToInstance/)
   assert.match(prepare, /discoverKickedGroupsFromHistory/)
   assert.match(prepare, /createLocalTask/)
   assert.match(prepare, /KICKED_GROUP_CLEANUP/)
   assert.match(prepare, /activeKeys/)
   assert.match(prepare, /\$\{record\.id\}::\$\{roomId\}/)
+  assert.match(prepare, /options\.instanceId/)
+  assert.match(prepare, /wantedId/)
+  assert.match(prepare, /所选微信当前未在线/)
+  assert.match(main, /kicked-groups:cleanup[\s\S]*options\.instanceId/)
   const runTask = main.slice(main.indexOf('async function runTask'), main.indexOf('function createLocalTask'))
   assert.match(runTask, /action_type === 'KICKED_GROUP_CLEANUP'/)
   assert.match(runTask, /cleanupOneKickedGroupRoom/)
@@ -258,12 +300,19 @@ test('main process quits only after safe gates', () => {
   const page = fs.readFileSync(path.join(__dirname, '..', 'src', 'stores', 'wechatData.ts'), 'utf8')
   assert.match(page, /listBlockedRoomIds/)
   assert.match(page, /applyBlockedRoomRemoved/)
+  assert.match(page, /action === 'restore'/)
+  assert.match(page, /refreshDirectory\(\[id\], \{ force: true \}\)/)
   const settings = fs.readFileSync(path.join(__dirname, '..', 'src', 'pages', 'SettingsLogsPage.vue'), 'utf8')
   assert.match(settings, /cleanupKickedGroups/)
   assert.match(settings, /创建清理任务/)
   assert.match(settings, /promptGoToTaskCenter/)
   assert.match(settings, /最近 10 条/)
   assert.match(settings, /系统通知/)
+  assert.match(settings, /cleanupInstanceId/)
+  assert.match(settings, /onlineInstances/)
+  assert.match(settings, /cleanupKickedGroups\?\.\(\{\s*instanceId/)
+  assert.match(settings, /选择要清理的微信/)
+  assert.match(settings, /创建清理任务等待较久|610000/)
   const status = fs.readFileSync(path.join(__dirname, '..', 'src', 'utils', 'status.ts'), 'utf8')
   assert.match(status, /KICKED_GROUP_CLEANUP:\s*'清理被踢群'/)
   const tasksPage = fs.readFileSync(path.join(__dirname, '..', 'src', 'pages', 'TasksPage.vue'), 'utf8')
@@ -271,6 +320,7 @@ test('main process quits only after safe gates', () => {
   assert.match(tasksPage, /KICKED_GROUP_CLEANUP/)
   const preload = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.cjs'), 'utf8')
   assert.match(preload, /cleanupKickedGroups/)
+  assert.match(preload, /cleanupKickedGroups: \(payload\)/)
 })
 
 test('history message rows detect self-kick and ignore others', () => {
@@ -298,6 +348,44 @@ test('xml system kick content is stripped before matching', () => {
   }, 'wxid_self')
   assert.equal(hit?.roomId, 'xmlroom@chatroom')
   assert.equal(hit?.evidence, 'SYSTEM_MSG_SELF_KICKED')
+})
+
+test('directory exclude covers strong kick pending and confirmed leave, not weak leave', () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-kick-exclude-'))
+  storage.initStorage(folder)
+  storage.upsertInstance({
+    id: 'inst-a',
+    apiPort: 19001,
+    tcpPort: 19002,
+    accountWxid: 'wxid_a',
+    nickname: 'A',
+    status: 'ONLINE',
+  })
+  storage.upsertKickedGroupPending({
+    instanceId: 'inst-a',
+    roomId: 'sys@chatroom',
+    accountWxid: 'wxid_a',
+    evidence: 'SYSTEM_MSG_SELF_KICKED',
+  })
+  storage.upsertKickedGroupPending({
+    instanceId: 'inst-a',
+    roomId: 'leave@chatroom',
+    accountWxid: 'wxid_a',
+    evidence: 'LEAVE_CALLBACK_SELF',
+  })
+  let excluded = storage.loadDirectoryExcludedRoomIdSetForInstance('inst-a')
+  assert.equal(excluded.has('sys@chatroom'), true)
+  assert.equal(excluded.has('leave@chatroom'), false)
+
+  storage.updateKickedGroupCleanup('inst-a', 'leave@chatroom', { confirmCount: 1 })
+  excluded = storage.loadDirectoryExcludedRoomIdSetForInstance('inst-a')
+  assert.equal(excluded.has('leave@chatroom'), true)
+
+  storage.updateKickedGroupCleanup('inst-a', 'sys@chatroom', {
+    status: 'CANCELLED',
+    lastError: 'REINVITED_SELF_STILL_MEMBER',
+  })
+  assert.equal(storage.loadDirectoryExcludedRoomIdSetForInstance('inst-a').has('sys@chatroom'), false)
 })
 
 test('system msg evidence allows cleanup without account wxid', () => {

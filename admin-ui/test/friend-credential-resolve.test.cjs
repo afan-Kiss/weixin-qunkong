@@ -71,7 +71,34 @@ test('skips update_single_profile when group already has V3+V4', async () => {
   })
   assert.equal(result.ok, true)
   assert.equal(result.credentialSource, 'GROUP_MEMBER_CONTACT')
+  assert.equal(calls.filter((c) => c.endpoint === '/api/get_group_member_contact').length, 1)
   assert.equal(calls.filter((c) => c.endpoint === '/api/update_single_profile').length, 0)
+})
+
+test('retries group member contact when V4 still missing', async () => {
+  let groupHits = 0
+  const calls = []
+  const fetchProfile = async (endpoint, body, sourceId, attempt) => {
+    calls.push({ endpoint, body, sourceId, attempt })
+    if (endpoint === '/api/get_group_member_contact') {
+      groupHits += 1
+      if (groupHits < 2) return { parsed: { v3: 'v3_early@stranger', v4: '' } }
+      return { parsed: { v3: 'v3_early@stranger', v4: 'v4_late@stranger' } }
+    }
+    if (endpoint === '/api/update_single_profile') return { parsed: { v3: 'v3_early@stranger', v4: '' } }
+    return { parsed: { v3: '', v4: '' } }
+  }
+  const result = await resolveFriendProfileCredentials({
+    targetWxid: 'wxid_target',
+    sourceRoomId: '123@chatroom',
+    fetchProfile,
+    delays: [0],
+    profileRetries: 1,
+    v4RetryDelays: [0],
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.v4, 'v4_late@stranger')
+  assert.ok(calls.filter((c) => c.endpoint === '/api/get_group_member_contact').length >= 2)
 })
 
 test('Invalid argument is retryable; policy -24 is not', () => {

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, clipboard, screen, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, clipboard, screen, shell, session } = require('electron')
 
 // 部分机器 GPU/驱动异常会导致进程在但窗口不显示/白屏
 try { app.disableHardwareAcceleration() } catch {}
@@ -12,7 +12,7 @@ const net = require('net')
 const http = require('http')
 const https = require('https')
 const path = require('path')
-const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms, markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, listBlockedChatrooms, hasQrContentHash } = require('./storage.cjs')
+const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms, markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, loadDirectoryExcludedRoomIdSetForInstance, listBlockedChatrooms, hasQrContentHash } = require('./storage.cjs')
 const { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, hasFrequentEvidence, isVerifiedSuccess, buildAddFriendRequest, evaluateFriendAddResult, isRetryableFriendCredentialFailure } = require('./protocol.cjs')
 const { createSerialExecutor, parseInjectorOutput, decodeInjectorChunks, waitForInjectorClose } = require('./instance-runtime.cjs')
 const { rawErrorMessage, toUserErrorMessage } = require('./user-error.cjs')
@@ -26,18 +26,22 @@ const {
   parseInvitePreview,
   mergeInvitePreview,
   buildInvitePageRequest,
-  extractA8KeyHttpHeaders,
   hasUsableInvitePreview,
-  a8keyResponseUseful,
+  hasReliableJoinTarget,
+  scoreInvitePreviewCandidate,
   evaluateEnterRoomResult,
   confirmJoinedFromRoomList,
+  findAlreadyJoinedRoom,
   formatInvitePreviewLine,
-  findRoomId,
+  findRoomIdInUrl,
+  isExpandedInviteUrl,
+  isShortGroupInviteUrl,
   isJoinApplicationPending,
 } = require('./qr-join.cjs')
 const { mergeMonitorRooms, extractRoomsFromApiRaw } = require('./qr-monitor-rooms.cjs')
 const { extractSelfKickedEvent, resolveSelfStillInMembers, canCleanupKickedRoom, isImmediateKickEvidence, isLeaveCallbackEvidence, kickHitFromHistoryMessage } = require('./kicked-group-cleanup.cjs')
 const { scrubLegacyCachesOnStartup } = require('./startup-cache-scrub.cjs')
+const { installServiceCertificateTrust } = require('./service-tls.cjs')
 
 /** 历史采集进行中标记，防止重复点击叠任务把主进程拖死 */
 let historyCollectRunning = false
@@ -625,7 +629,6 @@ function validPort(value, fallback) {
 
 function normalizeSettings(value) {
   const source = value && typeof value === 'object' ? value : {}
-  const intervalMin = Math.max(Number(source.intervalMin) || 20, 1)
   const apiPort = validPort(source.httpPort, 19088)
   let tcpPort = validPort(source.tcpPort, 61108)
   if (tcpPort === apiPort) tcpPort = apiPort < 65534 ? apiPort + 2 : apiPort - 2
@@ -633,14 +636,28 @@ function normalizeSettings(value) {
     ? path.resolve(source.weixinExe.trim())
     : ''
   return {
-    intervalMin,
-    intervalMax: Math.max(Number(source.intervalMax) || 40, intervalMin),
     httpPort: apiPort,
     tcpPort,
     friendDailyLimit: Math.max(Number(source.friendDailyLimit) || 50, 1),
     qrDir: typeof source.qrDir === 'string' ? source.qrDir : '',
     weixinExe,
   }
+}
+
+/** 确认执行未写入 intervalMs 时的安全默认间隔（避免升级前定时任务 0ms 连发） */
+const DEFAULT_TASK_PACE_INTERVAL_MS = 1000
+
+/**
+ * 任务项之间的固定执行间隔（毫秒）。确认执行时写入 config.intervalMs；显式 0 表示不等待。
+ * @param {{ config?: Record<string, unknown> } | null | undefined} task
+ */
+function resolveTaskPaceIntervalMs(task) {
+  if (!task?.config || !Object.prototype.hasOwnProperty.call(task.config, 'intervalMs')) {
+    return DEFAULT_TASK_PACE_INTERVAL_MS
+  }
+  const raw = Number(task.config.intervalMs)
+  if (!Number.isFinite(raw) || raw < 0) return DEFAULT_TASK_PACE_INTERVAL_MS
+  return Math.floor(raw)
 }
 
 function appLog(level, message, details = {}) {
@@ -946,20 +963,46 @@ function ensureChatAddRuleBound(record) {
   const rule = getChatAddRule()
   if (!rule.enabled) return rule
   if (!record?.id) return rule
-  if (rule.instanceId && rule.instanceId === record.id) return rule
 
+  const currentWxid = String(record.accountWxid || '').trim()
   const bound = rule.instanceId ? instances.get(rule.instanceId) : null
-  const boundOnline = Boolean(bound && bound.status === 'ONLINE')
-  if (boundOnline && rule.instanceId !== record.id) return rule
+  const boundWxid = String(rule.accountWxid || bound?.accountWxid || '').trim()
+  const sameInstance = Boolean(rule.instanceId && rule.instanceId === record.id)
 
-  const boundWxid = String(bound?.accountWxid || '')
-  const currentWxid = String(record.accountWxid || '')
-  // 旧实例已不在线/不存在时，自动改绑；多开时仅同账号才改绑
-  if (rule.instanceId && boundWxid && currentWxid && boundWxid !== currentWxid) return rule
+  // 实例已对齐时，仅回填缺失的账号字段
+  if (sameInstance) {
+    if (!rule.accountWxid && currentWxid) {
+      return saveChatAddRule({
+        enabled: rule.enabled,
+        instanceId: record.id,
+        accountWxid: currentWxid,
+        roomIds: rule.roomIds,
+        keywords: rule.keywords,
+        excludeText: rule.excludeText,
+      })
+    }
+    return rule
+  }
+
+  const boundOnline = Boolean(bound && bound.status === 'ONLINE')
+  const sameAccount = Boolean(boundWxid && currentWxid && boundWxid === currentWxid)
+  // 跨账号：绝不改绑（多开时其他微信的消息会走到这里）
+  if (boundWxid && currentWxid && boundWxid !== currentWxid) return rule
+  // 同账号且旧实例仍在线：仅当「当前实例刚有消息/探测」且旧实例不是最近活跃时才改绑，避免双 ONLINE 乒乓
+  const boundGone = !rule.instanceId || !bound || !boundOnline
+  if (!sameAccount && !boundGone) return rule
+  if (!sameAccount && boundOnline) return rule
+  if (sameAccount && boundOnline && rule.instanceId !== record.id) {
+    const boundLast = Number(bound?.lastCallbackAt || bound?.lastProbeAt || 0)
+    const currentLast = Number(record.lastCallbackAt || record.lastProbeAt || Date.now())
+    // 旧实例仍有更新的回调/探测 → 不抢绑；当前明显更新才改
+    if (boundLast && currentLast && boundLast >= currentLast - 2000) return rule
+  }
 
   const next = {
     enabled: rule.enabled,
     instanceId: record.id,
+    accountWxid: currentWxid || boundWxid || rule.accountWxid || '',
     roomIds: rule.roomIds,
     keywords: rule.keywords,
     excludeText: rule.excludeText,
@@ -970,7 +1013,8 @@ function ensureChatAddRuleBound(record) {
     module: '群聊加好友',
     operation: '自动绑定实例',
     previousInstanceId: rule.instanceId || '',
-    accountWxid: currentWxid,
+    accountWxid: next.accountWxid,
+    sameAccount,
   })
   return getChatAddRule()
 }
@@ -985,7 +1029,11 @@ function handleChatAddFriendEvent(record, event) {
   let rule = getChatAddRule()
   if (!rule.enabled) return { accepted: false, reason: 'DISABLED' }
   rule = ensureChatAddRuleBound(record)
-  const matched = matchChatAddRule(event, { ...rule, accountWxid: record.accountWxid }, record.id)
+  const matched = matchChatAddRule(event, {
+    ...rule,
+    // 规则缺账号时用当前实例 wxid，避免自己的群消息进候选
+    accountWxid: rule.accountWxid || record.accountWxid,
+  }, record.id)
   if (!matched.accepted || !matched.hit) {
     const reason = matched.reason || 'REJECTED'
     if (reason === 'INSTANCE_MISMATCH' || reason === 'ROOM_FILTER') {
@@ -994,12 +1042,20 @@ function handleChatAddFriendEvent(record, event) {
       const last = chatAddMissLogAt.get(key) || 0
       if (now - last > 30000) {
         chatAddMissLogAt.set(key, now)
-        appLog('WARN', `群聊加好友未命中：${reason === 'INSTANCE_MISMATCH' ? '监听微信实例已失效（将尝试自动改绑）' : '消息群不在监听列表'}`, {
+        const ruleWxid = String(rule.accountWxid || '').trim()
+        const currentWxid = String(record.accountWxid || '').trim()
+        const crossAccount = Boolean(ruleWxid && currentWxid && ruleWxid !== currentWxid)
+        const mismatchHint = crossAccount
+          ? '非监听微信号，已忽略'
+          : (reason === 'INSTANCE_MISMATCH' ? '监听实例未对齐且未能自动改绑' : '消息群不在监听列表')
+        appLog(crossAccount ? 'INFO' : 'WARN', `群聊加好友未命中：${mismatchHint}`, {
           instanceId: record.id,
           module: '群聊加好友',
           operation: '过滤',
           reason,
           ruleInstanceId: rule.instanceId,
+          ruleAccountWxid: ruleWxid,
+          accountWxid: currentWxid,
           roomCount: Array.isArray(rule.roomIds) ? rule.roomIds.length : 0,
         })
       }
@@ -1007,7 +1063,8 @@ function handleChatAddFriendEvent(record, event) {
     return { accepted: false, reason }
   }
   if (isChatroomBlockedForInstance(record.id, matched.hit.roomId)
-    || (record.accountWxid && isChatroomBlocked(record.accountWxid, matched.hit.roomId))) {
+    || (record.accountWxid && isChatroomBlocked(record.accountWxid, matched.hit.roomId))
+    || loadDirectoryExcludedRoomIdSetForInstance(record.id).has(String(matched.hit.roomId || ''))) {
     return { accepted: false, reason: 'BLOCKED_KICKED_ROOM' }
   }
   const saved = upsertChatAddCandidate({
@@ -1070,14 +1127,42 @@ function formatKickCleanupMessage(input) {
   return `群昵称：${roomName}｜被踢状态：${kickStatus}｜退出结果：${result}`
 }
 
-function notifyDirectoryBlockedChanged(instanceId, roomId, roomName) {
+function notifyDirectoryBlockedChanged(instanceId, roomId, roomName, action = 'exclude') {
   for (const win of BrowserWindow.getAllWindows()) {
     try {
       win.webContents.send('directory:blocked-changed', {
-        instanceId, roomId, roomName: roomName || '',
+        instanceId,
+        roomId,
+        roomName: roomName || '',
+        action: action === 'restore' ? 'restore' : 'exclude',
       })
     } catch { /* ignore */ }
   }
+}
+
+/**
+ * 强证据被踢：立刻从本机目录摘掉并通知界面不要再加载。
+ * @param {{ id: string }} record
+ * @param {string} roomId
+ * @param {string} [roomName]
+ */
+function hideKickedRoomFromDirectory(record, roomId, roomName = '') {
+  const id = String(roomId || '').trim()
+  if (!record?.id || !id.endsWith('@chatroom')) return
+  try { removeLocalChatroomOwnership(record.id, id) } catch { /* ignore */ }
+  notifyDirectoryBlockedChanged(record.id, id, roomName || '', 'exclude')
+}
+
+/**
+ * 误判取消后：通知界面强制重拉该号通讯录，把群加回来。
+ * @param {{ id: string }} record
+ * @param {string} roomId
+ * @param {string} [roomName]
+ */
+function restoreKickedRoomToDirectory(record, roomId, roomName = '') {
+  const id = String(roomId || '').trim()
+  if (!record?.id || !id.endsWith('@chatroom')) return
+  notifyDirectoryBlockedChanged(record.id, id, roomName || '', 'restore')
 }
 
 /**
@@ -1101,6 +1186,10 @@ function handleKickedGroupEvent(record, event) {
     evidence: hit.evidence,
     evidenceStrength: hit.strength,
   })
+  // 仅系统踢人强证据立刻隐藏；退群回调等成员核验后再隐藏，避免误藏仍在群
+  if (isImmediateKickEvidence(hit.evidence)) {
+    hideKickedRoomFromDirectory(record, hit.roomId, roomName)
+  }
   appLog('INFO', formatKickCleanupMessage({
     roomName,
     evidence: hit.evidence,
@@ -1133,6 +1222,113 @@ function isContactRoomMutationOk(httpOk, raw) {
   return true
 }
 
+/**
+ * 退群/取消通讯录请求体：Hook 字段名不统一，补齐别名避免「HTTP 成功但微信未生效」。
+ * @param {string} roomId
+ */
+function buildKickRoomMutationBody(roomId) {
+  const id = String(roomId || '').trim()
+  return {
+    roomId: id,
+    room_id: id,
+    chatroomId: id,
+    chatRoomId: id,
+    username: id,
+    userName: id,
+    wxid: id,
+    chatroomUserName: id,
+    chatRoomUserName: id,
+  }
+}
+
+/**
+ * 删除联系人/会话兜底请求体（群 ID 当作 wxid）。
+ * @param {string} roomId
+ */
+function buildKickRoomDelContactBody(roomId) {
+  const id = String(roomId || '').trim()
+  return { wxid: id, username: id, userName: id, roomId: id, room_id: id }
+}
+
+/**
+ * 取消通讯录 + 退出删会话 + del_contact 兜底，并回拉群列表核验是否仍残留。
+ * 未核验到「已不在群列表」前，不把清理当作真正成功（避免本地屏蔽后界面消失、微信仍在）。
+ * @param {{ id: string }} record
+ * @param {string} roomId
+ */
+async function quitAndClearKickedRoomSession(record, roomId) {
+  const body = buildKickRoomMutationBody(roomId)
+  const unsave = await requestApi(record, '/api/remov_chatroom_to_contact', body, 20000)
+  saveApiSample({
+    instanceId: record.id, sourceId: 438557557, path: '/api/remov_chatroom_to_contact',
+    request: body, response: unsave.raw, httpStatus: unsave.response.status, durationMs: 0,
+  })
+  const unsaveOk = isContactRoomMutationOk(unsave.response.ok, unsave.raw)
+
+  const runQuitAndDel = async () => {
+    const deleted = await requestApi(record, '/api/quit_and_del_chat_room', body, 20000)
+    saveApiSample({
+      instanceId: record.id, sourceId: 438557540, path: '/api/quit_and_del_chat_room',
+      request: body, response: deleted.raw, httpStatus: deleted.response.status, durationMs: 0,
+    })
+    let deleteOk = isContactRoomMutationOk(deleted.response.ok, deleted.raw)
+
+    const delBody = buildKickRoomDelContactBody(roomId)
+    const delContact = await requestApi(record, '/api/del_contact', delBody, 20000)
+    saveApiSample({
+      instanceId: record.id, sourceId: 438557532, path: '/api/del_contact',
+      request: delBody, response: delContact.raw, httpStatus: delContact.response.status, durationMs: 0,
+    })
+    const delContactOk = isContactRoomMutationOk(delContact.response.ok, delContact.raw)
+    if (delContactOk) deleteOk = true
+    return { deleted, deleteOk, delContact, delContactOk }
+  }
+
+  let { deleted, deleteOk, delContact, delContactOk } = await runQuitAndDel()
+
+  /** @type {boolean|null} */
+  let stillPresent = null
+  const recheckPresence = async () => {
+    try {
+      const live = await loadLiveRoomIdsForKickGate(record)
+      if (live == null) return null
+      return live.has(roomId)
+    } catch {
+      return null
+    }
+  }
+  stillPresent = await recheckPresence()
+
+  // 残留会话：延迟复检并最多再清两次（部分群 quit 后列表刷新慢）
+  for (let retry = 0; retry < 2 && stillPresent === true; retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000 + retry * 1500))
+    const again = await runQuitAndDel()
+    deleted = again.deleted
+    deleteOk = again.deleteOk || deleteOk
+    delContact = again.delContact
+    delContactOk = again.delContactOk || delContactOk
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    stillPresent = await recheckPresence()
+  }
+
+  // 仍在微信群列表 → 一律失败；已不在列表 → 成功；列表拉不到则退回接口结果（不屏蔽假成功残留）
+  const verifiedGone = stillPresent === false
+  const apiOk = unsaveOk && deleteOk
+  const ok = verifiedGone || (apiOk && stillPresent !== true)
+  return {
+    unsaveStatus: unsaveOk ? 'DONE' : 'FAILED',
+    deleteChatStatus: ok ? 'DONE' : 'FAILED',
+    delContactOk,
+    stillPresent,
+    verifiedGone,
+    ok,
+    unsaveRaw: unsave.raw,
+    deleteRaw: deleted.raw,
+    delContactRaw: delContact.raw,
+    deleteHttpStatus: deleted.response.status,
+  }
+}
+
 
 /**
  * 从本机已落库事件 + 微信群聊历史系统消息中发现被踢群，登记为 PENDING。
@@ -1160,6 +1356,9 @@ async function discoverKickedGroupsFromHistory(record) {
       evidence: hit.evidence,
       evidenceStrength: hit.strength || 'strong',
     })
+    if (isImmediateKickEvidence(hit.evidence)) {
+      hideKickedRoomFromDirectory(record, hit.roomId, roomName)
+    }
     appLog('INFO', formatKickCleanupMessage({
       roomName,
       evidence: hit.evidence,
@@ -1317,13 +1516,17 @@ async function loadLiveRoomIdsForKickGate(record) {
     const ids = []
     if (listRes?.response?.ok) ids.push(...extractRoomsFromApiRaw(listRes.raw).map((row) => row.roomId))
     if (detailRes?.response?.ok) ids.push(...extractRoomsFromApiRaw(detailRes.raw).map((row) => row.roomId))
+    // 两边都没拉到有效群 → 视为列表不可用（勿当成「已不在群」）
+    if (!listRes?.response?.ok && !detailRes?.response?.ok) return null
     if (ids.length) return new Set(ids.filter(Boolean))
+    // HTTP 成功但空列表：真·无群，可当作空集合
+    if (listRes?.response?.ok || detailRes?.response?.ok) return new Set()
   } catch (error) {
     appLog('WARN', '被踢群清理：拉取群列表失败', {
       instanceId: record.id, module: '被踢群清理', error: rawErrorMessage(error),
     })
   }
-  return new Set()
+  return null
 }
 
 /**
@@ -1336,6 +1539,7 @@ async function loadLiveRoomIdsForKickGate(record) {
 async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
   const reason = String(opts.reason || '任务执行')
   const taskId = opts.taskId ? String(opts.taskId) : ''
+  const liveListUnavailable = opts.liveIds === null
   const liveIds = opts.liveIds instanceof Set ? opts.liveIds : new Set()
   const accountWxid = String(record.accountWxid || row.accountWxid || '').trim()
   const roomId = String(row.roomId || row.room_id || '').trim()
@@ -1399,6 +1603,7 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
         status: 'CANCELLED',
         lastError: 'REINVITED_SELF_STILL_MEMBER',
       })
+      restoreKickedRoomToDirectory(record, roomId, roomLabel)
       const message = logKick('WARN', '已跳过：疑似重新入群，成员列表仍含本人，未退出')
       return { ...base, outcome: 'SKIPPED', message }
     }
@@ -1411,34 +1616,42 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
 
     let unsaveStatus = String(row.unsaveStatus || row.unsave_status || 'PENDING')
     let deleteChatStatus = String(row.deleteChatStatus || row.delete_chat_status || 'PENDING')
-    if (unsaveStatus !== 'DONE') {
-      const unsave = await requestApi(record, '/api/remov_chatroom_to_contact', {
-        roomId, room_id: roomId, chatroomId: roomId,
-      }, 20000)
-      unsaveStatus = isContactRoomMutationOk(unsave.response.ok, unsave.raw) ? 'DONE' : 'FAILED'
-    }
-    if (deleteChatStatus !== 'DONE') {
-      const deleted = await requestApi(record, '/api/quit_and_del_chat_room', {
-        roomId, room_id: roomId, chatroomId: roomId,
-      }, 20000)
-      deleteChatStatus = isContactRoomMutationOk(deleted.response.ok, deleted.raw) ? 'DONE' : 'FAILED'
+    // 已屏蔽群也一律重跑退群：此前可能 HTTP 假成功，微信会话仍在
+    {
+      const cleared = await quitAndClearKickedRoomSession(record, roomId)
+      unsaveStatus = cleared.unsaveStatus
+      deleteChatStatus = cleared.deleteChatStatus
+      if (!cleared.ok) {
+        updateKickedGroupCleanup(record.id, roomId, {
+          unsaveStatus,
+          deleteChatStatus,
+          status: 'PENDING',
+          lastError: cleared.stillPresent === true
+            ? 'QUIT_STILL_IN_ROOM_LIST'
+            : `RETRY_${unsaveStatus}_${deleteChatStatus}`,
+          roomName: roomLabel,
+        })
+        const detail = cleared.stillPresent === true
+          ? '退出失败：接口已调用但微信群列表仍残留该群'
+          : `退出失败：清理未完成（通讯录${unsaveStatus}，会话${deleteChatStatus}）`
+        const message = logKick('WARN', detail, {
+          unsaveStatus, deleteChatStatus, stillPresent: cleared.stillPresent,
+          deleteHttpStatus: cleared.deleteHttpStatus,
+        })
+        return { ...base, outcome: 'FAILED', message, unsaveStatus, deleteChatStatus }
+      }
     }
     removeLocalChatroomOwnership(record.id, roomId)
-    const done = unsaveStatus === 'DONE' && deleteChatStatus === 'DONE'
     updateKickedGroupCleanup(record.id, roomId, {
-      unsaveStatus,
-      deleteChatStatus,
-      status: done ? 'DONE' : 'PENDING',
-      lastError: done ? null : `RETRY_${unsaveStatus}_${deleteChatStatus}`,
+      unsaveStatus: 'DONE',
+      deleteChatStatus: 'DONE',
+      status: 'DONE',
+      lastError: null,
       roomName: roomLabel,
     })
-    if (done) {
-      notifyDirectoryBlockedChanged(record.id, roomId, roomLabel)
-      const message = logKick('INFO', '退出成功：已取消通讯录并清除会话', { unsaveStatus, deleteChatStatus })
-      return { ...base, outcome: 'COMPLETED', message, unsaveStatus, deleteChatStatus }
-    }
-    const message = logKick('WARN', `退出失败：清理未完成（通讯录${unsaveStatus}，会话${deleteChatStatus}）`, { unsaveStatus, deleteChatStatus })
-    return { ...base, outcome: 'FAILED', message, unsaveStatus, deleteChatStatus }
+    notifyDirectoryBlockedChanged(record.id, roomId, roomLabel)
+    const message = logKick('INFO', '退出成功：已取消通讯录并清除会话', { unsaveStatus: 'DONE', deleteChatStatus: 'DONE' })
+    return { ...base, outcome: 'COMPLETED', message, unsaveStatus: 'DONE', deleteChatStatus: 'DONE' }
   }
 
   let selfStillInMembers = null
@@ -1447,6 +1660,11 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
     if (leaveCallback && !accountWxid) {
       updateKickedGroupCleanup(record.id, roomId, { lastError: 'MISSING_ACCOUNT_WXID' })
       const message = logKick('WARN', '退出失败：缺少本机微信号，无法核验')
+      return { ...base, outcome: 'FAILED', message }
+    }
+    if (liveListUnavailable) {
+      updateKickedGroupCleanup(record.id, roomId, { lastError: 'LIVE_LIST_UNAVAILABLE' })
+      const message = logKick('WARN', '退出失败：群列表暂时不可用，暂未清理')
       return { ...base, outcome: 'FAILED', message }
     }
     if (!liveIds.size && !leaveCallback) {
@@ -1483,6 +1701,7 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
         status: 'CANCELLED',
         lastError: 'SELF_STILL_MEMBER_ABORT',
       })
+      restoreKickedRoomToDirectory(record, roomId, roomLabel)
       const message = logKick('WARN', '已跳过：成员列表仍含本人，未退出以免误退')
       return { ...base, outcome: 'SKIPPED', message }
     }
@@ -1498,6 +1717,8 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
       lastError: null,
       roomName: roomLabel,
     })
+    // 退群回调已核验本人不在群：此时再隐藏，避免未确认前误藏
+    hideKickedRoomFromDirectory(record, roomId, roomLabel)
   } else {
     confirmCount = Math.max(confirmCount, 1)
     updateKickedGroupCleanup(record.id, roomId, {
@@ -1526,46 +1747,32 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
   }
 
   let unsaveStatus = String(row.unsaveStatus || row.unsave_status || 'PENDING')
-  if (unsaveStatus !== 'DONE') {
-    const unsaveBody = { roomId, room_id: roomId, chatroomId: roomId }
-    const unsave = await requestApi(record, '/api/remov_chatroom_to_contact', unsaveBody, 20000)
-    saveApiSample({
-      instanceId: record.id, sourceId: 438557557, path: '/api/remov_chatroom_to_contact',
-      request: unsaveBody, response: unsave.raw, httpStatus: unsave.response.status, durationMs: 0,
+  let deleteChatStatus = String(row.deleteChatStatus || row.delete_chat_status || 'PENDING')
+  if (unsaveStatus !== 'DONE' || deleteChatStatus !== 'DONE') {
+    const cleared = await quitAndClearKickedRoomSession(record, roomId)
+    unsaveStatus = cleared.unsaveStatus
+    deleteChatStatus = cleared.deleteChatStatus
+    if (cleared.unsaveStatus === 'DONE') logKick('INFO', '取消通讯录成功')
+    else logKick('WARN', '取消通讯录失败', { status: cleared.deleteHttpStatus })
+    if (cleared.ok) logKick('INFO', '退出并清除会话成功', {
+      delContactOk: cleared.delContactOk, verifiedGone: cleared.verifiedGone, stillPresent: cleared.stillPresent,
     })
-    if (!isContactRoomMutationOk(unsave.response.ok, unsave.raw)) {
-      unsaveStatus = 'FAILED'
+    else {
       updateKickedGroupCleanup(record.id, roomId, {
         unsaveStatus,
-        lastError: `UNSAVE_FAILED_${unsave.response.status}`,
-      })
-      logKick('WARN', '取消通讯录失败', { status: unsave.response.status })
-    } else {
-      unsaveStatus = 'DONE'
-      updateKickedGroupCleanup(record.id, roomId, { unsaveStatus: 'DONE' })
-      logKick('INFO', '取消通讯录成功')
-    }
-  }
-
-  let deleteChatStatus = String(row.deleteChatStatus || row.delete_chat_status || 'PENDING')
-  if (deleteChatStatus !== 'DONE') {
-    const delBody = { roomId, room_id: roomId, chatroomId: roomId }
-    const deleted = await requestApi(record, '/api/quit_and_del_chat_room', delBody, 20000)
-    saveApiSample({
-      instanceId: record.id, sourceId: 438557540, path: '/api/quit_and_del_chat_room',
-      request: delBody, response: deleted.raw, httpStatus: deleted.response.status, durationMs: 0,
-    })
-    if (!isContactRoomMutationOk(deleted.response.ok, deleted.raw)) {
-      deleteChatStatus = 'FAILED'
-      updateKickedGroupCleanup(record.id, roomId, {
         deleteChatStatus,
-        lastError: `DELETE_CHAT_FAILED_${deleted.response.status}`,
+        lastError: cleared.stillPresent === true
+          ? 'QUIT_STILL_IN_ROOM_LIST'
+          : `DELETE_CHAT_FAILED_${cleared.deleteHttpStatus || 'UNKNOWN'}`,
       })
-      logKick('WARN', '退出/清除会话失败', { status: deleted.response.status })
-    } else {
-      deleteChatStatus = 'DONE'
-      updateKickedGroupCleanup(record.id, roomId, { deleteChatStatus: 'DONE' })
-      logKick('INFO', '退出并清除会话成功')
+      const detail = cleared.stillPresent === true
+        ? '退出/清除会话失败：微信群列表仍残留该群'
+        : '退出/清除会话失败'
+      logKick('WARN', detail, {
+        status: cleared.deleteHttpStatus,
+        stillPresent: cleared.stillPresent,
+        delContactOk: cleared.delContactOk,
+      })
     }
   }
 
@@ -1600,7 +1807,7 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
     roomName: roomLabel,
   })
   const message = logKick('INFO', '退出成功：已取消通讯录并清除会话，并永久屏蔽', {
-    unsaveStatus, deleteChatStatus, stillInSessionList: liveIds.has(roomId),
+    unsaveStatus, deleteChatStatus,
   })
   notifyDirectoryBlockedChanged(record.id, roomId, roomLabel)
   return { ...base, outcome: 'COMPLETED', message, unsaveStatus, deleteChatStatus }
@@ -1609,8 +1816,9 @@ async function cleanupOneKickedGroupRoom(record, row, opts = {}) {
 /**
  * 扫描历史被踢 → 登记 PENDING → 创建「清理被踢群」任务（不自动执行）。
  * @param {string} [reason]
+ * @param {{ instanceId?: string }} [options] 指定 instanceId 时只处理该微信；留空则处理全部在线微信
  */
-async function prepareKickedGroupCleanupTask(reason = '手动创建被踢群清理任务') {
+async function prepareKickedGroupCleanupTask(reason = '手动创建被踢群清理任务', options = {}) {
   if (kickedGroupCleanupPreparing) {
     return { ok: false, queued: true, message: '正在扫描并创建任务，请稍候' }
   }
@@ -1620,8 +1828,25 @@ async function prepareKickedGroupCleanupTask(reason = '手动创建被踢群清�
   let onlineCount = 0
   let historyDiscoveredTotal = 0
   try {
-    const online = [...instances.values()].filter((item) => item.status === 'ONLINE')
+    const wantedId = String(options.instanceId || '').trim()
+    const onlineAll = [...instances.values()].filter((item) => item.status === 'ONLINE')
+    const online = wantedId
+      ? onlineAll.filter((item) => item.id === wantedId)
+      : onlineAll
     onlineCount = online.length
+    if (wantedId && !onlineCount) {
+      const exists = instances.get(wantedId)
+      return {
+        ok: false,
+        online: 0,
+        pending: 0,
+        historyDiscovered: 0,
+        instanceId: wantedId,
+        message: exists
+          ? `所选微信当前未在线（${exists.nickname || exists.accountWxid || '微信'}），请先登录后再清理`
+          : '所选微信不存在，请刷新后重选',
+      }
+    }
     if (!onlineCount) {
       return { ok: false, online: 0, pending: 0, historyDiscovered: 0, message: '没有在线微信，无法创建清理任务' }
     }
@@ -1658,8 +1883,55 @@ async function prepareKickedGroupCleanupTask(reason = '手动创建被踢群清�
           instanceId: record.id, module: '被踢群清理', operation: reason, error: rawErrorMessage(error),
         })
       }
-      const pending = listKickedGroupPending({ instanceId: record.id, status: 'PENDING' })
-      for (const row of pending) {
+      // 假成功残留：本地已屏蔽/已完成，但微信群列表仍有该群 → 重新入队
+      try {
+        const liveIds = await loadLiveRoomIdsForKickGate(record)
+        if (!(liveIds instanceof Set)) {
+          appLog('WARN', '被踢群残留复检跳过：群列表暂时不可用', {
+            instanceId: record.id, module: '被踢群清理', operation: reason,
+          })
+        } else {
+        const blockedIds = accountWxid ? loadBlockedRoomIdSet(accountWxid) : new Set()
+        let residual = 0
+        for (const roomId of liveIds) {
+          if (!roomId.endsWith('@chatroom')) continue
+          const existing = getKickedGroupCleanup(record.id, roomId)
+          const wasDoneOrBlocked = (existing && ['DONE', 'CANCELLED'].includes(String(existing.status || '')))
+            || blockedIds.has(roomId)
+          if (!wasDoneOrBlocked) continue
+          const roomName = resolveKickRoomLabel(record.id, roomId, existing?.roomName || '')
+          upsertKickedGroupPending({
+            instanceId: record.id,
+            roomId,
+            accountWxid,
+            roomName,
+            evidence: String(existing?.evidence || 'SYSTEM_MSG_SELF_KICKED'),
+            evidenceStrength: String(existing?.evidenceStrength || 'strong'),
+          })
+          updateKickedGroupCleanup(record.id, roomId, {
+            status: 'PENDING',
+            unsaveStatus: 'PENDING',
+            deleteChatStatus: 'PENDING',
+            lastError: 'REQUEUE_STILL_IN_ROOM_LIST',
+            roomName,
+          })
+          hideKickedRoomFromDirectory(record, roomId, roomName)
+          residual += 1
+        }
+        if (residual) {
+          historyDiscoveredTotal += residual
+          appLog('INFO', `发现 ${residual} 个已清理但仍在微信群列表的残留群，已重新入队`, {
+            instanceId: record.id, module: '被踢群清理', operation: reason, residual,
+          })
+        }
+        }
+      } catch (error) {
+        appLog('WARN', '扫描被踢残留群列表失败', {
+          instanceId: record.id, module: '被踢群清理', operation: reason, error: rawErrorMessage(error),
+        })
+      }
+      const pendingAfter = listKickedGroupPending({ instanceId: record.id, status: 'PENDING' })
+      for (const row of pendingAfter) {
         const roomId = String(row.roomId || '').trim()
         if (!roomId.endsWith('@chatroom')) continue
         if (activeKeys.has(`${record.id}::${roomId}`)) { skippedActive += 1; continue }
@@ -1683,6 +1955,7 @@ async function prepareKickedGroupCleanupTask(reason = '手动创建被踢群清�
             confirmCount: Number(row.confirmCount) || 0,
           },
         })
+        activeKeys.add(`${record.id}::${roomId}`)
       }
     }
     pendingTotal = items.length
@@ -1702,24 +1975,27 @@ async function prepareKickedGroupCleanupTask(reason = '手动创建被踢群清�
       }
     }
     const created = createLocalTask({
-      name: `清理被踢群 ${new Date().toLocaleString()}`,
+      name: wantedId
+        ? `清理被踢群（${String(online[0]?.nickname || online[0]?.accountWxid || '指定微信').trim()}） ${new Date().toLocaleString()}`
+        : `清理被踢群 ${new Date().toLocaleString()}`,
       type: 'KICKED_GROUP_CLEANUP',
-      config: {},
+      config: wantedId ? { instanceId: wantedId } : {},
       items,
     })
     const taskId = String(created?.id || '')
-    appLog('INFO', `已创建被踢群清理任务：${pendingTotal} 个群（历史发现${historyDiscoveredTotal}，迁回${reboundTotal}）`, {
-      module: '被踢群清理', operation: reason, taskId, online: onlineCount,
+    appLog('INFO', `已创建被踢群清理任务：${pendingTotal} 个群（历史发现${historyDiscoveredTotal}，迁回${reboundTotal}${wantedId ? '，指定微信' : ''}）`, {
+      module: '被踢群清理', operation: reason, taskId, online: onlineCount, instanceId: wantedId || undefined,
       rebound: reboundTotal, pending: pendingTotal, historyDiscovered: historyDiscoveredTotal,
     })
     return {
       ok: true,
       taskId,
       online: onlineCount,
+      instanceId: wantedId || '',
       rebound: reboundTotal,
       pending: pendingTotal,
       historyDiscovered: historyDiscoveredTotal,
-      message: `已创建清理任务：${pendingTotal} 个群（历史扫描发现 ${historyDiscoveredTotal}）。请到任务中心确认执行。`,
+      message: `已创建清理任务：${pendingTotal} 个群（历史扫描发现 ${historyDiscoveredTotal}${wantedId ? '，仅所选微信' : ''}）。请到任务中心确认执行。`,
     }
   } catch (error) {
     const message = toUserErrorMessage(error, '创建被踢群清理任务失败')
@@ -2062,6 +2338,15 @@ async function probeInstance(record) {
 
 const runningTasks = new Set()
 /**
+ * 任务是否已暂停/取消（执行循环与进群长流程中途都要查）。
+ * @param {string} taskId
+ * @returns {boolean}
+ */
+function isTaskStopRequested(taskId) {
+  const task = listTasks().find((item) => item.id === taskId)
+  return !task || ['PAUSED', 'CANCELLED'].includes(String(task.status || ''))
+}
+/**
  * 等待到指定时间；暂停/取消时返回 false。
  * earlyContinueStatuses：冷却等待中若用户点「继续」把状态改成这些值，则立刻返回 true 继续执行。
  */
@@ -2071,9 +2356,9 @@ async function waitForTaskTime(taskId, timestamp, options = {}) {
     : []
   while (Date.now() < timestamp) {
     if (!runtimeAllowed) return false
+    if (isTaskStopRequested(taskId)) return false
     const task = listTasks().find((item) => item.id === taskId)
-    if (!task || ['PAUSED', 'CANCELLED'].includes(task.status)) return false
-    if (earlyContinueStatuses.length && earlyContinueStatuses.includes(String(task.status || ''))) return true
+    if (earlyContinueStatuses.length && task && earlyContinueStatuses.includes(String(task.status || ''))) return true
     await new Promise((resolve) => setTimeout(resolve, Math.min(timestamp - Date.now(), 1000)))
   }
   return true
@@ -2183,16 +2468,19 @@ async function fetchInvitePreview(record, url) {
   const sourceUrl = String(url || '').trim()
   if (!sourceUrl) return { roomId: '', roomName: '', memberCount: 0, fullUrl: '', expired: false, label: '空链接', error: '链接为空' }
   try {
-    // 短链 / 完整邀请链在不同 urlType、scene 下返回差异大；依次尝试
+    // 短链 / 完整邀请链在不同 urlType、scene 下返回差异大；优先能扩成 addchatroomby* 的组合
     const paramSets = [
-      { url: sourceUrl, urlType: '0', scene: '0' },
       { url: sourceUrl, urlType: '1', scene: '4' },
       { url: sourceUrl, urlType: '2', scene: '4' },
       { url: sourceUrl, urlType: '0', scene: '4' },
+      { url: sourceUrl, urlType: '0', scene: '0' },
+      { url: sourceUrl, urlType: '1', scene: '0' },
+      { url: sourceUrl, urlType: '2', scene: '0' },
     ]
     let response = null
     let raw = null
     let preview = { roomId: '', roomName: '', memberCount: 0, fullUrl: sourceUrl, expired: false }
+    let bestScore = -1
     for (const params of paramSets) {
       const startedAt = Date.now()
       const result = await requestApi(record, '/api/get_a8key', params, 12000)
@@ -2204,32 +2492,42 @@ async function fetchInvitePreview(record, url) {
         httpStatus: currentResponse.status, durationMs: Date.now() - startedAt,
       })
       const currentPreview = parseInvitePreview(currentRaw, sourceUrl)
-      const currentHeaders = extractA8KeyHttpHeaders(currentRaw)
-      // 保留信息更完整的一轮；仅拿到 FullURL 不能提前结束，后续参数可能返回 Cookie/群资料。
-      const currentScore = (hasUsableInvitePreview(currentPreview) ? 4 : 0)
-        + (currentHeaders.Cookie || currentHeaders.cookie ? 2 : 0)
-        + (a8keyResponseUseful(currentRaw) ? 1 : 0)
-      const savedHeaders = extractA8KeyHttpHeaders(raw)
-      const savedScore = (hasUsableInvitePreview(preview) ? 4 : 0)
-        + (savedHeaders.Cookie || savedHeaders.cookie ? 2 : 0)
-        + (a8keyResponseUseful(raw) ? 1 : 0)
-      if (!raw || currentScore > savedScore) {
+      const currentScore = scoreInvitePreviewCandidate(currentPreview, currentRaw)
+      // 合并多轮非空字段，避免后一轮空响应覆盖前一轮群标识
+      preview = mergeInvitePreview(preview, currentPreview)
+      if (currentScore > bestScore) {
+        bestScore = currentScore
         response = currentResponse
         raw = currentRaw
-        preview = currentPreview
+      } else if (!raw) {
+        response = currentResponse
+        raw = currentRaw
       }
-      if (currentPreview.expired || hasUsableInvitePreview(currentPreview) || currentHeaders.Cookie || currentHeaders.cookie) break
+      // 过期立即停；已有 roomId +（群名或完整链）也可提前结束
+      if (currentPreview.expired) {
+        preview = mergeInvitePreview(preview, currentPreview)
+        raw = currentRaw
+        response = currentResponse
+        break
+      }
+      if (
+        String(preview.roomId || '').endsWith('@chatroom')
+        && (usableQrRoomName(preview.roomName) || isExpandedInviteUrl(preview.fullUrl))
+      ) break
     }
 
     // get_a8key 多数只返回 FullURL/HttpHeader，需再抓邀请页才能拿到群名/人数
-    if (!preview.expired && (!preview.roomName || !preview.memberCount)) {
+    if (!preview.expired && (!preview.roomName || !preview.memberCount || !preview.roomId)) {
       const pageReq = buildInvitePageRequest(raw, sourceUrl)
       const urlsToFetch = []
       if (pageReq.url) urlsToFetch.push(pageReq.url)
       if (sourceUrl && sourceUrl !== pageReq.url) urlsToFetch.push(sourceUrl)
+      if (preview.fullUrl && preview.fullUrl !== pageReq.url && preview.fullUrl !== sourceUrl) {
+        urlsToFetch.push(preview.fullUrl)
+      }
       let sawDownloadGate = false
       for (const pageUrl of urlsToFetch) {
-        if (preview.roomName && preview.memberCount) break
+        if (preview.roomName && preview.memberCount && preview.roomId) break
         let pageBody = await fetchInvitePageBody(pageUrl, pageReq.headers, 5, { method: 'GET' })
         if (pageBody && /weixin_getdownurl|请在微信中打开|下载微信|getdownurl_sms/i.test(pageBody)) {
           sawDownloadGate = true
@@ -2241,10 +2539,19 @@ async function fetchInvitePreview(record, url) {
           continue
         }
         preview = mergeInvitePreview(preview, parseInvitePreview(pageBody, pageUrl))
+        const roomFromUrl = findRoomIdInUrl(pageUrl)
+        if (roomFromUrl && !preview.roomId) preview.roomId = roomFromUrl
       }
       if (!hasUsableInvitePreview(preview) && sawDownloadGate && !pageReq.headers.Cookie && !pageReq.headers.cookie) {
+        preview = { ...preview, notice: '暂时无法读取群名和人数（邀请页需微信登录态），执行任务时仍会尝试进群' }
+      } else if (!hasUsableInvitePreview(preview) && sawDownloadGate) {
         preview = { ...preview, notice: '暂时无法读取群名和人数，执行任务时仍会尝试进群' }
       }
+    }
+
+    if (!preview.roomId) {
+      const roomFromUrl = findRoomIdInUrl(preview.fullUrl) || findRoomIdInUrl(sourceUrl)
+      if (roomFromUrl) preview.roomId = roomFromUrl
     }
 
     const label = formatInvitePreviewLine(preview)
@@ -2253,7 +2560,15 @@ async function fetchInvitePreview(record, url) {
       return { ...preview, label, error: '无法解析群资料，请确认链接有效且微信在线' }
     }
     if (!hasUsableInvitePreview(preview) && preview.fullUrl && !preview.error) {
-      return { ...preview, label, notice: preview.notice || '暂时无法读取群名和人数，执行任务时仍会尝试进群' }
+      const shortOnly = isShortGroupInviteUrl(preview.fullUrl) && !isExpandedInviteUrl(preview.fullUrl)
+      return {
+        ...preview,
+        label,
+        notice: preview.notice
+          || (shortOnly
+            ? '短链未能解析出群标识/完整邀请链，执行期将继续尝试进群并核验群列表'
+            : '暂时无法读取群名和人数，执行任务时仍会尝试进群'),
+      }
     }
     return { ...preview, label }
   } catch (error) {
@@ -2280,6 +2595,47 @@ async function readWechatRoomIds(record) {
     return new Set(extractRoomsFromApiRaw(raw).map((room) => room.roomId).filter(Boolean))
   } catch {
     return new Set()
+  }
+}
+
+/**
+ * 读取群列表（含成功标记）；接口失败时 ok=false，避免当成「空通讯录」误进群。
+ * 默认只用 get_chatroom_list，避免每条进群都打 get_all_room_detail 狂刷接口。
+ * @param {{ id: string }} record
+ * @param {{ includeDetail?: boolean }} [options]
+ * @returns {Promise<{ ok: boolean, rooms: Array<{ roomId: string, name: string }>, ids: Set<string> }>}
+ */
+async function readWechatRoomListState(record, options = {}) {
+  try {
+    const listRes = await requestApi(record, '/api/get_chatroom_list', {}, 15000)
+    if (!listRes?.response?.ok) return { ok: false, rooms: [], ids: new Set() }
+    const map = new Map()
+    for (const room of extractRoomsFromApiRaw(listRes.raw)) {
+      const roomId = String(room.roomId || '').trim()
+      if (!roomId.endsWith('@chatroom')) continue
+      map.set(roomId, { roomId, name: String(room.name || '').trim() })
+    }
+    // 仅在首次/显式要求时补名称；禁止每条进群都拉全量详情
+    if (options.includeDetail) {
+      try {
+        const detailRes = await requestApi(record, '/api/get_all_room_detail', {}, 8000)
+        if (detailRes?.response?.ok) {
+          for (const room of extractRoomsFromApiRaw(detailRes.raw)) {
+            const roomId = String(room.roomId || '').trim()
+            if (!roomId.endsWith('@chatroom')) continue
+            const prev = map.get(roomId)
+            const name = String(room.name || '').trim()
+            if (!prev || (name && name !== '群聊' && (!prev.name || prev.name === '群聊'))) {
+              map.set(roomId, { roomId, name: name || prev?.name || '' })
+            }
+          }
+        }
+      } catch { /* 详情失败时仍可用列表做 roomId / 已有名称判断 */ }
+    }
+    const rooms = [...map.values()]
+    return { ok: true, rooms, ids: new Set(rooms.map((room) => room.roomId)) }
+  } catch {
+    return { ok: false, rooms: [], ids: new Set() }
   }
 }
 
@@ -2346,6 +2702,22 @@ function persistQrTaskDisplay(itemId, preview) {
 }
 
 /**
+ * 任务项上的二维码查找键：兼容 `instanceId::sha256`（多执行号同群）与旧版纯 sha/id。
+ * @param {{ target_key?: string, id?: string } | null | undefined} item
+ * @param {Record<string, unknown> | null | undefined} request
+ * @returns {string}
+ */
+function resolveQrItemLookupKey(item, request = {}) {
+  const fromRequest = String(request?.qrSha || request?.qrItemId || '').trim()
+  if (fromRequest) return fromRequest
+  const key = String(item?.target_key || item?.id || '').trim()
+  if (!key) return ''
+  const sep = key.indexOf('::')
+  if (sep > 0) return key.slice(sep + 2)
+  return key
+}
+
+/**
  * 任务执行时解析二维码类型：优先用手改/入库类型，避免自动分类覆盖人工纠正。
  * @param {{ request_json?: string, target_key?: string, id?: string }} item
  * @param {Record<string, unknown>} request
@@ -2356,7 +2728,7 @@ function resolveTaskQrType(item, request, decodedText) {
   const allowed = new Set(['GROUP_LINK', 'PERSONAL_LINK', 'QQ_GROUP_LINK', 'UNKNOWN', 'INVALID'])
   const fromRequest = String(request?.qrType || '').trim()
   if (allowed.has(fromRequest)) return fromRequest
-  const key = String(item?.target_key || item?.id || '').trim()
+  const key = resolveQrItemLookupKey(item, request)
   if (key) {
     try {
       const stored = listQrItems().find((row) => row.sha256 === key || row.id === key)
@@ -2369,11 +2741,13 @@ function resolveTaskQrType(item, request, decodedText) {
 
 /**
  * 邀请页没解析出群名时，用已进群的 roomId 从微信群列表反查名称。
+ * 禁止默认打 get_all_room_detail；优先任务内缓存 / 群列表，缺名时最多补一次详情。
  * @param {{ id: string }} record
  * @param {Record<string, unknown>} preview
  * @param {string} [roomIdHint]
+ * @param {{ loadRoomState?: (options?: object) => Promise<{ ok: boolean, rooms: Array<{ roomId: string, name: string }> }> }} [helpers]
  */
-async function enrichPreviewRoomName(record, preview, roomIdHint = '') {
+async function enrichPreviewRoomName(record, preview, roomIdHint = '', helpers = {}) {
   const source = preview && typeof preview === 'object' ? { ...preview } : {}
   const existingName = usableQrRoomName(source.roomName)
   if (existingName) {
@@ -2383,8 +2757,15 @@ async function enrichPreviewRoomName(record, preview, roomIdHint = '') {
   }
   const roomId = String(roomIdHint || source.roomId || '').trim()
   if (roomId.endsWith('@chatroom')) {
-    const rooms = await readWechatRooms(record)
-    const hit = rooms.find((row) => row.roomId === roomId)
+    const loadState = typeof helpers.loadRoomState === 'function'
+      ? helpers.loadRoomState
+      : async (opts) => readWechatRoomListState(record, opts)
+    let state = await loadState({ includeDetail: false })
+    let hit = (state.rooms || []).find((row) => row.roomId === roomId)
+    if (!usableQrRoomName(hit?.name)) {
+      state = await loadState({ includeDetail: true })
+      hit = (state.rooms || []).find((row) => row.roomId === roomId)
+    }
     const lookedUp = usableQrRoomName(hit?.name)
     if (lookedUp) {
       source.roomName = lookedUp
@@ -2397,22 +2778,108 @@ async function enrichPreviewRoomName(record, preview, roomIdHint = '') {
   return source
 }
 
-async function verifyJoinedRoom(record, beforeRoomIds, expectedRoomId = '') {
+/**
+ * 核验是否已进群。轮询只用 get_chatroom_list；按群名匹配时整次核验最多补一次详情，禁止每轮 get_all_room_detail。
+ * @param {{ id: string }} record
+ * @param {Set<string>|string[]} beforeRoomIds
+ * @param {string} [expectedRoomId]
+ * @param {{ finalize?: boolean, taskId?: string, expectedRoomName?: string, loadRoomState?: Function }} [options]
+ */
+async function verifyJoinedRoom(record, beforeRoomIds, expectedRoomId = '', options = {}) {
   const target = String(expectedRoomId || '').trim()
   const before = beforeRoomIds instanceof Set ? beforeRoomIds : new Set(beforeRoomIds || [])
+  const finalize = Boolean(options.finalize)
+  const taskId = String(options.taskId || '')
   if (target.endsWith('@chatroom') && before.has(target)) {
     return { status: 'ALREADY_IN', roomId: target, reason: '进群前已在该群中，不算本次进群成功' }
   }
-  // 加长轮询：真进群后 get_chatroom_list 常有延迟；短链无 roomId 时靠「唯一新群」确认
-  for (let attempt = 0; attempt < 12; attempt += 1) {
+  const expectedRoomName = String(options.expectedRoomName || '').trim()
+  const needNames = !target.endsWith('@chatroom') && Boolean(expectedRoomName)
+  const loadPollState = typeof options.loadRoomState === 'function'
+    ? options.loadRoomState
+    : async (opts) => readWechatRoomListState(record, opts)
+  let detailFetched = false
+
+  const pollOnce = async () => {
+    // 轮询强制刷新列表；仅当出现「无名称的新群」时整次核验最多补一次详情
+    let state = await loadPollState({ force: true, includeDetail: false })
+    if (needNames && !detailFetched && state.ok) {
+      const rooms = state.rooms || []
+      const ids = state.ids instanceof Set ? state.ids : new Set(rooms.map((row) => row.roomId).filter(Boolean))
+      const added = [...ids].filter((id) => String(id).endsWith('@chatroom') && !before.has(id))
+      const addedMissingName = added.some((id) => {
+        const hit = rooms.find((row) => row.roomId === id)
+        return !usableQrRoomName(hit?.name)
+      })
+      if (addedMissingName) {
+        const enriched = await loadPollState({ force: true, includeDetail: true })
+        detailFetched = true
+        if (enriched.ok) state = enriched
+      }
+    }
+    const rooms = state.ok ? (state.rooms || []) : []
+    const current = state.ok
+      ? (state.ids instanceof Set ? state.ids : new Set(rooms.map((row) => row.roomId).filter(Boolean)))
+      : new Set()
+    const roomNameById = new Map(rooms.map((row) => [row.roomId, row.name || '']))
+    return { current, roomNameById, ok: Boolean(state.ok) }
+  }
+
+  // 加长轮询：真进群后 get_chatroom_list 常有延迟；短链无 roomId 时靠「唯一新群」或群名确认
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    if (taskId && isTaskStopRequested(taskId)) {
+      // 取消前再核验一次，避免已进群却记成「取消」
+      try {
+        const snap = await pollOnce()
+        const last = confirmJoinedFromRoomList(before, snap.current, target, {
+          expectedRoomName,
+          roomNameById: snap.roomNameById,
+        })
+        if (last.status === 'JOINED' || last.status === 'ALREADY_IN') return last
+      } catch { /* ignore */ }
+      return { status: 'CANCELLED', roomId: target, reason: '任务已取消，停止等待进群确认' }
+    }
     if (attempt) await new Promise((resolve) => setTimeout(resolve, 1500))
-    const current = await readWechatRoomIds(record)
-    const verdict = confirmJoinedFromRoomList(before, current, target)
-    if (verdict.status === 'JOINED' || verdict.status === 'ALREADY_IN' || verdict.status === 'MISSING_TARGET') {
+    const snap = await pollOnce()
+    const verdict = confirmJoinedFromRoomList(before, snap.current, target, {
+      expectedRoomName,
+      roomNameById: snap.roomNameById,
+    })
+    if (verdict.status === 'JOINED' || verdict.status === 'ALREADY_IN') {
       return verdict
     }
   }
   if (!target.endsWith('@chatroom')) {
+    // 终态：若仍恰好一新群则成功；多群且群名可唯一匹配也成功
+    // 非 finalize 时返回 NOT_YET，让 applyQrOptions 还能再 enter_room 一次
+    const snap = await pollOnce()
+    const finalVerdict = confirmJoinedFromRoomList(before, snap.current, target, {
+      expectedRoomName,
+      roomNameById: snap.roomNameById,
+    })
+    if (finalVerdict.status === 'JOINED' || finalVerdict.status === 'ALREADY_IN') return finalVerdict
+    const added = [...snap.current].filter((id) => String(id).endsWith('@chatroom') && !before.has(id))
+    if (added.length > 1) {
+      if (!finalize) {
+        return {
+          status: 'NOT_YET',
+          roomId: '',
+          reason: '短链缺少群标识且新增多群，继续等待可确认目标',
+        }
+      }
+      return {
+        status: 'MISSING_TARGET',
+        roomId: '',
+        reason: '无法确认目标群（缺少群标识且新增多群），不能凭任意新群判成功',
+      }
+    }
+    if (!finalize) {
+      return {
+        status: 'NOT_YET',
+        roomId: '',
+        reason: '短链缺少群标识，群列表尚未出现新群',
+      }
+    }
     return {
       status: 'MISSING_TARGET',
       roomId: '',
@@ -2422,7 +2889,7 @@ async function verifyJoinedRoom(record, beforeRoomIds, expectedRoomId = '') {
   return { status: 'NOT_YET', roomId: target, reason: '群列表未出现目标群，未能确认进群成功' }
 }
 
-async function applyQrOptions(record, task, item, decodedText, taskId) {
+async function applyQrOptions(record, task, item, decodedText, taskId, helpers = {}) {
   const text = String(decodedText || '')
   let requestMeta = {}
   try { requestMeta = JSON.parse(item.request_json || '{}') } catch { requestMeta = {} }
@@ -2435,12 +2902,16 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
     return { scannedOnly: true, reason: 'QQ群链接不支持微信进群，已跳过', qrType: type }
   }
   if (type !== 'GROUP_LINK') return { scannedOnly: true, qrType: type }
-  const reservation = reserveQrJoinDailyAttempt(record.accountWxid, item.id, item.target_key, task?.config?.limitPerAccount)
-  if (!reservation.accepted) {
-    const reason = reservation.reason === 'ACCOUNT_REQUIRED' ? '未读取到登录微信号，已跳过进群申请' : '已达到本微信今日进群上限'
-    appLog('INFO', reason, { instanceId: record.id, taskId })
-    return { skippedLimit: true, reason }
+  if (isTaskStopRequested(taskId)) {
+    return { cancelled: true, reason: '任务已取消' }
   }
+
+  const loadRoomState = typeof helpers.loadRoomState === 'function'
+    ? helpers.loadRoomState
+    : async (opts = {}) => readWechatRoomListState(record, { includeDetail: Boolean(opts?.includeDetail) })
+  const rememberJoinedRoom = typeof helpers.rememberJoinedRoom === 'function'
+    ? helpers.rememberJoinedRoom
+    : null
 
   let preview = await fetchInvitePreview(record, text)
   // 创建任务时已写入的群名优先保留，避免执行期邀请页再解析失败后目标列变回「群聊」
@@ -2463,32 +2934,88 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
   if (preview.expired) {
     return { joinSubmitted: false, joinOk: false, reason: '邀请已过期或无效', preview, joinResponse: null }
   }
+  if (isTaskStopRequested(taskId)) {
+    return { cancelled: true, reason: '任务已取消', preview }
+  }
 
   const configuredApply = String(task?.config?.applyText || '').trim()
   const applyText = (configuredApply || DEFAULT_QR_APPLY_TEXT)
     .replaceAll('{昵称}', record.nickname || record.accountWxid || '微信用户')
     .trim() || DEFAULT_QR_APPLY_TEXT
   // 短链 weixin.qq.com/g/ 直接 enter_room 常返回空成功；优先用 a8key 解析出的完整邀请 URL
-  const joinUrl = String(preview.fullUrl || text).trim() || text
-  const joinRequest = {
-    url: joinUrl,
-    link: joinUrl,
-    inviteUrl: joinUrl,
-    // 多字段兼容：需申请理由的群依赖 msg/verifyContent
-    msg: applyText,
-    verifyContent: applyText,
-    applyText,
-    reason: applyText,
+  const buildJoinRequest = (joinUrlValue) => {
+    const joinUrl = String(joinUrlValue || '').trim()
+    return {
+      url: joinUrl,
+      link: joinUrl,
+      inviteUrl: joinUrl,
+      // 多字段兼容：需申请理由的群依赖 msg/verifyContent
+      msg: applyText,
+      verifyContent: applyText,
+      applyText,
+      reason: applyText,
+    }
   }
+  let joinUrl = String(preview.fullUrl || text).trim() || text
+  if (isShortGroupInviteUrl(joinUrl) && !isExpandedInviteUrl(joinUrl)) {
+    appLog('INFO', '短链尚未解析为完整邀请链，进群前再尝试一次 a8key', {
+      instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '',
+    })
+    const refreshed = await fetchInvitePreview(record, text)
+    preview = mergeInvitePreview(preview, refreshed)
+    if (priorName && !usableQrRoomName(preview.roomName)) {
+      preview.roomName = priorName
+      preview.memberCount = Number(preview.memberCount) || Number(requestMeta.memberCount) || 0
+    }
+    if (!usableQrRoomName(preview.roomName) && usableQrRoomName(refreshed.roomName)) {
+      preview.roomName = refreshed.roomName
+    }
+    preview.label = formatInvitePreviewLine(preview)
+    persistQrTaskDisplay(item.id, preview)
+    joinUrl = String(preview.fullUrl || text).trim() || text
+  }
+  let joinRequest = buildJoinRequest(joinUrl)
   if (preview.needApply) {
     appLog('INFO', `该群需申请理由进群，已提交验证文案（${applyText.length}字）`, {
       instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '',
     })
   }
-  const beforeRoomIds = await readWechatRoomIds(record)
-  const expectedFromPreview = String(preview.roomId || '').trim()
-  if (expectedFromPreview.endsWith('@chatroom') && beforeRoomIds.has(expectedFromPreview)) {
-    preview = await enrichPreviewRoomName(record, preview, expectedFromPreview)
+  if (!hasReliableJoinTarget(preview) && isShortGroupInviteUrl(joinUrl) && !isExpandedInviteUrl(joinUrl)) {
+    appLog('WARN', '仍将使用短链提交进群（可能仅返回空成功），将以群列表核验为准', {
+      instanceId: record.id, taskId, module: '二维码进群',
+    })
+  }
+  if (isTaskStopRequested(taskId)) {
+    return { cancelled: true, reason: '任务已取消', preview }
+  }
+  // 进群前必须能读到群列表：失败时跳过，避免误判「不在群」而重复 enter_room 刷「欢迎回到群聊」
+  // 同一任务内按执行号缓存；仅缺 roomId、需按群名判断时才补详情，禁止每条都全量拉群
+  const needNameMatch = Boolean(usableQrRoomName(preview.roomName) || priorName)
+    && !String(preview.roomId || requestMeta.resolvedRoomId || '').trim().endsWith('@chatroom')
+  let roomListState = await loadRoomState({ includeDetail: needNameMatch })
+  if (!roomListState.ok) {
+    await new Promise((resolve) => setTimeout(resolve, 800))
+    roomListState = await loadRoomState({ force: true, includeDetail: needNameMatch })
+  }
+  if (!roomListState.ok) {
+    const reason = '无法读取当前微信群列表，已跳过进群以免重复加入'
+    appLog('ERROR', reason, { instanceId: record.id, taskId, module: '二维码进群' })
+    return { joinSubmitted: false, joinOk: false, skippedNoRoomList: true, reason, preview }
+  }
+  const beforeRoomIds = roomListState.ids instanceof Set
+    ? roomListState.ids
+    : new Set(roomListState.ids || [])
+  const already = findAlreadyJoinedRoom(roomListState.rooms || [], {
+    roomId: String(preview.roomId || requestMeta.resolvedRoomId || '').trim(),
+    roomName: usableQrRoomName(preview.roomName) || priorName || '',
+  })
+  if (already) {
+    preview = {
+      ...preview,
+      roomId: already.roomId || preview.roomId,
+      roomName: already.roomName || preview.roomName,
+    }
+    preview.label = formatInvitePreviewLine(preview)
     persistQrTaskDisplay(item.id, preview)
     appLog('INFO', `进群前已在该群中：${preview.roomName || preview.label}`, {
       instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '', label: preview.label,
@@ -2497,13 +3024,24 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
       joinSubmitted: false,
       joinOk: false,
       alreadyIn: true,
-      reason: '进群前已在该群中，不算本次进群成功',
-      roomId: expectedFromPreview,
+      reason: already.reason,
+      roomId: already.roomId,
       preview,
       roomName: preview.roomName || '',
       label: preview.label,
       joinResponse: null,
     }
+  }
+
+  // 确认需要真正进群后再占当日额度，避免取消/已在群误扣次数
+  const reservation = reserveQrJoinDailyAttempt(record.accountWxid, item.id, item.target_key, task?.config?.limitPerAccount)
+  if (!reservation.accepted) {
+    const reason = reservation.reason === 'ACCOUNT_REQUIRED' ? '未读取到登录微信号，已跳过进群申请' : '已达到本微信今日进群上限'
+    appLog('INFO', reason, { instanceId: record.id, taskId })
+    return { skippedLimit: true, reason }
+  }
+  if (isTaskStopRequested(taskId)) {
+    return { cancelled: true, reason: '任务已取消', preview }
   }
 
   const startedAt = Date.now()
@@ -2555,10 +3093,75 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
   }
 
   let expectedRoomId = String(preview.roomId || apiVerdict.roomId || '').trim()
-  let listVerdict = await verifyJoinedRoom(record, beforeRoomIds, expectedRoomId)
+  let listVerdict = await verifyJoinedRoom(record, beforeRoomIds, expectedRoomId, {
+    expectedRoomName: usableQrRoomName(preview.roomName) || '',
+    finalize: false,
+    taskId,
+    loadRoomState,
+  })
 
-  // 列表未确认且首次接口非硬失败时，再 enter_room 一次后复验（必须带申请理由）
+  // 列表未确认且首次接口非硬失败时，再展开短链并 enter_room 一次后复验（必须带申请理由）
   if (listVerdict.status === 'NOT_YET' && response.ok) {
+    if (isTaskStopRequested(taskId)) {
+      return { cancelled: true, reason: '任务已取消', preview, joinResponse: raw, joinSubmitted: true }
+    }
+    if (isShortGroupInviteUrl(joinUrl) && !isExpandedInviteUrl(joinUrl)) {
+      const refreshed = await fetchInvitePreview(record, text)
+      preview = mergeInvitePreview(preview, refreshed)
+      preview.label = formatInvitePreviewLine(preview)
+      persistQrTaskDisplay(item.id, preview)
+      joinUrl = String(preview.fullUrl || text).trim() || text
+      joinRequest = buildJoinRequest(joinUrl)
+      const refreshedRoomId = String(preview.roomId || '').trim()
+      if (refreshedRoomId.endsWith('@chatroom') && beforeRoomIds.has(refreshedRoomId)) {
+        preview = await enrichPreviewRoomName(record, preview, refreshedRoomId, { loadRoomState })
+        persistQrTaskDisplay(item.id, preview)
+        appLog('INFO', `进群前已在该群中：${preview.roomName || preview.label}`, {
+          instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '', label: preview.label,
+        })
+        return {
+          joinSubmitted: true,
+          joinOk: false,
+          alreadyIn: true,
+          reason: '进群前已在该群中，不算本次进群成功',
+          roomId: refreshedRoomId,
+          preview,
+          roomName: preview.roomName || '',
+          label: preview.label,
+          joinResponse: raw,
+        }
+      }
+      if (usableQrRoomName(preview.roomName)) {
+        const named = findAlreadyJoinedRoom(roomListState.rooms || [], {
+          roomId: refreshedRoomId,
+          roomName: usableQrRoomName(preview.roomName) || '',
+        })
+        // 用进群前已缓存的群列表判断，禁止再打 get_all_room_detail
+        if (named) {
+          preview = { ...preview, roomId: named.roomId, roomName: named.roomName || preview.roomName }
+          preview.label = formatInvitePreviewLine(preview)
+          persistQrTaskDisplay(item.id, preview)
+          appLog('INFO', `进群前已在该群中：${preview.roomName || preview.label}`, {
+            instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '', label: preview.label,
+          })
+          return {
+            joinSubmitted: true,
+            joinOk: false,
+            alreadyIn: true,
+            reason: named.reason,
+            roomId: named.roomId,
+            preview,
+            roomName: preview.roomName || '',
+            label: preview.label,
+            joinResponse: raw,
+          }
+        }
+      }
+      if (refreshedRoomId.endsWith('@chatroom')) expectedRoomId = refreshedRoomId
+    }
+    if (isTaskStopRequested(taskId)) {
+      return { cancelled: true, reason: '任务已取消', preview, joinResponse: raw, joinSubmitted: true }
+    }
     const retryStartedAt = Date.now()
     const retry = await requestApi(record, '/api/enter_room', joinRequest)
     response = retry.response
@@ -2600,21 +3203,44 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
       }
     }
     expectedRoomId = String(preview.roomId || apiVerdict.roomId || expectedRoomId || '').trim()
-    listVerdict = await verifyJoinedRoom(record, beforeRoomIds, expectedRoomId)
+    listVerdict = await verifyJoinedRoom(record, beforeRoomIds, expectedRoomId, {
+      expectedRoomName: usableQrRoomName(preview.roomName) || '',
+      finalize: true,
+      taskId,
+      loadRoomState,
+    })
+  }
+
+  if (listVerdict.status === 'CANCELLED') {
+    return { cancelled: true, reason: listVerdict.reason || '任务已取消', preview, joinResponse: raw, joinSubmitted: true }
   }
 
   if (listVerdict.status === 'JOINED') {
     const roomId = listVerdict.roomId
-    preview = await enrichPreviewRoomName(record, preview, roomId)
+    preview = await enrichPreviewRoomName(record, preview, roomId, { loadRoomState })
     persistQrTaskDisplay(item.id, preview)
+    if (rememberJoinedRoom && roomId) {
+      rememberJoinedRoom(record.id, {
+        roomId,
+        name: usableQrRoomName(preview.roomName) || '',
+      })
+    }
     appLog('INFO', `进群成功：${preview.roomName || preview.label}`, {
       instanceId: record.id, taskId, module: '二维码进群', operation: '提交进群并核验群列表',
       sourceId: 438557545, path: '/api/enter_room', status: response.status,
       roomName: preview.roomName || '', label: preview.label, reason: listVerdict.reason,
     })
     if (task?.config?.saveContact && roomId) {
-      const saved = await requestApi(record, '/api/save_chatroom_to_contact', { roomId })
-      saveApiSample({ instanceId: record.id, sourceId: 438557556, path: '/api/save_chatroom_to_contact', request: { roomId }, response: saved.raw, httpStatus: saved.response.status, durationMs: 0 })
+      const saved = await requestApi(record, '/api/save_chatroom_to_contact', {
+        roomId,
+        room_id: roomId,
+        chatroomId: roomId,
+      })
+      saveApiSample({
+        instanceId: record.id, sourceId: 438557556, path: '/api/save_chatroom_to_contact',
+        request: { roomId, room_id: roomId, chatroomId: roomId },
+        response: saved.raw, httpStatus: saved.response.status, durationMs: 0,
+      })
       appLog(saved.response.ok ? 'INFO' : 'ERROR', saved.response.ok ? `群聊已保存到通讯录：${preview.roomName || preview.label}` : `群聊保存到通讯录失败：${preview.roomName || preview.label}`, { instanceId: record.id, taskId, roomName: preview.roomName || '' })
     }
     if (qrMonitorConfig.enabled && qrMonitorConfig.watchAll && roomId.endsWith('@chatroom')) {
@@ -2637,7 +3263,7 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
   }
 
   if (listVerdict.status === 'ALREADY_IN') {
-    preview = await enrichPreviewRoomName(record, preview, listVerdict.roomId)
+    preview = await enrichPreviewRoomName(record, preview, listVerdict.roomId, { loadRoomState })
     persistQrTaskDisplay(item.id, preview)
     appLog('INFO', `进群前已在该群中：${preview.roomName || preview.label}`, {
       instanceId: record.id, taskId, module: '二维码进群', roomName: preview.roomName || '', label: preview.label,
@@ -2655,11 +3281,20 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
     }
   }
 
+  // 无 roomId 的短链在 finalize 后仍可能是 NOT_YET（有 roomId 时）；统一收口失败文案
+  if (listVerdict.status === 'NOT_YET' && !String(expectedRoomId || '').endsWith('@chatroom')) {
+    listVerdict = {
+      status: 'MISSING_TARGET',
+      roomId: '',
+      reason: '无法确认目标群（短链缺少群标识，且轮询期间未观察到唯一新群）',
+    }
+  }
+
   const failReason = listVerdict.reason
     || apiVerdict.reason
     || '群列表未出现目标群，未能确认进群成功'
   if (expectedRoomId || listVerdict.roomId) {
-    preview = await enrichPreviewRoomName(record, preview, expectedRoomId || listVerdict.roomId)
+    preview = await enrichPreviewRoomName(record, preview, expectedRoomId || listVerdict.roomId, { loadRoomState })
     persistQrTaskDisplay(item.id, preview)
   }
   // 需申请进群的群：提交后群列表不会立刻出现，按「申请已提交」处理，避免误报失败
@@ -2702,10 +3337,13 @@ async function applyQrOptions(record, task, item, decodedText, taskId) {
   }
 }
 
-async function applyQrOptionsWithConnectionRetry(record, task, item, decodedText, taskId) {
+async function applyQrOptionsWithConnectionRetry(record, task, item, decodedText, taskId, helpers = {}) {
   for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (isTaskStopRequested(taskId)) {
+      return { cancelled: true, reason: '任务已取消' }
+    }
     try {
-      return await applyQrOptions(record, task, item, decodedText, taskId)
+      return await applyQrOptions(record, task, item, decodedText, taskId, helpers)
     } catch (error) {
       const message = rawErrorMessage(error)
       const transient = /fetch failed|econnrefused|connect.*refused|socket hang up|econnreset/i.test(message)
@@ -2780,11 +3418,72 @@ async function runTask(taskId) {
       setTaskStatus(taskId, 'PAUSED')
       return
     }
+    if (!task || ['PAUSED', 'CANCELLED'].includes(String(task.status || ''))) return
     const scheduledAt = Date.parse(String(task?.config?.scheduledAt || ''))
     if (Number.isFinite(scheduledAt) && scheduledAt > Date.now() && !await waitForTaskTime(taskId, scheduledAt)) return
+    if (isTaskStopRequested(taskId)) return
     setTaskStatus(taskId, 'RUNNING')
+    if (isTaskStopRequested(taskId)) return
     /** @type {Map<string, Set<string>>} */
     const kickLiveRoomIdsByInstance = new Map()
+    /** 二维码进群：某执行号触发频繁后，仅跳过该号剩余项，不影响其他执行号 */
+    /** @type {Set<string>} */
+    const qrFrequentInstanceIds = new Set()
+    /** 同一任务内按执行号缓存群列表，避免每条进群都重复打微信接口 */
+    /** @type {Map<string, { ok: boolean, rooms: Array<{ roomId: string, name: string }>, ids: Set<string>, detailed?: boolean }>} */
+    const qrRoomStateByInstance = new Map()
+    /**
+     * @param {{ id: string }} record
+     */
+    const qrHelpersFor = (record) => ({
+      async loadRoomState(options = {}) {
+        const force = Boolean(options?.force)
+        const wantDetail = Boolean(options?.includeDetail)
+        const cached = qrRoomStateByInstance.get(record.id)
+        if (!force && cached?.ok) {
+          if (wantDetail && !cached.detailed) {
+            const enriched = await readWechatRoomListState(record, { includeDetail: true })
+            if (enriched.ok) {
+              qrRoomStateByInstance.set(record.id, { ...enriched, detailed: true })
+              return enriched
+            }
+          }
+          return cached
+        }
+        // 默认只拉群列表；仅当调用方明确需要按群名匹配时再补一次详情
+        const state = await readWechatRoomListState(record, { includeDetail: wantDetail })
+        if (state.ok) {
+          const prev = qrRoomStateByInstance.get(record.id)
+          // 强制刷新仅列表时，保留此前详情里的可读群名，避免核验轮询冲掉名称
+          if (!wantDetail && prev?.detailed && Array.isArray(prev.rooms)) {
+            const nameById = new Map(prev.rooms.map((row) => [row.roomId, row.name || '']))
+            for (const room of state.rooms || []) {
+              const prevName = usableQrRoomName(nameById.get(room.roomId))
+              if (prevName && !usableQrRoomName(room.name)) room.name = prevName
+            }
+          }
+          qrRoomStateByInstance.set(record.id, {
+            ...state,
+            detailed: Boolean(wantDetail || prev?.detailed),
+          })
+        }
+        return state
+      },
+      rememberJoinedRoom(instanceId, room) {
+        const roomId = String(room?.roomId || '').trim()
+        if (!roomId.endsWith('@chatroom')) return
+        const cached = qrRoomStateByInstance.get(String(instanceId || ''))
+        if (!cached?.ok) return
+        if (!cached.ids.has(roomId)) {
+          cached.ids.add(roomId)
+          cached.rooms.push({ roomId, name: String(room?.name || '').trim() })
+        } else {
+          const hit = cached.rooms.find((row) => row.roomId === roomId)
+          const name = String(room?.name || '').trim()
+          if (hit && name && (!hit.name || hit.name === '群聊')) hit.name = name
+        }
+      },
+    })
     const taskItems = getTaskItems(taskId)
     // REQUEST_SENT/UNSAFE_RESUME 也必须跳过，否则恢复加好友/不确定项会重复提交
     const doneItemStatuses = new Set(['COMPLETED', 'SKIPPED', 'FAILED', 'SUBMITTED', 'REQUEST_SENT', 'FREQUENT', 'RESOLUTION_FAILED', 'CANCELLED', 'UNSAFE_RESUME'])
@@ -2793,8 +3492,7 @@ async function runTask(taskId) {
         setTaskStatus(taskId, 'PAUSED')
         break
       }
-      const latest = listTasks().find((candidate) => candidate.id === taskId)
-      if (!latest || ['PAUSED', 'CANCELLED'].includes(latest.status)) break
+      if (isTaskStopRequested(taskId)) break
       // 恢复已暂停任务时跳过已结束项，避免对已成功目标重复发送
       if (doneItemStatuses.has(String(item.status || ''))) continue
       // 中断时停在 RUNNING 的项结果不确定，禁止自动重放
@@ -2805,6 +3503,10 @@ async function runTask(taskId) {
       const record = instances.get(item.instance_id)
       if (!record) { setTaskItemResult(item.id, 'FAILED', null, '实例不在线'); continue }
       if (record.status !== 'ONLINE') { setTaskItemResult(item.id, 'FAILED', null, '微信尚未登录'); continue }
+      if (item.action_type === 'QR_SCAN' && qrFrequentInstanceIds.has(String(item.instance_id || ''))) {
+        setTaskItemResult(item.id, 'SKIPPED', null, '该微信本任务内已触发加群频繁，剩余进群已跳过')
+        continue
+      }
       if (item.action_type === 'KICKED_GROUP_CLEANUP') {
         let request
         try { request = JSON.parse(item.request_json || '{}') } catch { request = {} }
@@ -2848,12 +3550,13 @@ async function runTask(taskId) {
         })
         try {
           const needsGate = !isImmediateKickEvidence(evidence)
-          let liveIds = kickLiveRoomIdsByInstance.get(record.id)
-          if (needsGate && !liveIds) {
+          let liveIds = kickLiveRoomIdsByInstance.has(record.id)
+            ? kickLiveRoomIdsByInstance.get(record.id)
+            : undefined
+          if (needsGate && !kickLiveRoomIdsByInstance.has(record.id)) {
             liveIds = await loadLiveRoomIdsForKickGate(record)
             kickLiveRoomIdsByInstance.set(record.id, liveIds)
           }
-          if (!liveIds) liveIds = new Set()
           const result = await cleanupOneKickedGroupRoom(record, {
             roomId,
             roomName,
@@ -2863,7 +3566,11 @@ async function runTask(taskId) {
             unsaveStatus: dbRow.unsaveStatus || request.unsaveStatus || 'PENDING',
             deleteChatStatus: dbRow.deleteChatStatus || request.deleteChatStatus || 'PENDING',
             confirmCount: Number(dbRow.confirmCount ?? request.confirmCount) || 0,
-          }, { reason: '任务执行', liveIds, taskId })
+          }, {
+            reason: '任务执行',
+            liveIds: needsGate ? liveIds : new Set(),
+            taskId,
+          })
           setTaskItemResult(item.id, result.outcome, result, result.message)
         } catch (error) {
           const message = formatKickCleanupMessage({
@@ -2877,11 +3584,8 @@ async function runTask(taskId) {
           setTaskItemResult(item.id, 'FAILED', null, message)
         }
         if (itemIndex < taskItems.length - 1) {
-          const settings = generalSettings()
-          const min = Math.max(Number(settings.intervalMin) || 1, 1)
-          const max = Math.max(Number(settings.intervalMax) || min, min)
-          const waitMs = (min + Math.random() * (max - min)) * 1000
-          if (!await waitForTaskTime(taskId, Date.now() + waitMs)) {
+          const waitMs = resolveTaskPaceIntervalMs(task)
+          if (waitMs > 0 && !await waitForTaskTime(taskId, Date.now() + waitMs)) {
             if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
             break
           }
@@ -3013,22 +3717,23 @@ async function runTask(taskId) {
         // 链接进群：无需本地图片扫码，直接走 enter_room
         if (item.action_type === 'QR_SCAN' && (request.url || request.link || request.decodedText)) {
           const linkText = String(request.url || request.link || request.decodedText || '')
-          const joinResult = await applyQrOptionsWithConnectionRetry(record, task, item, linkText, taskId)
-          if (joinResult.frequent) {
+          const joinResult = await applyQrOptionsWithConnectionRetry(record, task, item, linkText, taskId, qrHelpersFor(record))
+          if (joinResult.cancelled) {
+            setTaskItemResult(item.id, 'CANCELLED', joinResult, joinResult.reason || '任务已取消')
+            return
+          } else if (joinResult.frequent) {
             setTaskItemResult(item.id, 'FREQUENT', joinResult.joinResponse, '已经频繁')
-            setTaskStatus(taskId, 'COOLING_DOWN')
-            const coolUntil = Date.now() + Math.max(Number(task?.config?.coolMinutes) || 30, 1) * 60000
-            if (!await waitForTaskTime(taskId, coolUntil, { earlyContinueStatuses: ['QUEUED', 'RUNNING'] })) {
-              if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
-              return
-            }
-            const cooled = listTasks().find((candidate) => candidate.id === taskId)
-            if (!cooled || ['PAUSED', 'CANCELLED'].includes(cooled.status)) return
-            if (['COOLING_DOWN', 'QUEUED'].includes(String(cooled.status || ''))) setTaskStatus(taskId, 'RUNNING')
+            // 仅冷却该执行号：不暂停整任务，其他执行号继续
+            qrFrequentInstanceIds.add(String(record.id || ''))
+            appLog('ERROR', '进群频繁：仅暂停该微信本任务剩余项', {
+              instanceId: record.id, taskId, module: '二维码进群', coolMinutes: Number(task?.config?.coolMinutes) || 30,
+            })
           } else if (joinResult.skippedPersonal) {
             setTaskItemResult(item.id, 'SKIPPED', joinResult, '已跳过个人二维码')
           } else if (joinResult.skippedLimit) {
             setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '已达到今日进群上限')
+          } else if (joinResult.skippedNoRoomList) {
+            setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '无法读取群列表，已跳过')
           } else if (joinResult.alreadyIn) {
             setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '进群前已在该群中')
           } else if (joinResult.requestSent) {
@@ -3054,11 +3759,8 @@ async function runTask(taskId) {
             setTaskItemResult(item.id, ok ? 'COMPLETED' : 'FAILED', joinResult, detail)
           }
           if (itemIndex < taskItems.length - 1) {
-            const settings = generalSettings()
-            const min = Math.max(Number(settings.intervalMin) || 1, 1)
-            const max = Math.max(Number(settings.intervalMax) || min, min)
-            const waitMs = (min + Math.random() * (max - min)) * 1000
-            if (!await waitForTaskTime(taskId, Date.now() + waitMs)) {
+            const waitMs = resolveTaskPaceIntervalMs(task)
+            if (waitMs > 0 && !await waitForTaskTime(taskId, Date.now() + waitMs)) {
               if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
               break
             }
@@ -3172,24 +3874,24 @@ async function runTask(taskId) {
             continue
           }
           if (item.action_type === 'QR_SCAN') {
-            updateQrScanResult(item.target_key, raw, success)
+            updateQrScanResult(resolveQrItemLookupKey(item, request), raw, success)
             if (success) {
               const decodedText = raw?.data?.scan_res ?? raw?.scan_res ?? ''
-              const storedQr = listQrItems().find((candidate) => candidate.sha256 === item.target_key || candidate.id === item.target_key)
+              const qrLookupKey = resolveQrItemLookupKey(item, request)
+              const storedQr = listQrItems().find((candidate) => candidate.sha256 === qrLookupKey || candidate.id === qrLookupKey)
               const storedGroupText = storedQr?.qrType === 'GROUP_LINK' ? String(storedQr.decodedText || '') : ''
               const effectiveDecodedText = storedGroupText || decodedText
-              const joinResult = await applyQrOptionsWithConnectionRetry(record, task, item, effectiveDecodedText, taskId)
+              const joinResult = await applyQrOptionsWithConnectionRetry(record, task, item, effectiveDecodedText, taskId, qrHelpersFor(record))
+              if (joinResult.cancelled) {
+                setTaskItemResult(item.id, 'CANCELLED', joinResult, joinResult.reason || '任务已取消')
+                return
+              }
               if (joinResult.frequent) {
                 setTaskItemResult(item.id, 'FREQUENT', joinResult.joinResponse, '已经频繁')
-                setTaskStatus(taskId, 'COOLING_DOWN')
-                const coolUntil = Date.now() + Math.max(Number(task?.config?.coolMinutes) || 30, 1) * 60000
-                if (!await waitForTaskTime(taskId, coolUntil, { earlyContinueStatuses: ['QUEUED', 'RUNNING'] })) {
-                  if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
-                  return
-                }
-                const cooled = listTasks().find((candidate) => candidate.id === taskId)
-                if (!cooled || ['PAUSED', 'CANCELLED'].includes(cooled.status)) return
-                if (['COOLING_DOWN', 'QUEUED'].includes(String(cooled.status || ''))) setTaskStatus(taskId, 'RUNNING')
+                qrFrequentInstanceIds.add(String(record.id || ''))
+                appLog('ERROR', '进群频繁：仅暂停该微信本任务剩余项', {
+                  instanceId: record.id, taskId, module: '二维码进群', coolMinutes: Number(task?.config?.coolMinutes) || 30,
+                })
                 break
               }
               if (joinResult.skippedPersonal) {
@@ -3198,6 +3900,10 @@ async function runTask(taskId) {
               }
               if (joinResult.skippedLimit) {
                 setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '已达到今日进群上限')
+                break
+              }
+              if (joinResult.skippedNoRoomList) {
+                setTaskItemResult(item.id, 'SKIPPED', joinResult, joinResult.reason || '无法读取群列表，已跳过')
                 break
               }
               if (joinResult.alreadyIn) {
@@ -3248,11 +3954,8 @@ async function runTask(taskId) {
         } else setTaskItemResult(item.id, 'FAILED', null, toUserErrorMessage(error, '任务执行失败'))
       }
       if (itemIndex < taskItems.length - 1) {
-        const settings = generalSettings()
-        const min = Math.max(Number(settings.intervalMin) || 1, 1)
-        const max = Math.max(Number(settings.intervalMax) || min, min)
-        const waitMs = (min + Math.random() * (max - min)) * 1000
-        if (!await waitForTaskTime(taskId, Date.now() + waitMs)) {
+        const waitMs = resolveTaskPaceIntervalMs(task)
+        if (waitMs > 0 && !await waitForTaskTime(taskId, Date.now() + waitMs)) {
           if (!runtimeAllowed) setTaskStatus(taskId, 'PAUSED')
           break
         }
@@ -3320,8 +4023,8 @@ function createLocalTask(payload) {
         if (isGroupTask && !targetIsGroup) throw new Error('群聊群发只能选择群聊对象')
         if (!isGroupTask && targetIsGroup) throw new Error('好友群发不能选择群聊对象')
         if (!ownedKeysOf(instanceId).has(targetKey)) {
-          if (isGroupTask && isChatroomBlockedForInstance(instanceId, targetKey)) {
-            throw new Error('所选群包含已确认被踢并屏蔽的群，请刷新通讯录后重选')
+          if (isGroupTask && loadDirectoryExcludedRoomIdSetForInstance(instanceId).has(targetKey)) {
+            throw new Error('所选群包含已登记被踢或已屏蔽的群，请刷新通讯录后重选')
           }
           throw new Error('所选微信不包含这个接收对象，请刷新通讯录后重试')
         }
@@ -3664,7 +4367,22 @@ function registerIpc() {
   ipcMain.handle('tasks:list', () => safeCloneForIpc(listTasks(), []))
   ipcMain.handle('tasks:items', (_event, id) => safeCloneForIpc(getTaskItems(id), []))
   ipcMain.handle('tasks:create', (_event, payload) => { requireRuntime(); return createLocalTask(payload) }) // createLocalTask 内部已 safeClone + 普通 Error
-  ipcMain.handle('tasks:confirm', (_event, id) => { requireRuntime(); const task = listTasks().find((item) => item.id === id); if (!task) throw new Error('任务不存在'); if (task.status !== 'WAITING_CONFIRMATION') throw new Error('任务当前不可确认'); setTaskStatus(id, 'QUEUED'); setImmediate(() => runTask(id)); return true })
+  ipcMain.handle('tasks:confirm', (_event, payload) => {
+    requireRuntime()
+    const id = typeof payload === 'string' ? payload : String(payload?.id || payload?.taskId || '')
+    if (!id) throw new Error('任务不存在')
+    const task = listTasks().find((item) => item.id === id)
+    if (!task) throw new Error('任务不存在')
+    if (task.status !== 'WAITING_CONFIRMATION') throw new Error('任务当前不可确认')
+    const intervalRaw = typeof payload === 'object' && payload ? Number(payload.intervalMs) : Number.NaN
+    if (!Number.isFinite(intervalRaw) || intervalRaw < 0 || !Number.isInteger(intervalRaw)) {
+      throw new Error('请设置执行间隔（毫秒，整数，可填 0）')
+    }
+    patchTaskConfig(id, { intervalMs: intervalRaw })
+    setTaskStatus(id, 'QUEUED')
+    setImmediate(() => runTask(id))
+    return true
+  })
   ipcMain.handle('tasks:pause', (_event, id) => { setTaskStatus(id, 'PAUSED'); return true })
   ipcMain.handle('tasks:resume', (_event, id) => {
     requireRuntime()
@@ -3677,7 +4395,13 @@ function registerIpc() {
     setImmediate(() => runTask(id))
     return true
   })
-  ipcMain.handle('tasks:cancel', (_event, id) => { requireRuntime(); return cancelTask(id) })
+  ipcMain.handle('tasks:cancel', (_event, id) => {
+    requireRuntime()
+    const taskId = String(id || '')
+    const result = cancelTask(taskId)
+    appLog('INFO', '任务已取消，停止后续执行', { taskId, released: result.released, module: '任务中心' })
+    return result
+  })
   ipcMain.handle('settings:get', () => {
     const settings = getSettings()
     const general = settings.general && typeof settings.general === 'object' ? settings.general : {}
@@ -3706,9 +4430,30 @@ function registerIpc() {
       weixinAutoDetected: Boolean(isWeixinExe(normalized.weixinExe)),
     }
   })
-  ipcMain.handle('kicked-groups:cleanup', async () => {
+  ipcMain.handle('kicked-groups:cleanup', async (_event, payload) => {
     requireRuntime()
-    return prepareKickedGroupCleanupTask('手动创建被踢群清理任务')
+    const options = payload && typeof payload === 'object' ? payload : {}
+    const work = prepareKickedGroupCleanupTask('手动创建被踢群清理任务', {
+      instanceId: String(options.instanceId || '').trim(),
+    })
+    // 全量扫群可能较久；超时只解锁创建入口，不中断后台扫描，也不改退群/取消通讯录逻辑。
+    const timeoutMs = 600000
+    let timer = null
+    try {
+      return await Promise.race([
+        work,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('扫描被踢群时间较长仍未返回。可稍后重试；若后台仍在扫，完成前请勿重复狂点创建。')), timeoutMs)
+          if (typeof timer.unref === 'function') timer.unref()
+        }),
+      ])
+    } catch (error) {
+      // 超时后后台扫描可能仍在跑；先解锁，避免后续创建全部提示「请稍候」
+      kickedGroupCleanupPreparing = false
+      throw error
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   })
   ipcMain.handle('weixin:detect', () => {
     requireRuntime()
@@ -3765,7 +4510,7 @@ function registerIpc() {
     const ids = Array.isArray(instanceIds) ? instanceIds.map(String).filter(Boolean) : []
     /** @type {Record<string, string[]>} */
     const out = {}
-    for (const id of ids) out[id] = [...loadBlockedRoomIdSetForInstance(id)]
+    for (const id of ids) out[id] = [...loadDirectoryExcludedRoomIdSetForInstance(id)]
     return out
   })
   ipcMain.handle('qr:list', () => listQrItems())
@@ -4259,6 +5004,7 @@ function createTray() {
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
+  try { installServiceCertificateTrust(session.defaultSession) } catch {}
   createSplashWindow()
   try {
     initStorage(app.getPath('userData'))

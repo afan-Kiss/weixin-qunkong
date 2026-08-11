@@ -413,10 +413,11 @@ class TouchOnlinePolicyShotTest(unittest.TestCase):
 
     def test_start_desktop_queue_keeps_force_restart(self):
         calls = []
+        tell_ok = True
 
         def fake_tell(cid, payload):
             calls.append(("tell", dict(payload)))
-            return True
+            return tell_ok
 
         queued = []
 
@@ -427,26 +428,59 @@ class TouchOnlinePolicyShotTest(unittest.TestCase):
         orig_set = self.srv.set_command
         self.srv.tell_agent = fake_tell
         self.srv.set_command = fake_set
+        # Reset rate-limit state between assertions.
+        with self.srv._desktop_start_lock:
+            self.srv._desktop_start_meta.clear()
         try:
+            # WS 送达时不入队，避免重连再吃 START_DESKTOP
             self.srv.start_desktop_for_agent("c-force", quality="auto", session_id="s1", force_restart=True)
             self.assertTrue(calls)
             self.assertTrue(calls[0][1].get("forceRestart"))
             self.assertTrue(calls[0][1].get("kick"))
+            self.assertEqual(queued, [])
+
+            tell_ok = False
+            calls.clear()
+            queued.clear()
+            with self.srv._desktop_start_lock:
+                self.srv._desktop_start_meta.clear()
+            self.srv.start_desktop_for_agent("c-force", quality="auto", session_id="s1", force_restart=True)
             self.assertTrue(queued)
             self.assertTrue(queued[0].get("forceRestart"))
             self.assertTrue(queued[0].get("kick"))
             self.assertEqual(queued[0].get("desktopSessionId"), "s1")
 
+            tell_ok = True
             calls.clear()
             queued.clear()
+            with self.srv._desktop_start_lock:
+                self.srv._desktop_start_meta.clear()
             self.srv.start_desktop_for_agent("c-soft", quality="smooth", force_restart=False)
             self.assertNotIn("forceRestart", calls[0][1])
             self.assertNotIn("kick", calls[0][1])
-            self.assertNotIn("forceRestart", queued[0])
-            self.assertNotIn("kick", queued[0])
+            self.assertEqual(queued, [])
+
+            # Rapid forceRestart must coalesce / downgrade instead of flooding.
+            calls.clear()
+            queued.clear()
+            with self.srv._desktop_start_lock:
+                self.srv._desktop_start_meta.clear()
+            with self.srv._online_lock:
+                self.srv._online["c-rate"] = {"desktopWatching": False}
+            self.srv.start_desktop_for_agent("c-rate", force_restart=True)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0][1].get("forceRestart"))
+            calls.clear()
+            queued.clear()
+            self.srv.start_desktop_for_agent("c-rate", force_restart=True)
+            self.assertEqual(len(calls), 0)  # within force coalesce
+            self.srv.start_desktop_for_agent("c-rate", force_restart=False)
+            self.assertEqual(len(calls), 0)  # soft coalesce while watching
         finally:
             self.srv.tell_agent = orig_tell
             self.srv.set_command = orig_set
+            with self.srv._desktop_start_lock:
+                self.srv._desktop_start_meta.clear()
 
     def test_desktop_latest_api_shape_compat(self):
         img = "data:image/jpeg;base64," + base64.b64encode(_JPEG_1X1).decode("ascii")

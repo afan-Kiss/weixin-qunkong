@@ -8,13 +8,26 @@ param(
   [switch]$Mandatory,
   [string[]]$TargetClientIds = @(),
   [int]$Concurrency = 4,
-  [int]$PreferredChunkMB = 4
+  [int]$PreferredChunkMB = 4,
+  [switch]$InsecureTls
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
+if ($InsecureTls -or $env:WXQK_INSECURE_TLS -eq '1') {
+  add-type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class WxqkTrustAllCertsPolicy : ICertificatePolicy {
+  public bool CheckValidationResult(ServicePoint s, X509Certificate c, WebRequest r, int p) { return true; }
+}
+"@
+  [System.Net.ServicePointManager]::CertificatePolicy = New-Object WxqkTrustAllCertsPolicy
+  [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+  Write-Host 'TLS: insecure mode enabled (self-signed / IP cert)'
+}
 if (-not (Test-Path -LiteralPath $ExePath)) {
   throw "EXE not found: $ExePath"
 }

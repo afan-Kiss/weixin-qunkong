@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Deploy wxqk remote board to xiangyuzhubao.xyz/wxqk (port 4812)."""
+"""Deploy wxqk remote board to new host 120.27 (port 4812 behind :8443).
+
+域名机只做 /888 墙入口与 LiveKit TLS 反代，不再跑本地 wxqk。
+"""
 from __future__ import annotations
 
 import json
@@ -9,9 +12,10 @@ from pathlib import Path
 
 import paramiko
 
-from deploy import EXTRA_PY, HOST, PASSWORD, USER, VERSION_POLICY
+from deploy import EXTRA_PY, PASSWORD, USER, VERSION_POLICY
 
 HERE = Path(__file__).resolve().parent
+HOST = os.environ.get("WXQK_SSH_HOST", "120.27.219.138").strip()
 REMOTE_DIR = "/opt/wxqk"
 SERVICE = "wxqk"
 PORT = 4812
@@ -32,7 +36,7 @@ Environment=FACAI888_PORT={PORT}
 Environment=FACAI888_BIND=127.0.0.1
 Environment=FACAI888_DATA={REMOTE_DIR}/data
 Environment=FACAI888_PUBLIC_PREFIX={PUBLIC_PREFIX}
-Environment=FACAI888_PUBLIC_BASE_URL=https://xiangyuzhubao.xyz{PUBLIC_PREFIX}
+Environment=FACAI888_PUBLIC_BASE_URL=https://120.27.219.138:8443{PUBLIC_PREFIX}
 Environment=FACAI888_AUTO_ACTIVATE_DEVICES=1
 Environment=FACAI888_PUBLISH_KEY_B64=TIwR8GPTQsAO49IXWjfXok0xHouoHGFbkTsi5B4Pf9A=
 ExecStart=/usr/bin/python3 {REMOTE_DIR}/server.py
@@ -170,9 +174,9 @@ def main() -> None:
     run(f"python3 {REMOTE_DIR}/_upsert_nginx_wxqk.py")
     run("nginx -t && systemctl reload nginx")
     run(f"curl -fsS http://127.0.0.1:{PORT}/ >/dev/null && echo local_ok")
-    run("curl -sS -o /dev/null -w '%{http_code}\\n' -H 'Host: xiangyuzhubao.xyz' http://127.0.0.1/wxqk/")
+    run("curl -sk -o /dev/null -w '%{http_code}\\n' https://127.0.0.1:8443/wxqk/ || true")
     client.close()
-    print("wxqk deploy complete → https://xiangyuzhubao.xyz/wxqk/")
+    print(f"wxqk deploy complete → https://{HOST}:8443/wxqk/")
 
 
 if __name__ == "__main__":

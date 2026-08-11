@@ -526,7 +526,7 @@ onBeforeUnmount(() => document.removeEventListener('paste', onPaste))
 
         <div class="form-block">
           <label>间隔设置</label>
-          <div class="muted">使用系统设置中的全局随机间隔</div>
+          <div class="muted">执行间隔在任务中心「确认执行」时按毫秒单独设置</div>
         </div>
 
         <div class="form-block">

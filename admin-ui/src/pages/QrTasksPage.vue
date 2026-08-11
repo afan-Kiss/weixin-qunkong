@@ -41,6 +41,20 @@ const limitPerAccount = ref(20)
 const coolMinutes = ref(30)
 const rawRecords = ref<Array<Record<string, unknown>>>([])
 const selected = ref<Array<Record<string, unknown>>>([])
+/** 执行方式：all=所选微信×全部已选群；manual=按群手动分配 */
+const assignMode = ref<'all' | 'manual'>('all')
+const selectedExecutorIds = ref<string[]>([])
+const executorSearch = ref('')
+/** 手动模式：二维码记录 id → 执行微信 instanceId 列表 */
+const manualExecutorsByQrId = ref<Record<string, string[]>>({})
+const assignPreviewOpen = ref(false)
+const batchAssignVisible = ref(false)
+const batchAssignIds = ref<string[]>([])
+const batchAssignMode = ref<'add' | 'replace'>('add')
+const batchDialogExecutorIds = ref<string[]>([])
+const manualPickQrId = ref('')
+const manualPickVisible = ref(false)
+const manualPickIds = ref<string[]>([])
 /**
  * 去重列文案与样式：重复未落盘为红色「重复-不下载」，否则绿色「可下载」。
  * @param row 原始二维码记录
@@ -376,32 +390,282 @@ function isExecutableQr(item: Record<string, unknown>) {
   return Boolean(text) && (type === 'GROUP_LINK' || type === 'PERSONAL_LINK' || /weixin\.qq\.com\/g\/|addchatroombyinvite/i.test(text))
 }
 
+function instanceLabel(inst: { nickname?: string; alias?: string; accountWxid?: string; id: string }) {
+  return String(inst.nickname || inst.alias || inst.accountWxid || inst.id).trim() || inst.id
+}
+
+function parseSourceParts(source: unknown) {
+  const text = String(source || '').trim()
+  if (!text) return { label: '-', wxid: '-' }
+  const parts = text.split('·').map((part) => part.trim()).filter(Boolean)
+  if (parts.length >= 2) return { label: parts[0], wxid: parts.slice(1).join(' · ') }
+  return { label: text, wxid: '-' }
+}
+
+const executableSelected = computed(() => selected.value.filter((item) => isExecutableQr(item)))
+const sourceAccountCount = computed(() => {
+  const keys = new Set<string>()
+  for (const row of rawRecords.value) {
+    const src = String(row.source || '').trim()
+    if (src) keys.add(src.split('·')[0]?.trim() || src)
+  }
+  return keys.size
+})
+
+const executorCandidates = computed(() => {
+  const q = executorSearch.value.trim().toLowerCase()
+  return instances.value
+    .slice()
+    .sort((a, b) => {
+      const ao = a.status === 'ONLINE' ? 0 : 1
+      const bo = b.status === 'ONLINE' ? 0 : 1
+      if (ao !== bo) return ao - bo
+      return instanceLabel(a).localeCompare(instanceLabel(b), 'zh-CN')
+    })
+    .filter((inst) => {
+      if (!q) return true
+      const hay = `${inst.nickname || ''} ${inst.alias || ''} ${inst.accountWxid || ''} ${inst.id}`.toLowerCase()
+      return hay.includes(q)
+    })
+})
+
+const selectedExecutors = computed(() => {
+  const idSet = new Set(selectedExecutorIds.value)
+  return instances.value.filter((inst) => idSet.has(inst.id) && inst.status === 'ONLINE')
+})
+
+function manualExecutorIdsFor(qrId: string) {
+  return manualExecutorsByQrId.value[qrId] || []
+}
+
+function manualExecutorLabels(qrId: string) {
+  const ids = manualExecutorIdsFor(qrId)
+  if (!ids.length) return '未分配'
+  return ids.map((id) => {
+    const inst = instances.value.find((row) => row.id === id)
+    return inst ? instanceLabel(inst) : id.slice(0, 8)
+  }).join('、')
+}
+
+/** 预计任务对数（群×执行微信），不含限额裁剪 */
+const plannedPairs = computed(() => {
+  const groups = executableSelected.value
+  if (!groups.length) return [] as Array<{ qr: Record<string, unknown>; instanceId: string }>
+  if (assignMode.value === 'all') {
+    const execs = selectedExecutors.value
+    const pairs: Array<{ qr: Record<string, unknown>; instanceId: string }> = []
+    for (const inst of execs) {
+      for (const qr of groups) pairs.push({ qr, instanceId: inst.id })
+    }
+    return pairs
+  }
+  const pairs: Array<{ qr: Record<string, unknown>; instanceId: string }> = []
+  for (const qr of groups) {
+    const qrId = String(qr.id || '')
+    const execIds = [...new Set(manualExecutorIdsFor(qrId))]
+      .filter((id) => instances.value.some((inst) => inst.id === id && inst.status === 'ONLINE'))
+    for (const instanceId of execIds) pairs.push({ qr, instanceId })
+  }
+  return pairs
+})
+
+const plannedTaskCount = computed(() => plannedPairs.value.length)
+
+const accountWorkload = computed(() => {
+  const map = new Map<string, number>()
+  for (const pair of plannedPairs.value) {
+    map.set(pair.instanceId, (map.get(pair.instanceId) || 0) + 1)
+  }
+  const limit = Math.max(Number(limitPerAccount.value) || 0, 0)
+  return [...map.entries()].map(([id, assigned]) => {
+    const inst = instances.value.find((row) => row.id === id)
+    return {
+      id,
+      label: inst ? instanceLabel(inst) : id,
+      assigned,
+      capped: limit > 0 ? Math.min(assigned, limit) : assigned,
+      limit,
+    }
+  })
+})
+
+function selectOnlineExecutors() {
+  selectedExecutorIds.value = instances.value.filter((item) => item.status === 'ONLINE').map((item) => item.id)
+}
+function clearExecutors() {
+  selectedExecutorIds.value = []
+}
+function selectNormalExecutors() {
+  selectedExecutorIds.value = instances.value.filter((item) => item.status === 'ONLINE').map((item) => item.id)
+}
+function toggleExecutor(id: string, online: boolean) {
+  if (!online) return
+  const set = new Set(selectedExecutorIds.value)
+  if (set.has(id)) set.delete(id)
+  else set.add(id)
+  selectedExecutorIds.value = [...set]
+}
+function setExecutorChecked(id: string, checked: boolean, online: boolean) {
+  if (!online) return
+  const set = new Set(selectedExecutorIds.value)
+  if (checked) set.add(id)
+  else set.delete(id)
+  selectedExecutorIds.value = [...set]
+}
+
+function openManualPick(row: Record<string, unknown>) {
+  const qrId = String(row.id || '')
+  if (!qrId) return
+  manualPickQrId.value = qrId
+  manualPickIds.value = [...manualExecutorIdsFor(qrId)]
+  manualPickVisible.value = true
+}
+function saveManualPick() {
+  const qrId = manualPickQrId.value
+  if (!qrId) return
+  manualExecutorsByQrId.value = {
+    ...manualExecutorsByQrId.value,
+    [qrId]: [...new Set(manualPickIds.value.filter((id) => instances.value.some((inst) => inst.id === id && inst.status === 'ONLINE')))],
+  }
+  manualPickVisible.value = false
+}
+function openBatchAssign() {
+  const ids = executableSelected.value.map((row) => String(row.id || '')).filter(Boolean)
+  if (!ids.length) return ElMessage.warning('请先勾选要分配的群资源')
+  batchAssignIds.value = ids
+  batchDialogExecutorIds.value = []
+  batchAssignMode.value = 'add'
+  batchAssignVisible.value = true
+}
+function confirmBatchAssign() {
+  const execIds = [...new Set(batchDialogExecutorIds.value)]
+    .filter((id) => instances.value.some((inst) => inst.id === id && inst.status === 'ONLINE'))
+  if (!execIds.length) return ElMessage.warning('请选择至少一个在线执行微信')
+  const next = { ...manualExecutorsByQrId.value }
+  for (const qrId of batchAssignIds.value) {
+    if (batchAssignMode.value === 'replace') next[qrId] = [...execIds]
+    else next[qrId] = [...new Set([...(next[qrId] || []), ...execIds])]
+  }
+  manualExecutorsByQrId.value = next
+  batchAssignVisible.value = false
+  ElMessage.success(`已为 ${batchAssignIds.value.length} 个群更新执行微信`)
+}
+function clearManualAssignSelected() {
+  const ids = executableSelected.value.map((row) => String(row.id || '')).filter(Boolean)
+  if (!ids.length) return ElMessage.warning('请先勾选要清除的群')
+  const next = { ...manualExecutorsByQrId.value }
+  for (const id of ids) delete next[id]
+  manualExecutorsByQrId.value = next
+  ElMessage.success(`已清除 ${ids.length} 个群的执行微信`)
+}
+
+function buildQrTaskItem(qr: Record<string, unknown>, instanceId: string, previewByUrl: Map<string, { roomName?: string; label?: string; memberCount?: number }>) {
+  const qrKey = String(qr.sha256 || qr.id || '').trim()
+  const targetKey = `${instanceId}::${qrKey}`
+  const localPath = String(qr.localPath || '').trim()
+  const sourceLabel = String(qr.source || '').trim()
+  const qrType = String(qr.qrType || '').trim()
+  const baseRequest: Record<string, unknown> = {
+    qrSha: qrKey,
+    qrItemId: String(qr.id || ''),
+    sourceLabel,
+    executorInstanceId: instanceId,
+    ...(qrType ? { qrType } : {}),
+  }
+  if (qr.decodedText) {
+    const url = String(qr.decodedText)
+    const preview = previewByUrl.get(url.trim()) || previewByUrl.get(url)
+    const roomName = String(preview?.roomName || '').trim()
+    const usableName = roomName && roomName !== '未知群名' ? roomName : ''
+    const labelRaw = String(preview?.label || '').trim()
+    const label = usableName && labelRaw && !/未知群名|二维码目标/.test(labelRaw) ? labelRaw : ''
+    const memberCount = Number(preview?.memberCount) || 0
+    return {
+      instanceId,
+      targetKey,
+      request: {
+        ...baseRequest,
+        url,
+        ...(localPath ? { path: localPath, localPath } : {}),
+        ...(usableName ? { roomName: usableName } : {}),
+        ...(label ? { label } : {}),
+        ...(memberCount > 0 ? { memberCount } : {}),
+      },
+    }
+  }
+  return {
+    instanceId,
+    targetKey,
+    request: {
+      ...baseRequest,
+      path: localPath || qr.localPath,
+      ...(localPath ? { localPath } : {}),
+    },
+  }
+}
+
 /**
- * 创建识别/进群任务：进群前先解析并展示群名/人数，确认后再创建。
+ * 创建识别/进群任务：按「已选群 × 已选执行微信」生成账号-群任务（非轮询均分）。
  * @param rows 勾选记录
  */
 async function createScanTask(rows = selected.value) {
-  if (!rows.length) return ElMessage.warning('请先勾选要执行的二维码记录')
+  if (!rows.length) return ElMessage.warning('请选择至少一个微信群')
   const executable = rows.filter((item) => isExecutableQr(item))
   if (!executable.length) return ElMessage.warning('勾选的记录无可执行项：请勾选本地图片或群二维码链接')
-  const availableInstances = instances.value.filter((item) => item.status === 'ONLINE')
-  if (!availableInstances.length) return ElMessage.warning('没有可用的微信，请先打开并登录微信')
-  const capacity = availableInstances.length * limitPerAccount.value
-  const accepted = executable.slice(0, capacity)
-  const linkRows = accepted.filter((item) => String(item.decodedText || '').trim())
-  const imageOnly = accepted.length - linkRows.length
+
+  let pairs = plannedPairs.value
+  if (rows !== selected.value) {
+    // 单行快捷进群：仍要求已选执行微信（all 模式）或该行已手动分配
+    if (assignMode.value === 'all') {
+      const execs = selectedExecutors.value
+      if (!execs.length) return ElMessage.warning('请选择至少一个执行微信')
+      pairs = []
+      for (const inst of execs) {
+        for (const qr of executable) pairs.push({ qr, instanceId: inst.id })
+      }
+    } else {
+      pairs = []
+      for (const qr of executable) {
+        const qrId = String(qr.id || '')
+        const execIds = [...new Set(manualExecutorIdsFor(qrId))]
+          .filter((id) => instances.value.some((inst) => inst.id === id && inst.status === 'ONLINE'))
+        for (const instanceId of execIds) pairs.push({ qr, instanceId })
+      }
+    }
+  }
+
+  if (!pairs.length) {
+    if (assignMode.value === 'manual') return ElMessage.warning('请为已选群分配至少一个在线执行微信')
+    return ElMessage.warning('请选择至少一个执行微信')
+  }
+  const onlineExecIds = new Set(instances.value.filter((item) => item.status === 'ONLINE').map((item) => item.id))
+  const usablePairs = pairs.filter((pair) => onlineExecIds.has(pair.instanceId))
+  if (!usablePairs.length) return ElMessage.warning('当前没有可执行的微信账号（需在线已登录）')
+
+  const uniqueGroups = new Set(usablePairs.map((pair) => String(pair.qr.id || pair.qr.sha256 || '')))
+  const uniqueExecs = new Set(usablePairs.map((pair) => pair.instanceId))
+  const previewInstanceId = [...uniqueExecs][0]
+  const linkRows = [...new Map(
+    usablePairs
+      .map((pair) => pair.qr)
+      .filter((item) => String(item.decodedText || '').trim())
+      .map((item) => [String(item.sha256 || item.id), item]),
+  ).values()]
+  const imageOnly = uniqueGroups.size - linkRows.length
   creating.value = true
   try {
     let previewBlock = ''
     const previewByUrl = new Map<string, { roomName?: string; label?: string; memberCount?: number }>()
-    if (linkRows.length) {
+    if (linkRows.length && previewInstanceId) {
       ElMessage.info('正在解析群资料（群名/人数）…')
+      // 创建确认只需抽样预览，避免一次对几十上百条邀请连环打 a8key
+      const previewLimit = 20
+      const previewRows = linkRows.slice(0, previewLimit)
       const previews = await window.wxControl?.previewQrInvites?.({
-        instanceId: availableInstances[0].id,
-        urls: linkRows.map((item) => String(item.decodedText)),
+        instanceId: previewInstanceId,
+        urls: previewRows.map((item) => String(item.decodedText)),
       }) ?? []
-      // 按请求顺序对齐，并同时用源链 / 回写 url / fullUrl 建索引，避免字符串细微差异导致丢群名
-      linkRows.forEach((row, index) => {
+      previewRows.forEach((row, index) => {
         const preview = previews[index]
         if (!preview) return
         for (const key of [row.decodedText, preview.url, preview.fullUrl]) {
@@ -423,7 +687,9 @@ async function createScanTask(rows = selected.value) {
         const count = Number(item.memberCount) > 0 ? `${item.memberCount} 人` : '人数未知'
         return `${index + 1}. <b>${escapeHtml(name)}</b>（${escapeHtml(count)}）`
       })
-      if (resolved.length > 20) lines.push(`另有 ${resolved.length - 20} 个已解析群邀请`)
+      if (linkRows.length > previewLimit) {
+        lines.push(`另有 ${linkRows.length - previewLimit} 个群邀请未在创建前预览（执行时再解析，避免狂打接口）`)
+      }
       if (pendingPreviewCount > 0) lines.push(`<b>${pendingPreviewCount} 个群邀请</b>暂时无法读取群名和人数，执行任务时仍会逐个尝试`)
       if (invalid.length > 0) lines.push(`<b>${invalid.length} 个邀请无效</b>：${escapeHtml(invalid[0].error || '邀请已过期')}`)
       previewBlock = lines.length
@@ -436,18 +702,29 @@ async function createScanTask(rows = selected.value) {
     const personalNote = skipPersonal.value
       ? '个人码将自动跳过'
       : '个人码无法进群，执行时也会跳过'
+    const modeNote = assignMode.value === 'all'
+      ? '执行方式：每个选中的微信都会分别执行全部已选群。'
+      : '执行方式：按群手动分配的执行微信生成任务。'
     await ElMessageBox.confirm(
-      `${previewBlock}共 ${accepted.length} 条；${personalNote}；进群后${saveContact.value ? '会保存到通讯录' : '不会自动保存到通讯录'}。<br/>确认后到任务中心执行。`,
-      '确认进群目标',
+      `${previewBlock}`
+      + `已选群：<b>${uniqueGroups.size}</b><br/>`
+      + `执行微信：<b>${uniqueExecs.size}</b><br/>`
+      + `预计任务：<b>${usablePairs.length}</b><br/>`
+      + `${assignMode.value === 'all'
+        ? `${uniqueGroups.size} 个群 × ${uniqueExecs.size} 个微信 = ${usablePairs.length} 条执行任务`
+        : `按手动分配合计 = ${usablePairs.length} 条执行任务`}<br/><br/>`
+      + `${modeNote}<br/>${personalNote}；进群后${saveContact.value ? '会保存到通讯录' : '不会自动保存到通讯录'}。<br/>确认后到任务中心执行。`,
+      '创建进群任务',
       {
         type: 'warning',
-        confirmButtonText: '确认创建任务',
+        confirmButtonText: `确认创建${usablePairs.length}条任务`,
         cancelButtonText: '取消',
         dangerouslyUseHTMLString: true,
         customClass: 'qr-invite-confirm-box',
       },
     )
-    await window.wxControl?.createTask({
+    const items = usablePairs.map((pair) => buildQrTaskItem(pair.qr, pair.instanceId, previewByUrl))
+    const created = await window.wxControl?.createTask({
       name: `二维码识别与进群 ${new Date().toLocaleString()}`,
       type: 'QR_SCAN',
       config: {
@@ -457,46 +734,16 @@ async function createScanTask(rows = selected.value) {
         folder: folder.value,
         limitPerAccount: limitPerAccount.value,
         coolMinutes: coolMinutes.value,
+        assignMode: assignMode.value,
       },
-      items: accepted.map((item, index) => {
-        const instanceId = availableInstances[index % availableInstances.length].id
-        const targetKey = String(item.sha256 || item.id)
-        const localPath = String(item.localPath || '').trim()
-        if (item.decodedText) {
-          const url = String(item.decodedText)
-          const preview = previewByUrl.get(url.trim()) || previewByUrl.get(url)
-          const roomName = String(preview?.roomName || '').trim()
-          const usableName = roomName && roomName !== '未知群名' ? roomName : ''
-          const labelRaw = String(preview?.label || '').trim()
-          const label = usableName && labelRaw && !/未知群名|二维码目标/.test(labelRaw) ? labelRaw : ''
-          const memberCount = Number(preview?.memberCount) || 0
-          const qrType = String(item.qrType || '').trim()
-          return {
-            instanceId,
-            targetKey,
-            request: {
-              url,
-              ...(localPath ? { path: localPath, localPath } : {}),
-              ...(qrType ? { qrType } : {}),
-              ...(usableName ? { roomName: usableName } : {}),
-              ...(label ? { label } : {}),
-              ...(memberCount > 0 ? { memberCount } : {}),
-            },
-          }
-        }
-        return {
-          instanceId,
-          targetKey,
-          request: {
-            path: localPath || item.localPath,
-            ...(localPath ? { localPath } : {}),
-            ...(item.qrType ? { qrType: String(item.qrType) } : {}),
-          },
-        }
-      }),
+      items,
     })
-    if (accepted.length < executable.length) ElMessage.warning(`受每账号上限影响，已跳过 ${executable.length - accepted.length} 条`)
-    await promptGoToTaskCenter(router, `已创建 ${accepted.length} 条二维码进群任务`)
+    const inserted = Number((created as { total?: number })?.total || items.length)
+    const deduped = Number((created as { deduplicated?: number })?.deduplicated || 0)
+    await promptGoToTaskCenter(
+      router,
+      `任务创建成功\n群资源：${uniqueGroups.size}\n执行微信：${uniqueExecs.size}\n生成任务：${items.length}\n跳过重复：${deduped}\n实际新增：${inserted}`,
+    )
   } catch (error) {
     if (error === 'cancel' || (error && typeof error === 'object' && 'action' in error && (error as { action?: string }).action === 'cancel')) return
     ElMessage.error(userErrorMessage(error, '创建二维码任务失败'))
@@ -505,7 +752,10 @@ async function createScanTask(rows = selected.value) {
   }
 }
 async function removeSelected() { if (!selected.value.length) return; await ElMessageBox.confirm('仅删除本地数据库记录，不删除原图片。', '删除二维码记录', { type: 'warning' }); rawRecords.value = (await window.wxControl?.deleteQrItems(selected.value.map((item) => String(item.id))) ?? []) as Array<Record<string, unknown>> }
-onMounted(initialize)
+onMounted(async () => {
+  await initialize()
+  selectOnlineExecutors()
+})
 onBeforeUnmount(() => {
   stopMonitorListener?.()
   stopMonitorRoomsListener?.()
@@ -517,7 +767,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app-page">
-    <PageHeader title="二维码任务" subtitle="分三步：导入/采集 → 勾选记录 → 创建任务；创建后到任务中心确认执行。" />
+    <PageHeader title="二维码任务" subtitle="勾选群资源并自选执行微信：默认每个执行微信都会分别处理全部已选群（群数×微信号=任务数）。" />
 
     <div class="chip-row">
       <button
@@ -607,7 +857,13 @@ onBeforeUnmount(() => {
 
     <div v-if="activeTab === '识别结果' || activeTab === '链接导入' || activeTab === '图片采集'" class="mid-split">
       <section class="app-card block">
-        <h3 class="section-title">二维码记录表<span class="muted" style="margin-left:8px;font-weight:400">勾选后创建任务</span></h3>
+        <div class="section-head">
+          <h3 class="section-title">待进群资源</h3>
+          <div class="resource-stats muted">
+            已采集 {{ rawRecords.length }} · 当前选择 {{ executableSelected.length }} · 来源账号 {{ sourceAccountCount }}
+          </div>
+        </div>
+        <p class="tip muted">来源微信仅表示该群由哪个账号采集，不决定实际执行账号。</p>
         <div class="chip-row qr-type-filter" style="margin: 0 0 10px">
           <button
             v-for="item in qrTypeFilterChips"
@@ -620,18 +876,31 @@ onBeforeUnmount(() => {
             {{ item.label }}
           </button>
           <span class="muted" style="margin-left:4px;font-size:12px">当前 {{ qrRecords.length }} 条</span>
+          <template v-if="assignMode === 'manual'">
+            <el-button size="small" style="margin-left:auto" @click="openBatchAssign">批量分配执行微信</el-button>
+            <el-button size="small" @click="clearManualAssignSelected">清除执行微信</el-button>
+          </template>
         </div>
         <div class="table-wrap">
           <el-table :data="qrRecords" stripe height="320" style="width: 100%" @selection-change="selected = $event" @row-dblclick="(row: Record<string, unknown>) => revealQrImage(row)">
             <el-table-column type="selection" width="48" />
-            <el-table-column label="缩略图" width="80">
+            <el-table-column label="缩略图" width="64">
               <template #default="{ row }">
                 <div class="thumb">{{ row.thumb }}</div>
               </template>
             </el-table-column>
-            <el-table-column prop="cacheTime" label="缓存时间" width="100" show-overflow-tooltip />
-            <el-table-column prop="source" label="来源" min-width="110" show-overflow-tooltip />
-            <el-table-column label="识别结果" min-width="180" show-overflow-tooltip>
+            <el-table-column prop="cacheTime" label="采集时间" width="100" show-overflow-tooltip />
+            <el-table-column label="来源微信" min-width="100" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span class="source-label">{{ parseSourceParts(row.source).label }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column v-if="assignMode === 'manual'" label="执行微信" min-width="140" show-overflow-tooltip>
+              <template #default="{ row }">
+                <el-button link type="primary" @click.stop="openManualPick(row)">{{ manualExecutorLabels(String(row.id || '')) }}</el-button>
+              </template>
+            </el-table-column>
+            <el-table-column label="识别结果" min-width="160" show-overflow-tooltip>
               <template #default="{ row }">
                 <span
                   class="qr-result-cell"
@@ -640,17 +909,16 @@ onBeforeUnmount(() => {
                 >{{ row.result }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="type" label="类型" width="110" show-overflow-tooltip />
-            <el-table-column label="去重状态" min-width="110" show-overflow-tooltip>
+            <el-table-column prop="type" label="类型" width="100" show-overflow-tooltip />
+            <el-table-column label="去重" width="100" show-overflow-tooltip>
               <template #default="{ row }">
                 <span :class="row.dedupeClass">{{ row.dedupe }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="path" label="保存路径" min-width="160" show-overflow-tooltip />
-            <el-table-column label="状态" width="110">
+            <el-table-column label="状态" width="100">
               <template #default="{ row }"><StatusTag :text="row.status" /></template>
             </el-table-column>
-            <el-table-column label="操作" width="120" fixed="right">
+            <el-table-column label="操作" width="100" fixed="right">
               <template #default="{ row }">
                 <el-button link type="primary" :disabled="!isExecutableQr(row)" @click="createScanTask([row])">{{ row.localPath ? '识别进群' : '进群' }}</el-button>
               </template>
@@ -660,17 +928,101 @@ onBeforeUnmount(() => {
       </section>
 
       <aside class="app-card block config-panel panel-scroll">
-        <h3 class="section-title">执行配置</h3>
-        <div class="form-stack">
+        <div class="section-head">
+          <h3 class="section-title">执行微信分配</h3>
+          <el-tooltip
+            content="群来源微信只表示二维码/群信息由哪个微信采集。执行微信由本页面单独选择。不同微信可以重复执行加入同一个群。"
+            placement="top"
+          >
+            <span class="info-hint">ⓘ</span>
+          </el-tooltip>
+        </div>
+        <div class="muted tiny-stats">已选群 {{ executableSelected.length }} · 已选微信 {{ selectedExecutors.length }} · 预计任务 {{ plannedTaskCount }}</div>
+
+        <div class="form-stack" style="margin-top:10px">
+          <div>
+            <label>执行方式</label>
+            <el-radio-group v-model="assignMode" class="assign-mode">
+              <el-radio value="all">所选微信执行全部已选群（推荐）</el-radio>
+              <el-radio value="manual">手动给群分配执行微信</el-radio>
+            </el-radio-group>
+            <p class="tip muted">{{ assignMode === 'all' ? '每个选中的微信都会分别执行全部已选群。' : '请在左侧群列表为每个群指定执行微信，支持批量分配。' }}</p>
+          </div>
+
+          <template v-if="assignMode === 'all'">
+            <div>
+              <label>选择执行微信</label>
+              <el-input v-model="executorSearch" clearable placeholder="搜索昵称 / WXID" size="small" style="margin-bottom:8px" />
+              <div class="toolbar-left" style="margin-bottom:8px;flex-wrap:wrap;gap:6px">
+                <el-button size="small" @click="selectOnlineExecutors">全选在线微信</el-button>
+                <el-button size="small" @click="clearExecutors">取消全选</el-button>
+                <el-button size="small" @click="selectNormalExecutors">仅选择正常账号</el-button>
+              </div>
+              <div class="executor-list">
+                <div
+                  v-for="inst in executorCandidates"
+                  :key="inst.id"
+                  class="executor-row"
+                  :class="{ offline: inst.status !== 'ONLINE', selected: selectedExecutorIds.includes(inst.id) }"
+                  @click="toggleExecutor(inst.id, inst.status === 'ONLINE')"
+                >
+                  <el-checkbox
+                    :model-value="selectedExecutorIds.includes(inst.id)"
+                    :disabled="inst.status !== 'ONLINE'"
+                    @click.stop
+                    @change="(checked: boolean | string | number) => setExecutorChecked(inst.id, Boolean(checked), inst.status === 'ONLINE')"
+                  />
+                  <el-avatar :size="28" :src="inst.avatar || undefined">{{ instanceLabel(inst).slice(0, 1) }}</el-avatar>
+                  <div class="executor-meta">
+                    <div class="executor-name">{{ instanceLabel(inst) }}</div>
+                    <div class="muted tiny">{{ inst.alias || inst.accountWxid || '微信号读取中' }}</div>
+                    <div class="badge-row">
+                      <span class="dot" :class="inst.status === 'ONLINE' ? 'ok' : 'off'" />
+                      <span class="tag-mini" :class="inst.status === 'ONLINE' ? 'ok' : 'off'">{{ inst.status === 'ONLINE' ? '在线' : '离线' }}</span>
+                      <span v-if="inst.status !== 'ONLINE'" class="tag-mini off">不可选择 · 当前未登录</span>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="!executorCandidates.length" class="muted tiny">暂无微信账号，请先在微信管理中打开并登录</div>
+              </div>
+            </div>
+          </template>
+
+          <div class="preview-box">
+            <div class="preview-title">本次任务预览</div>
+            <div class="preview-grid">
+              <div><span class="muted">群聊数量</span><strong>{{ executableSelected.length }}</strong></div>
+              <div><span class="muted">执行微信</span><strong>{{ assignMode === 'all' ? selectedExecutors.length : new Set(plannedPairs.map((p) => p.instanceId)).size }}</strong></div>
+              <div><span class="muted">预计任务</span><strong>{{ plannedTaskCount }}</strong></div>
+            </div>
+            <p class="tip" style="margin-top:8px">
+              <template v-if="assignMode === 'all'">
+                {{ executableSelected.length }} 个群 × {{ selectedExecutors.length }} 个微信 = {{ plannedTaskCount }} 条执行任务
+              </template>
+              <template v-else>
+                手动分配合计 {{ plannedTaskCount }} 条执行任务
+              </template>
+            </p>
+            <el-button link type="primary" @click="assignPreviewOpen = !assignPreviewOpen">{{ assignPreviewOpen ? '收起任务分配' : '查看任务分配' }}</el-button>
+            <div v-if="assignPreviewOpen" class="workload-list">
+              <div v-for="row in accountWorkload" :key="row.id" class="workload-row">
+                <div>{{ row.label }}</div>
+                <div class="muted tiny">分配 {{ row.assigned }} 个群 · 本轮最多执行 {{ row.capped }}（每账号上限 {{ row.limit || '—' }}）</div>
+              </div>
+              <div v-if="!accountWorkload.length" class="muted tiny">暂无分配</div>
+            </div>
+          </div>
+
+          <h3 class="section-title" style="margin-top:4px">进群设置</h3>
           <div>
             <label>进群申请文案</label>
-            <el-input v-model="applyText" type="textarea" :rows="4" placeholder="需群主确认的群必须填写；留空则使用默认「你好，想加入群聊」" />
+            <el-input v-model="applyText" type="textarea" :rows="3" placeholder="需群主确认的群必须填写；留空则使用默认「你好，想加入群聊」" />
             <el-button style="margin-top: 8px" size="small" @click="applyText += '{昵称}'">插入变量</el-button>
             <p class="tip muted">开启「群聊邀请确认」的群会把这段文字作为申请理由提交；群主同意后才会真正进群。</p>
           </div>
           <div>
-            <label>随机间隔（秒）</label>
-            <div class="muted">使用系统设置中的全局随机间隔</div>
+            <label>执行间隔（毫秒）</label>
+            <div class="muted">在任务中心确认执行时单独设置，单位毫秒</div>
           </div>
           <div class="switch-row">
             <span>遇到个人码自动跳过（推荐）</span>
@@ -693,13 +1045,56 @@ onBeforeUnmount(() => {
           <div>
             <label>已经频繁冷却（分钟）</label>
             <el-input-number v-model="coolMinutes" :min="1" controls-position="right" style="width: 100%" />
+            <p class="tip muted">仅影响触发频繁的那个执行微信，其他执行微信继续跑。</p>
+          </div>
+          <div class="create-summary muted">
+            本次将创建：{{ executableSelected.length }} 个群 ×
+            {{ assignMode === 'all' ? selectedExecutors.length : new Set(plannedPairs.map((p) => p.instanceId)).size }}
+            个微信 = <b>{{ plannedTaskCount }}</b> 条任务
           </div>
           <div class="toolbar-left">
-            <el-button type="primary" :loading="creating" :disabled="!selected.some((item) => isExecutableQr(item))" @click="createScanTask()">创建识别与进群任务</el-button>
+            <el-button
+              type="primary"
+              :loading="creating"
+              :disabled="!executableSelected.length || plannedTaskCount <= 0"
+              @click="createScanTask()"
+            >创建识别与进群任务 · {{ plannedTaskCount }}</el-button>
           </div>
         </div>
       </aside>
     </div>
+
+    <el-dialog v-model="manualPickVisible" title="为该群选择执行微信" width="420px" append-to-body>
+      <el-checkbox-group v-model="manualPickIds">
+        <div v-for="inst in instances.filter((item) => item.status === 'ONLINE')" :key="inst.id" style="margin-bottom:8px">
+          <el-checkbox :value="inst.id">{{ instanceLabel(inst) }}（{{ inst.alias || inst.accountWxid || 'wxid' }}）</el-checkbox>
+        </div>
+      </el-checkbox-group>
+      <template #footer>
+        <el-button @click="manualPickVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveManualPick">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="batchAssignVisible" title="给已选群分配执行微信" width="460px" append-to-body>
+      <p class="muted">当前选择：{{ batchAssignIds.length }} 个群</p>
+      <div style="margin:12px 0">
+        <label>分配方式</label>
+        <el-radio-group v-model="batchAssignMode" style="display:flex;flex-direction:column;gap:6px;margin-top:6px">
+          <el-radio value="add">添加到现有执行微信</el-radio>
+          <el-radio value="replace">替换现有执行微信</el-radio>
+        </el-radio-group>
+      </div>
+      <el-checkbox-group v-model="batchDialogExecutorIds">
+        <div v-for="inst in instances.filter((item) => item.status === 'ONLINE')" :key="inst.id" style="margin-bottom:8px">
+          <el-checkbox :value="inst.id">{{ instanceLabel(inst) }}（{{ inst.alias || inst.accountWxid || 'wxid' }}）</el-checkbox>
+        </div>
+      </el-checkbox-group>
+      <template #footer>
+        <el-button @click="batchAssignVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmBatchAssign">确认分配</el-button>
+      </template>
+    </el-dialog>
 
     <div class="bottom-bar">
       <div class="toolbar-left">
@@ -725,12 +1120,180 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
+.config-panel.panel-scroll {
+  overflow: auto !important;
+  max-height: min(78vh, 920px);
+  align-self: start;
+}
+
 .mid-split {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+  grid-template-columns: minmax(0, 1fr) minmax(340px, 420px);
   gap: var(--app-gap);
   min-width: 0;
   min-height: 320px;
+  align-items: start;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.resource-stats,
+.tiny-stats {
+  font-size: 12px;
+}
+
+.info-hint {
+  cursor: help;
+  color: var(--app-text-secondary);
+  font-size: 13px;
+}
+
+.source-label {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.assign-mode {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.executor-list {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--app-border, #e5e7eb);
+  border-radius: 6px;
+  padding: 6px;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+}
+
+@media (min-width: 1600px) {
+  .executor-list {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.executor-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.executor-row:hover {
+  background: #f8fafc;
+}
+
+.executor-row.selected {
+  background: #eef7f6;
+}
+
+.executor-row.offline {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.executor-meta {
+  min-width: 0;
+  flex: 1;
+}
+
+.executor-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.tiny {
+  font-size: 12px;
+}
+
+.badge-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  flex-wrap: wrap;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #94a3b8;
+}
+
+.dot.ok { background: #16a34a; }
+.dot.off { background: #94a3b8; }
+
+.tag-mini {
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.tag-mini.ok {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.tag-mini.off {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.preview-box {
+  border: 1px solid var(--app-border, #e5e7eb);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #fafafa;
+}
+
+.preview-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.preview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.preview-grid strong {
+  display: block;
+  font-size: 18px;
+  margin-top: 2px;
+}
+
+.workload-list {
+  margin-top: 8px;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.workload-row {
+  padding: 6px 0;
+  border-bottom: 1px solid #eee;
+  font-size: 12px;
+}
+
+.create-summary {
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .overview-grid {

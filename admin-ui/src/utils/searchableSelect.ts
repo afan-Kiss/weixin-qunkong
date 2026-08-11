@@ -1,14 +1,14 @@
 import { onBeforeUnmount, ref, type Ref } from 'vue'
 
-/** 无搜索词时最多渲染条数（保证已选项始终可见） */
+/** 无搜索词时最多渲染条数（未选项；已选项始终全量保留） */
 export const SELECT_OPTION_LIMIT_IDLE = 80
 /** 有搜索词时最多渲染匹配条数 */
 export const SELECT_OPTION_LIMIT_SEARCH = 120
-/** 已选项在下拉里最多渲染条数；全选 150+ 时避免 DOM 爆炸（标签文案由页面 labelMap 兜底） */
-export const SELECTED_OPTION_RENDER_CAP = 24
 
 /**
- * 可搜索下拉：按输入过滤选项，并限制渲染数量，避免群列表过大时打开下拉卡顿。
+ * 可搜索下拉：按输入过滤选项，并限制「未选」渲染数量，避免群列表过大时打开下拉卡顿。
+ * 已选项必须全部出现在返回列表里：Element Plus 多选在 options 变动时会丢掉没有 el-option 的值，
+ * 截断已选项会导致「全选后出现新群 → 原勾选被清空」。
  * @param options 全部选项（需含 label / value）
  * @param query 用户输入的搜索词
  * @param selectedValues 当前已选值（保证已选项始终在列表里，标签能显示名称）
@@ -29,13 +29,9 @@ export function filterSelectOptions<T extends { label: string; value: string }>(
       .filter(Boolean),
   )
   const maxRest = Math.max(Number(limit) || SELECT_OPTION_LIMIT_IDLE, 1)
-  let selectedItems: T[] = []
+  const selectedItems: T[] = []
   for (const item of list) {
     if (selected.has(String(item.value))) selectedItems.push(item)
-  }
-  // 无搜索且已选很多时，下拉只保留少量已选项，防止全选上百群卡死
-  if (!q && selectedItems.length > SELECTED_OPTION_RENDER_CAP) {
-    selectedItems = selectedItems.slice(0, SELECTED_OPTION_RENDER_CAP)
   }
   const rest: T[] = []
   for (const item of list) {

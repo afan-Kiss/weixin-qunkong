@@ -23,6 +23,7 @@ function validV4(value) {
  *   fetchProfile: (endpoint: string, body: Record<string, string>, sourceId: number, attempt: number) => Promise<{ parsed: { v3?: string, v4?: string } }>,
  *   delays?: number[],
  *   profileRetries?: number,
+ *   v4RetryDelays?: number[],
  * }} input
  */
 async function resolveFriendProfileCredentials(input = {}) {
@@ -31,6 +32,9 @@ async function resolveFriendProfileCredentials(input = {}) {
   const fetchProfile = input.fetchProfile
   const delays = Array.isArray(input.delays) && input.delays.length ? input.delays : [0, 400, 1000]
   const profileRetries = Math.max(Number(input.profileRetries) || 3, 1)
+  const v4RetryDelays = Array.isArray(input.v4RetryDelays) && input.v4RetryDelays.length
+    ? input.v4RetryDelays
+    : [1500, 3000]
   if (typeof fetchProfile !== 'function') {
     return { ok: false, v3: '', v4: '', missing: ['fetch'], credentialSource: '', reason: '缺少资料拉取函数' }
   }
@@ -40,16 +44,15 @@ async function resolveFriendProfileCredentials(input = {}) {
   let credentialSource = ''
   let attempt = 0
 
+  const pullGroupMember = async (body) => {
+    attempt += 1
+    return fetchProfile('/api/get_group_member_contact', body, 438557510, attempt)
+  }
+
   // 群成员接口：优先拿新鲜 V4（票会轮换，必须执行前现取）
   for (let index = 0; index < delays.length; index += 1) {
     if (delays[index]) await sleep(delays[index])
-    attempt += 1
-    const group = await fetchProfile(
-      '/api/get_group_member_contact',
-      { wxid: targetWxid, roomId: sourceRoomId },
-      438557510,
-      attempt,
-    )
+    const group = await pullGroupMember({ wxid: targetWxid, roomId: sourceRoomId })
     v3 = validV3(group?.parsed?.v3) || v3
     v4 = validV4(group?.parsed?.v4) || v4
     if (v3 && v4) {
@@ -81,6 +84,27 @@ async function resolveFriendProfileCredentials(input = {}) {
         if (!credentialSource) credentialSource = v4 ? 'GROUP_MEMBER_CONTACT+UPDATE_SINGLE_PROFILE' : 'UPDATE_SINGLE_PROFILE'
         else if (credentialSource === 'GROUP_MEMBER_CONTACT') credentialSource = 'GROUP_MEMBER_CONTACT+UPDATE_SINGLE_PROFILE'
         else if (!credentialSource.includes('UPDATE_SINGLE_PROFILE')) credentialSource = `${credentialSource}+UPDATE_SINGLE_PROFILE`
+        break
+      }
+    }
+  }
+
+  // 仍缺 V4：加长间隔再拉群成员（含 room_id 兼容字段），覆盖偶发空票
+  if (!v4 && sourceRoomId.endsWith('@chatroom')) {
+    const bodies = [
+      { wxid: targetWxid, roomId: sourceRoomId },
+      { wxid: targetWxid, room_id: sourceRoomId },
+      { userName: targetWxid, roomId: sourceRoomId },
+    ]
+    for (let index = 0; index < v4RetryDelays.length; index += 1) {
+      await sleep(v4RetryDelays[index])
+      const body = bodies[index % bodies.length]
+      const group = await pullGroupMember(body)
+      v4 = validV4(group?.parsed?.v4) || v4
+      v3 = validV3(group?.parsed?.v3) || v3
+      if (v4) {
+        if (!credentialSource) credentialSource = 'GROUP_MEMBER_CONTACT_RETRY'
+        else if (!credentialSource.includes('GROUP_MEMBER')) credentialSource = `${credentialSource}+GROUP_MEMBER_CONTACT_RETRY`
         break
       }
     }

@@ -11,7 +11,7 @@ import type { WechatInstance } from '../services/wechat'
 const router = useRouter()
 const settingsMenus = ['任务与频率', '连接设置', '文件位置']
 const logLevelChips = [{ label: '全部', value: '全部' }, { label: '普通', value: 'INFO' }, { label: '提醒', value: 'WARNING' }, { label: '错误', value: 'ERROR' }]
-const settingsForm = { intervalMin: 20, intervalMax: 40, httpPort: 19088, friendDailyLimit: 50, tcpPort: 61108, qrDir: '', weixinExe: '' }
+const settingsForm = { httpPort: 19088, friendDailyLimit: 50, tcpPort: 61108, qrDir: '', weixinExe: '' }
 
 const activeMenu = ref('任务与频率')
 const activeLogLevel = ref('全部')
@@ -19,11 +19,20 @@ const form = reactive({ ...settingsForm })
 const weixinVersion = ref('')
 const detectingWeixin = ref(false)
 const cleaningKickedGroups = ref(false)
+const cleanupInstanceId = ref('')
 const logKeyword = ref('')
 const logs = ref<Array<Record<string, unknown>>>([])
 const logInstances = ref<WechatInstance[]>([])
 const selectedInstance = ref('all')
 const timeRange = ref('1h')
+/** 在线微信：创建被踢群清理任务时必须指定其中之一（多开时避免扫全部） */
+const onlineInstances = computed(() =>
+  logInstances.value.filter((item) => String(item.status || '').toUpperCase() === 'ONLINE'),
+)
+function syncCleanupInstanceSelection() {
+  if (cleanupInstanceId.value && onlineInstances.value.some((item) => item.id === cleanupInstanceId.value)) return
+  cleanupInstanceId.value = onlineInstances.value[0]?.id || ''
+}
 const logLevelLabels: Record<string, string> = { INFO: '普通', WARNING: '提醒', ERROR: '错误' }
 const apiOperationLabels: Record<string, string> = {
   '/api/send_text_msg': '发送文字消息', '/api/send_image_msg': '发送图片消息', '/api/add_friend': '添加好友',
@@ -112,8 +121,6 @@ async function load() {
   if (settings?.general && typeof settings.general === 'object') {
     const general = settings.general as Record<string, unknown>
     // 只回填表单字段，避免把 weixinVersion 等展示字段写进保存载荷
-    form.intervalMin = Number(general.intervalMin) || form.intervalMin
-    form.intervalMax = Number(general.intervalMax) || form.intervalMax
     form.httpPort = Number(general.httpPort) || form.httpPort
     form.tcpPort = Number(general.tcpPort) || form.tcpPort
     form.friendDailyLimit = Number(general.friendDailyLimit) || form.friendDailyLimit
@@ -123,6 +130,7 @@ async function load() {
   }
   logs.value = rows as Array<Record<string, unknown>>
   logInstances.value = instances
+  syncCleanupInstanceSelection()
 }
 
 /**
@@ -177,16 +185,37 @@ async function clear() { await ElMessageBox.confirm('确定清空本机日志记
 
 /**
  * 扫描历史被踢并创建清理任务；真正退出在任务中心确认后按队列执行。
+ * 多开时必须先选中要清理的微信，只扫描该实例。
  */
 async function cleanupKickedGroups() {
+  syncCleanupInstanceSelection()
+  const instanceId = String(cleanupInstanceId.value || '').trim()
+  if (!instanceId) {
+    ElMessage.warning(onlineInstances.value.length ? '请选择要清理的微信' : '没有在线微信，请先登录后再清理')
+    return
+  }
+  const picked = onlineInstances.value.find((item) => item.id === instanceId)
+  const accountLabel = String(picked?.nickname || picked?.accountWxid || '所选微信').trim()
   await ElMessageBox.confirm(
-    '将先扫描本地事件与各群最近系统通知，把被踢群登记后创建清理任务。真正退出需到「任务中心」确认执行；执行时日志会显示每个群的成功或失败。',
+    `将只扫描「${accountLabel}」的本地事件与各群最近系统通知，把被踢群登记后创建清理任务。真正退出需到「任务中心」确认执行；执行时日志会显示每个群的成功或失败。`,
     '创建清理被踢群任务',
     { type: 'warning', confirmButtonText: '创建任务', cancelButtonText: '取消' },
   )
   cleaningKickedGroups.value = true
   try {
-    const result = await window.wxControl?.cleanupKickedGroups?.()
+    type CleanupResult = {
+      ok?: boolean
+      queued?: boolean
+      taskId?: string
+      pending?: number
+      message?: string
+    }
+    const result = await Promise.race([
+      window.wxControl?.cleanupKickedGroups?.({ instanceId }) as Promise<CleanupResult | undefined>,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('创建清理任务等待较久仍未返回。请稍后查看任务中心是否已生成；勿连续狂点创建。')), 610000)
+      }),
+    ])
     const message = String(result?.message || '已处理')
     if (result?.ok === false && result?.queued) {
       ElMessage.info(message)
@@ -229,24 +258,33 @@ onMounted(() => { load(); unsubscribe = window.wxControl?.onLog((entry) => logs.
       <section class="app-card form-card">
         <h3 class="section-title">{{ activeMenu }}</h3>
         <div v-if="activeMenu === '任务与频率'" class="form-grid">
-          <div class="form-item form-item--wide">
-            <label>随机间隔范围（秒）</label>
-            <div class="range-row">
-              <el-input-number v-model="form.intervalMin" :min="1" controls-position="right" />
-              <span>—</span>
-              <el-input-number v-model="form.intervalMax" :min="1" controls-position="right" />
-            </div>
-          </div>
           <div class="form-item">
             <label>添加好友每日上限（个）</label>
             <el-input-number v-model="form.friendDailyLimit" :min="1" controls-position="right" style="width: 100%" />
           </div>
           <div class="form-item form-item--wide">
+            <label>任务执行间隔</label>
+            <div class="form-note">已取消全局随机间隔。每个任务在「任务中心 → 确认执行」时单独填写间隔（单位：毫秒）。</div>
+          </div>
+          <div class="form-item form-item--wide">
             <label>被踢群清理</label>
             <div class="range-row">
-              <el-button type="warning" :loading="cleaningKickedGroups" @click="cleanupKickedGroups">创建清理任务</el-button>
+              <el-select
+                v-model="cleanupInstanceId"
+                placeholder="选择要清理的微信"
+                filterable
+                style="min-width: 220px; flex: 1"
+              >
+                <el-option
+                  v-for="item in onlineInstances"
+                  :key="item.id"
+                  :label="item.nickname || item.accountWxid || '待登录微信'"
+                  :value="item.id"
+                />
+              </el-select>
+              <el-button type="warning" :loading="cleaningKickedGroups" :disabled="!cleanupInstanceId" @click="cleanupKickedGroups">创建清理任务</el-button>
             </div>
-            <div class="form-note">点击后会先查本地事件与各群最近 10 条系统通知，把被踢群做成任务队列；再到「任务中心」确认执行。执行时按间隔逐个退出，日志会写明清理到哪个群、成功或失败。需微信在线。</div>
+            <div class="form-note">先选择要清理的微信（多开时只处理该号），再查本地事件与各群最近 10 条系统通知，把被踢群做成任务队列；再到「任务中心」确认执行。执行时按间隔逐个退出，日志会写明清理到哪个群、成功或失败。需微信在线。</div>
           </div>
         </div>
         <div v-else-if="activeMenu === '连接设置'" class="form-grid">

@@ -24,10 +24,12 @@ function normalizeTask(row: Record<string, unknown>): TaskView {
   const failed = Number(row.failed || 0)
   const skipped = Number(row.skipped || 0)
   const done = success + failed + skipped
+  const config = row.config && typeof row.config === 'object' ? row.config as Record<string, unknown> : {}
+  const intervalMs = Number(config.intervalMs)
   return {
     id: String(row.id), name: String(row.name), type: taskTypeLabel(row.type), typeCode: String(row.type), status: statusLabel(row.status), statusCode: String(row.status), total, success, failed, skipped,
     progress: total ? Math.round(done / total * 100) : 0, accounts: String(row.accountSummary || '微信资料读取中'), targets: `${total} 项`,
-    interval: '全局设置', createdAt: row.created_at ? new Date(String(row.created_at)).toLocaleString() : '-', remark: '',
+    interval: Number.isFinite(intervalMs) && intervalMs >= 0 ? `${Math.floor(intervalMs)} ms` : '-', createdAt: row.created_at ? new Date(String(row.created_at)).toLocaleString() : '-', remark: '',
   }
 }
 function typeMatches(row: TaskView) {
@@ -63,20 +65,15 @@ function taskItemTargetLabel(row: Record<string, unknown>) {
   if (label && !isJunkLabel(label)) {
     return label.replace(/[（(]\s*\d+\s*人\s*[）)]\s*$/, '').replace(/[（(]\s*人数未知\s*[）)].*$/, '').trim() || label
   }
-  let request: Record<string, unknown> = {}
+  const request = parseItemRequest(row)
   let response: Record<string, unknown> = {}
-  try {
-    request = typeof row.request_json === 'string' ? JSON.parse(row.request_json) as Record<string, unknown> : (row.request_json as Record<string, unknown>) || {}
-  } catch { /* ignore */ }
   try {
     response = typeof row.response_json === 'string' ? JSON.parse(row.response_json) as Record<string, unknown> : (row.response_json as Record<string, unknown>) || {}
   } catch { /* ignore */ }
   const preview = (response.preview && typeof response.preview === 'object')
     ? response.preview as Record<string, unknown>
     : {}
-  const roomName = String(
-    request.roomName || response.roomName || preview.roomName || '',
-  ).trim()
+  const roomName = String(request.roomName || response.roomName || preview.roomName || '').trim()
   if (roomName && !isJunkLabel(roomName)) return roomName
   const fromLabel = String(request.label || response.label || preview.label || '').trim()
   if (fromLabel && !isJunkLabel(fromLabel)) {
@@ -88,10 +85,34 @@ function taskItemTargetLabel(row: Record<string, unknown>) {
   const joined = err.match(/已进群[：:]\s*([^（(\n]+)/)
   if (joined?.[1] && !/未知群名|二维码/.test(joined[1])) return joined[1].trim()
   const key = String(row.target_key || '').trim()
-  if (key.endsWith('@chatroom')) return '未命名群聊'
+  const bareKey = key.includes('::') ? key.slice(key.indexOf('::') + 2) : key
+  if (bareKey.endsWith('@chatroom') || key.endsWith('@chatroom')) return '未命名群聊'
   if (String(row.action_type || '') === 'QR_SCAN') return '群邀请（未解析到群名）'
-  if (/^wxid_/i.test(key) || /^[0-9A-Fa-f]{32,}$/.test(key)) return '微信好友'
-  return key || '-'
+  if (/^wxid_/i.test(bareKey) || /^[0-9A-Fa-f]{32,}$/.test(bareKey)) return '微信好友'
+  return bareKey || key || '-'
+}
+
+function parseItemRequest(row: Record<string, unknown>) {
+  try {
+    return typeof row.request_json === 'string'
+      ? JSON.parse(row.request_json) as Record<string, unknown>
+      : (row.request_json as Record<string, unknown>) || {}
+  } catch {
+    return {}
+  }
+}
+
+function taskItemExecutorLabel(row: Record<string, unknown>) {
+  const id = String(row.instance_id || '')
+  const instance = taskInstances.value.find((item) => item.id === id)
+  return instance?.nickname || instance?.alias || instance?.accountWxid || (id ? id.slice(0, 8) : '-')
+}
+
+function taskItemSourceLabel(row: Record<string, unknown>) {
+  const request = parseItemRequest(row)
+  const source = String(request.sourceLabel || request.source || '').trim()
+  if (!source) return '-'
+  return source.split('·')[0]?.trim() || source
 }
 
 /**
@@ -99,15 +120,14 @@ function taskItemTargetLabel(row: Record<string, unknown>) {
  * @param row 明细行
  */
 async function revealTaskItemQrImage(row: Record<string, unknown>) {
-  let request: Record<string, unknown> = {}
-  try {
-    request = typeof row.request_json === 'string'
-      ? JSON.parse(row.request_json) as Record<string, unknown>
-      : (row.request_json as Record<string, unknown>) || {}
-  } catch { /* ignore */ }
+  const request = parseItemRequest(row)
   let target = String(request.path || request.localPath || '').trim()
   if (!target) {
-    const key = String(row.target_key || '').trim()
+    const key = String(request.qrSha || request.qrItemId || '').trim()
+      || (() => {
+        const raw = String(row.target_key || '').trim()
+        return raw.includes('::') ? raw.slice(raw.indexOf('::') + 2) : raw
+      })()
     if (key) {
       try {
         const items = (await window.wxControl?.listQrItems?.() ?? []) as Array<Record<string, unknown>>
@@ -161,10 +181,23 @@ function confirmCopy(typeCode: string) {
 async function confirmTask(id: string) {
   const row = rawTasks.value.find((item) => String(item.id) === id)
   const typeCode = String(row?.type || '')
+  const config = row?.config && typeof row.config === 'object' ? row.config as Record<string, unknown> : {}
+  const previousMs = Number(config.intervalMs)
+  const defaultMs = Number.isFinite(previousMs) && previousMs >= 0 ? String(Math.floor(previousMs)) : '1000'
   try {
     await ElMessageBox.confirm(confirmCopy(typeCode), '确认执行', { type: 'warning' })
-    await window.wxControl?.confirmTask(id)
-    ElMessage.success('任务已开始排队执行')
+    const { value } = await ElMessageBox.prompt('请填写本任务的执行间隔（毫秒）。两项之间等待该时长，填 0 表示不等待。', '设置执行间隔', {
+      inputValue: defaultMs,
+      inputPlaceholder: '例如 1000',
+      confirmButtonText: '开始执行',
+      cancelButtonText: '取消',
+      inputPattern: /^\d+$/,
+      inputErrorMessage: '请输入非负整数（单位：毫秒）',
+    })
+    const intervalMs = Number(value)
+    if (!Number.isInteger(intervalMs) || intervalMs < 0) throw new Error('执行间隔无效')
+    await window.wxControl?.confirmTask({ id, intervalMs })
+    ElMessage.success(`任务已开始排队执行（间隔 ${intervalMs} ms）`)
     await refresh()
   } catch (error) {
     if (error === 'cancel' || error === 'close') return
@@ -316,13 +349,21 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
             row-class-name="task-item-row"
             @row-dblclick="(row: Record<string, unknown>) => revealTaskItemQrImage(row)"
           >
-            <el-table-column label="目标" min-width="160" show-overflow-tooltip>
+            <el-table-column label="执行微信" width="120" show-overflow-tooltip>
+              <template #default="{ row }">{{ taskItemExecutorLabel(row) }}</template>
+            </el-table-column>
+            <el-table-column label="目标" min-width="140" show-overflow-tooltip>
               <template #default="{ row }">{{ taskItemTargetLabel(row) }}</template>
+            </el-table-column>
+            <el-table-column label="来源微信" width="120" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span class="source-muted">{{ taskItemSourceLabel(row) }}</span>
+              </template>
             </el-table-column>
             <el-table-column label="状态" width="120">
               <template #default="{ row }"><StatusTag :text="statusLabel(row.status)" /></template>
             </el-table-column>
-            <el-table-column prop="error" label="说明（含微信拒绝理由）" min-width="260" show-overflow-tooltip />
+            <el-table-column prop="error" label="说明（含微信拒绝理由）" min-width="220" show-overflow-tooltip />
           </el-table>
         </div>
       </DetailPanel>
@@ -347,6 +388,11 @@ onMounted(() => { refresh(); timer = setInterval(refresh, 3000) }); onBeforeUnmo
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 16px;
+}
+
+.source-muted {
+  color: #64748b;
+  font-size: 12px;
 }
 
 .account-title {

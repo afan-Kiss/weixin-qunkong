@@ -128,6 +128,10 @@ function initStorage(userDataPath) {
   } catch { /* 无历史数据时忽略 */ }
   db.prepare(`INSERT OR IGNORE INTO chat_add_rules(id,enabled,instance_id,room_ids_json,keywords_json,exclude_text,updated_at)
     VALUES(1,0,NULL,'[]','[]','',?)`).run(new Date().toISOString())
+  const chatAddRuleColumns = new Set(db.prepare('PRAGMA table_info(chat_add_rules)').all().map((column) => column.name))
+  if (!chatAddRuleColumns.has('account_wxid')) {
+    db.exec('ALTER TABLE chat_add_rules ADD COLUMN account_wxid TEXT')
+  }
   const instanceColumns = new Set(db.prepare('PRAGMA table_info(wechat_instances)').all().map((column) => column.name))
   if (!instanceColumns.has('managed')) db.exec('ALTER TABLE wechat_instances ADD COLUMN managed INTEGER NOT NULL DEFAULT 0')
   if (!instanceColumns.has('nickname')) db.exec('ALTER TABLE wechat_instances ADD COLUMN nickname TEXT')
@@ -352,9 +356,23 @@ function listMessageEventsForKickScan(filters = {}) {
   ).all(...params)
 }
 
+let messageEventWrites = 0
+
 function saveEvent(instanceId, event) {
   const newMsgId = event?.newMsgId ?? event?.new_msg_id ?? event?.msgId ?? null
   database().prepare('INSERT OR IGNORE INTO message_events(instance_id,new_msg_id,event_json,created_at) VALUES(?,?,?,?)').run(instanceId, newMsgId ? String(newMsgId) : null, JSON.stringify(event), new Date().toISOString())
+  // 每 200 次写入抽检裁剪，避免每条消息都 COUNT(*)
+  messageEventWrites += 1
+  if (messageEventWrites % 200 === 0) {
+    try {
+      const row = database().prepare('SELECT COUNT(*) AS c FROM message_events').get()
+      if (Number(row?.c || 0) > 30000) {
+        database().prepare(`DELETE FROM message_events WHERE id IN (
+          SELECT id FROM message_events ORDER BY id ASC LIMIT 5000
+        )`).run()
+      }
+    } catch { /* ignore prune errors */ }
+  }
   const joins = extractMemberJoins(event)
   if (!joins.length) return { joinRecorded: false, joinCount: 0 }
   for (const join of joins) {
@@ -551,10 +569,40 @@ function getTaskItems(taskId) {
     targetLabel: String(row.target_label || ''),
   }))
 }
-function setTaskStatus(taskId, status) { database().prepare('UPDATE tasks SET status=?,updated_at=? WHERE id=?').run(status, new Date().toISOString(), taskId) }
+function setTaskStatus(taskId, status) {
+  const id = String(taskId || '')
+  const next = String(status || '')
+  if (!id || !next) return false
+  // 已取消为终态：禁止被 RUNNING/COMPLETED 等覆盖（取消与执行循环竞态时尤其关键）
+  if (next !== 'CANCELLED') {
+    const row = database().prepare('SELECT status FROM tasks WHERE id=?').get(id)
+    if (row && String(row.status || '') === 'CANCELLED') return false
+  }
+  database().prepare('UPDATE tasks SET status=?,updated_at=? WHERE id=?').run(next, new Date().toISOString(), id)
+  return true
+}
 
 /**
- * 取消任务。
+ * 合并写入任务 config_json（确认执行时写入 intervalMs 等）。
+ * @param {string} taskId
+ * @param {Record<string, unknown>} patch
+ */
+function patchTaskConfig(taskId, patch) {
+  const id = String(taskId || '').trim()
+  if (!id || !patch || typeof patch !== 'object') return false
+  const row = database().prepare('SELECT config_json AS configJson FROM tasks WHERE id=?').get(id)
+  if (!row) return false
+  let config = {}
+  try { config = JSON.parse(String(row.configJson || '{}')) || {} } catch { config = {} }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) config = {}
+  const next = { ...config, ...patch }
+  database().prepare('UPDATE tasks SET config_json=?,updated_at=? WHERE id=?')
+    .run(JSON.stringify(next), new Date().toISOString(), id)
+  return true
+}
+
+/**
+ * 取消任务：任务标 CANCELLED，并终止尚未开始的明细（执行中单项仍可能跑完当前 API）。
  * @param {string} taskId 任务 ID
  * @returns {{ released: number }}
  */
@@ -562,7 +610,23 @@ function cancelTask(taskId) {
   const id = String(taskId || '')
   if (!id) return { released: 0 }
   setTaskStatus(id, 'CANCELLED')
-  return { released: 0 }
+  const now = new Date().toISOString()
+  const result = database().prepare(`
+    UPDATE task_items
+    SET status='CANCELLED',
+        error=COALESCE(NULLIF(error,''),'任务已取消'),
+        finished_at=COALESCE(finished_at, ?)
+    WHERE task_id=? AND status IN ('QUEUED','PROFILE_PENDING','CREDENTIALS_READY')
+  `).run(now, id)
+  const row = database().prepare(`
+    SELECT SUM(status IN ('COMPLETED','SUBMITTED','REQUEST_SENT')) success,
+           SUM(status IN ('FAILED','FREQUENT','RESOLUTION_FAILED')) failed,
+           SUM(status IN ('SKIPPED','CANCELLED')) skipped
+    FROM task_items WHERE task_id=?
+  `).get(id)
+  database().prepare('UPDATE tasks SET success=?,failed=?,skipped=?,updated_at=? WHERE id=?')
+    .run(Number(row?.success || 0), Number(row?.failed || 0), Number(row?.skipped || 0), now, id)
+  return { released: Number(result.changes || 0) }
 }
 function setTaskItemStatus(id, status) { database().prepare('UPDATE task_items SET status=? WHERE id=?').run(String(status), String(id)) }
 /**
@@ -584,8 +648,8 @@ function patchTaskItemRequest(id, patch) {
 function setTaskItemStarted(id) { database().prepare("UPDATE task_items SET status='RUNNING',started_at=? WHERE id=? AND status IN ('QUEUED','PROFILE_PENDING','CREDENTIALS_READY')").run(new Date().toISOString(), id) }
 function setTaskItemResult(id, status, response, error) {
   database().prepare('UPDATE task_items SET status=?,response_json=?,error=?,finished_at=? WHERE id=?').run(status, JSON.stringify(response ?? null), error ?? null, new Date().toISOString(), id)
-  // FREQUENT 不计 success，避免“已经频繁”被当成已添加
-  const row = database().prepare(`SELECT SUM(status IN ('COMPLETED','SUBMITTED','REQUEST_SENT')) success,SUM(status IN ('FAILED','FREQUENT','RESOLUTION_FAILED')) failed,SUM(status='SKIPPED') skipped FROM task_items WHERE task_id=(SELECT task_id FROM task_items WHERE id=?)`).get(id)
+  // FREQUENT 不计 success；CANCELLED 计入 skipped，避免取消后进度对不上
+  const row = database().prepare(`SELECT SUM(status IN ('COMPLETED','SUBMITTED','REQUEST_SENT')) success,SUM(status IN ('FAILED','FREQUENT','RESOLUTION_FAILED')) failed,SUM(status IN ('SKIPPED','CANCELLED')) skipped FROM task_items WHERE task_id=(SELECT task_id FROM task_items WHERE id=?)`).get(id)
   database().prepare('UPDATE tasks SET success=?,failed=?,skipped=?,updated_at=? WHERE id=(SELECT task_id FROM task_items WHERE id=?)').run(Number(row.success), Number(row.failed), Number(row.skipped), new Date().toISOString(), id)
 }
 
@@ -742,6 +806,33 @@ function loadBlockedRoomIdSetForInstance(instanceId) {
 }
 
 /**
+ * 目录/群聊加好友不应再加载的群：永久屏蔽 ∪ 已清理(DONE) ∪ 强证据待清理(系统踢人 PENDING)。
+ * 弱证据（退群回调）PENDING 不排除，避免误判把仍在群里的会话藏掉。
+ * @param {string} instanceId
+ * @returns {Set<string>}
+ */
+function loadDirectoryExcludedRoomIdSetForInstance(instanceId) {
+  const id = String(instanceId || '').trim()
+  const excluded = loadBlockedRoomIdSetForInstance(id)
+  if (!id) return excluded
+  const account = resolveInstanceAccountWxid(id)
+  const rows = database().prepare(`
+    SELECT room_id AS roomId FROM kicked_group_cleanup
+    WHERE (instance_id=? OR (?!='' AND account_wxid=?))
+      AND (
+        status='DONE'
+        OR (status='PENDING' AND evidence='SYSTEM_MSG_SELF_KICKED')
+        OR (status='PENDING' AND evidence='LEAVE_CALLBACK_SELF' AND COALESCE(confirm_count,0) >= 1)
+      )
+  `).all(id, account, account)
+  for (const row of rows) {
+    const roomId = String(row.roomId || '')
+    if (roomId.endsWith('@chatroom')) excluded.add(roomId)
+  }
+  return excluded
+}
+
+/**
  * @param {{ accountWxid?: string }} [filters]
  */
 function listBlockedChatrooms(filters = {}) {
@@ -759,7 +850,7 @@ function listBlockedChatrooms(filters = {}) {
 function hasDirectoryOwnership(instanceId, targetId, isGroup) {
   if (isGroup) {
     if (!database().prepare('SELECT 1 FROM chatrooms WHERE source_instance_id=? AND room_id=?').get(instanceId, targetId)) return false
-    if (isChatroomBlockedForInstance(instanceId, targetId)) return false
+    if (loadDirectoryExcludedRoomIdSetForInstance(instanceId).has(String(targetId || ''))) return false
     return true
   }
   return Boolean(database().prepare('SELECT 1 FROM contacts WHERE source_instance_id=? AND wxid=? AND is_group=0').get(instanceId, targetId))
@@ -775,7 +866,7 @@ function loadDirectoryOwnershipSet(instanceId, isGroup) {
   const key = String(instanceId || '')
   if (!key) return new Set()
   if (isGroup) {
-    const blocked = loadBlockedRoomIdSetForInstance(key)
+    const blocked = loadDirectoryExcludedRoomIdSetForInstance(key)
     const rows = database().prepare('SELECT room_id AS id FROM chatrooms WHERE source_instance_id=?').all(key)
     return new Set(rows.map((row) => String(row.id || '')).filter((id) => id && !blocked.has(id)))
   }
@@ -794,7 +885,7 @@ function syncDirectorySnapshot(payload) {
   const blockedByInstance = new Map()
   const blockedFor = (instanceId) => {
     const key = String(instanceId || '')
-    if (!blockedByInstance.has(key)) blockedByInstance.set(key, loadBlockedRoomIdSetForInstance(key))
+    if (!blockedByInstance.has(key)) blockedByInstance.set(key, loadDirectoryExcludedRoomIdSetForInstance(key))
     return blockedByInstance.get(key)
   }
   const now = new Date().toISOString()
@@ -1043,14 +1134,14 @@ function classifyStoredQr(text) {
 
 /**
  * 读取群聊发言加好友监听规则（单行全局规则）。
- * @returns {{ enabled: boolean, instanceId: string, roomIds: string[], keywords: string[], excludeText: string, updatedAt: string }}
+ * @returns {{ enabled: boolean, instanceId: string, accountWxid: string, roomIds: string[], keywords: string[], excludeText: string, updatedAt: string }}
  */
 function getChatAddRule() {
-  const row = database().prepare(`SELECT enabled, instance_id AS instanceId, room_ids_json AS roomIdsJson,
-      keywords_json AS keywordsJson, exclude_text AS excludeText, updated_at AS updatedAt
+  const row = database().prepare(`SELECT enabled, instance_id AS instanceId, account_wxid AS accountWxid,
+      room_ids_json AS roomIdsJson, keywords_json AS keywordsJson, exclude_text AS excludeText, updated_at AS updatedAt
     FROM chat_add_rules WHERE id=1`).get()
   if (!row) {
-    return { enabled: false, instanceId: '', roomIds: [], keywords: [], excludeText: '', updatedAt: '' }
+    return { enabled: false, instanceId: '', accountWxid: '', roomIds: [], keywords: [], excludeText: '', updatedAt: '' }
   }
   let roomIds = []
   let keywords = []
@@ -1059,6 +1150,7 @@ function getChatAddRule() {
   return {
     enabled: Boolean(row.enabled),
     instanceId: String(row.instanceId || ''),
+    accountWxid: String(row.accountWxid || ''),
     roomIds: Array.isArray(roomIds) ? roomIds.map(String).filter(Boolean) : [],
     keywords: Array.isArray(keywords) ? keywords.map(String).filter(Boolean) : [],
     excludeText: String(row.excludeText || ''),
@@ -1068,7 +1160,7 @@ function getChatAddRule() {
 
 /**
  * 保存群聊发言加好友监听规则。
- * @param {{ enabled?: boolean, instanceId?: string, roomIds?: string[], keywords?: string[]|string, excludeText?: string }} rule
+ * @param {{ enabled?: boolean, instanceId?: string, accountWxid?: string, roomIds?: string[], keywords?: string[]|string, excludeText?: string }} rule
  * @returns {ReturnType<typeof getChatAddRule>}
  */
 function saveChatAddRule(rule = {}) {
@@ -1079,13 +1171,18 @@ function saveChatAddRule(rule = {}) {
     keywords = String(rule.keywords || '').split(/[\r\n,，]+/).map((item) => item.trim()).filter(Boolean)
   }
   const excludeText = String(rule.excludeText ?? '')
+  const previous = getChatAddRule()
+  const incomingWxid = String(rule.accountWxid || '').trim()
+  // 空 wxid 不覆盖已有锚点（探测未完成时的草稿保存）
+  const accountWxid = incomingWxid || previous.accountWxid || null
   const now = new Date().toISOString()
-  database().prepare(`INSERT INTO chat_add_rules(id,enabled,instance_id,room_ids_json,keywords_json,exclude_text,updated_at)
-    VALUES(1,?,?,?,?,?,?)
+  database().prepare(`INSERT INTO chat_add_rules(id,enabled,instance_id,account_wxid,room_ids_json,keywords_json,exclude_text,updated_at)
+    VALUES(1,?,?,?,?,?,?,?)
     ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,instance_id=excluded.instance_id,
+      account_wxid=excluded.account_wxid,
       room_ids_json=excluded.room_ids_json,keywords_json=excluded.keywords_json,
       exclude_text=excluded.exclude_text,updated_at=excluded.updated_at`)
-    .run(rule.enabled ? 1 : 0, String(rule.instanceId || '') || null, JSON.stringify(roomIds), JSON.stringify(keywords), excludeText, now)
+    .run(rule.enabled ? 1 : 0, String(rule.instanceId || '') || null, accountWxid || null, JSON.stringify(roomIds), JSON.stringify(keywords), excludeText, now)
   return getChatAddRule()
 }
 
@@ -1442,11 +1539,11 @@ function listOwnedChatrooms(instanceId) {
 module.exports = {
   initStorage, database, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts,
   saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, recordMemberJoin, listMemberJoins, listFriendAddStatuses,
-  createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, recoverInterruptedTasks,
+  createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks,
   repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, hasDeliveredContent, recordDeliveredContent,
   hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType,
   getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates,
   upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms,
-  markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, listBlockedChatrooms,
+  markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, loadDirectoryExcludedRoomIdSetForInstance, listBlockedChatrooms,
   hasQrContentHash, isHighPrioritySyncLog, isNoisySyncLog, selectLogsForRemoteSync, listTaskItemDiagnostics, formatLogForRemoteSync,
 }

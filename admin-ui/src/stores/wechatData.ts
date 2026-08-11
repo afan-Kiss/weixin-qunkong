@@ -58,9 +58,26 @@ export function applyBlockedRoomRemoved(payload: { instanceId?: string; roomId?:
 }
 
 let stopBlockedListener: (() => void) | undefined
+let directoryRestoreTimer: ReturnType<typeof setTimeout> | undefined
+const directoryRestorePending = new Set<string>()
+
 export function ensureBlockedDirectoryListener() {
   if (stopBlockedListener || typeof window === 'undefined') return
   stopBlockedListener = window.wxControl?.onBlockedDirectoryChanged?.((payload) => {
+    const action = String((payload as { action?: string })?.action || 'exclude')
+    const instanceId = String(payload?.instanceId || '')
+    if (action === 'restore') {
+      if (!instanceId) return
+      directoryRestorePending.add(instanceId)
+      if (directoryRestoreTimer) clearTimeout(directoryRestoreTimer)
+      directoryRestoreTimer = setTimeout(() => {
+        const ids = [...directoryRestorePending]
+        directoryRestorePending.clear()
+        directoryRestoreTimer = undefined
+        for (const id of ids) void refreshDirectory([id], { force: true }).catch(() => { /* ignore */ })
+      }, 300)
+      return
+    }
     applyBlockedRoomRemoved(payload)
   })
 }

@@ -15,8 +15,8 @@ declare global {
       listEvents: (id: string) => Promise<Array<{ time: string; data: unknown }>>
       listMemberJoins: (filters?: { instanceIds?: string[]; roomIds?: string[]; limit?: number; sinceHours?: number }) => Promise<Array<{ id: number; instanceId: string; roomId: string; wxid: string; nickname: string; avatar: string; inviter: string; source: string; joinAt: string }>>
       listFriendAddStatuses: (targetKeys: string[]) => Promise<Record<string, { status: string; error: string; taskStatus: string; updatedAt: string }>>
-      getChatAddRule: () => Promise<{ enabled: boolean; instanceId: string; roomIds: string[]; keywords: string[]; excludeText: string; updatedAt: string }>
-      saveChatAddRule: (rule: unknown) => Promise<{ enabled: boolean; instanceId: string; roomIds: string[]; keywords: string[]; excludeText: string; updatedAt: string }>
+      getChatAddRule: () => Promise<{ enabled: boolean; instanceId: string; accountWxid?: string; roomIds: string[]; keywords: string[]; excludeText: string; updatedAt: string }>
+      saveChatAddRule: (rule: unknown) => Promise<{ enabled: boolean; instanceId: string; accountWxid?: string; roomIds: string[]; keywords: string[]; excludeText: string; updatedAt: string }>
       listChatAddCandidates: (filters?: { status?: string; instanceId?: string; roomIds?: string[]; since?: string; limit?: number }) => Promise<Array<{ id: number; instanceId: string; roomId: string; senderWxid: string; nickname: string; messagePreview: string; matchedKeyword: string; status: string; createdAt: string }>>
       clearChatAddCandidates: (filters?: { status?: string }) => Promise<number>
       markChatAddCandidatesTasked: (ids: number[]) => Promise<number>
@@ -26,7 +26,7 @@ declare global {
       listTasks: () => Promise<unknown[]>
       taskItems: (id: string) => Promise<unknown[]>
       createTask: (payload: unknown) => Promise<unknown>
-      confirmTask: (id: string) => Promise<boolean>
+      confirmTask: (payload: string | { id: string; intervalMs: number }) => Promise<boolean>
       pauseTask: (id: string) => Promise<boolean>
       resumeTask: (id: string) => Promise<boolean>
       cancelTask: (id: string) => Promise<boolean>
@@ -38,7 +38,7 @@ declare global {
       syncDirectory: (payload: unknown) => Promise<boolean>
       listBlockedChatrooms: () => Promise<Array<{ accountWxid: string; roomId: string; roomName: string; reason: string; evidence: string; sourceInstanceId: string; createdAt: string; updatedAt: string }>>
       listBlockedRoomIds: (instanceIds: string[]) => Promise<Record<string, string[]>>
-      onBlockedDirectoryChanged: (listener: (payload: { instanceId: string; roomId: string; roomName?: string }) => void) => () => void
+      onBlockedDirectoryChanged: (listener: (payload: { instanceId: string; roomId: string; roomName?: string; action?: 'exclude' | 'restore' }) => void) => () => void
       listQrItems: () => Promise<unknown[]>
       importQrFiles: () => Promise<unknown[]>
       importQrLinks: (text: string) => Promise<unknown[]>
@@ -59,15 +59,17 @@ declare global {
       revealInFolder: (targetPath: string) => Promise<{ ok: boolean; message?: string }>
       selectWeixinExecutable: (defaultPath?: string) => Promise<string>
       detectWeixinInstall: () => Promise<{ exePath: string; version: string; source: string; candidates: Array<{ exePath: string; version: string; source: string }> }>
-      cleanupKickedGroups: () => Promise<{
+      cleanupKickedGroups: (payload?: { instanceId?: string }) => Promise<{
         ok: boolean
         queued?: boolean
         taskId?: string
+        instanceId?: string
         online?: number
         rebound?: number
         pending?: number
         historyDiscovered?: number
         cleaned?: number
+        skippedActive?: number
         message?: string
       }>
       checkClientUpdate: () => Promise<{

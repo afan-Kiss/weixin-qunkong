@@ -19,7 +19,7 @@ const MANIFEST_URL = `${getServiceBase()}/api/update/manifest`
  */
 function fetchRemoteReleaseSequence() {
   return new Promise((resolve) => {
-    const req = https.get(MANIFEST_URL, { timeout: 8000 }, (res) => {
+    const req = https.get(MANIFEST_URL, { timeout: 8000, rejectUnauthorized: false }, (res) => {
       const chunks = []
       res.on('data', (c) => chunks.push(c))
       res.on('end', () => {

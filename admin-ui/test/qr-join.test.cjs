@@ -11,6 +11,7 @@ const {
   evaluateEnterRoomResult,
   formatInvitePreviewLine,
   findRoomId,
+  findAlreadyJoinedRoom,
   isJoinApplicationRequired,
   isJoinApplicationPending,
 } = require('../electron/qr-join.cjs')
@@ -138,6 +139,23 @@ test('evaluateEnterRoomResult rejects empty errCode=1 success', () => {
   assert.match(neg.reason, /错误码/)
 })
 
+test('findAlreadyJoinedRoom matches by roomId or exact room name', () => {
+  const rooms = [
+    { roomId: '111@chatroom', name: '蓝天合击' },
+    { roomId: '222@chatroom', name: '暗影之怒无充值交流' },
+  ]
+  const byId = findAlreadyJoinedRoom(rooms, { roomId: '111@chatroom', roomName: '' })
+  assert.equal(byId?.roomId, '111@chatroom')
+  assert.match(byId?.reason || '', /已在该群中/)
+
+  const byName = findAlreadyJoinedRoom(rooms, { roomId: '', roomName: '暗影之怒无充值交流' })
+  assert.equal(byName?.roomId, '222@chatroom')
+  assert.match(byName?.reason || '', /按群名确认/)
+
+  assert.equal(findAlreadyJoinedRoom(rooms, { roomId: '', roomName: '不存在的群' }), null)
+  assert.equal(findAlreadyJoinedRoom(rooms, { roomId: '', roomName: '暗影' }), null)
+})
+
 test('confirmJoinedFromRoomList only accepts target room newly appearing', () => {
   const { confirmJoinedFromRoomList } = require('../electron/qr-join.cjs')
   const before = new Set(['111@chatroom'])
@@ -157,17 +175,92 @@ test('confirmJoinedFromRoomList only accepts target room newly appearing', () =>
   assert.equal(shortOk.status, 'JOINED')
   assert.equal(shortOk.roomId, '444@chatroom')
 
-  // 短链无群标识：新增多群 → 仍拒绝
+  // 短链无群标识：新增多群 → 轮询中继续等待（终态由 verifyJoinedRoom finalize 判 MISSING_TARGET）
   const shortAmbiguous = confirmJoinedFromRoomList(before, new Set(['111@chatroom', '333@chatroom', '444@chatroom']), '')
-  assert.equal(shortAmbiguous.status, 'MISSING_TARGET')
+  assert.equal(shortAmbiguous.status, 'NOT_YET')
+
+  // 短链无群标识：新增多群但群名唯一命中 → 可确认
+  const byName = confirmJoinedFromRoomList(
+    before,
+    new Set(['111@chatroom', '333@chatroom', '444@chatroom']),
+    '',
+    {
+      expectedRoomName: '目标测试群',
+      roomNameById: new Map([
+        ['333@chatroom', '其他群'],
+        ['444@chatroom', '目标测试群'],
+      ]),
+    },
+  )
+  assert.equal(byName.status, 'JOINED')
+  assert.equal(byName.roomId, '444@chatroom')
+
+  // 短名不得靠「期望名包含短名」误命中
+  const shortNameTrap = confirmJoinedFromRoomList(
+    before,
+    new Set(['111@chatroom', '333@chatroom', '444@chatroom']),
+    '',
+    {
+      expectedRoomName: '创创网络15·交流群',
+      roomNameById: new Map([
+        ['333@chatroom', '创创'],
+        ['444@chatroom', '别的群'],
+      ]),
+    },
+  )
+  assert.equal(shortNameTrap.status, 'NOT_YET')
 
   const shortPending = confirmJoinedFromRoomList(before, new Set(['111@chatroom']), '')
   assert.equal(shortPending.status, 'NOT_YET')
 })
 
+test('invite URL helpers detect short/expanded links and roomId in query', () => {
+  const {
+    isExpandedInviteUrl,
+    isShortGroupInviteUrl,
+    findRoomIdInUrl,
+    scoreInvitePreviewCandidate,
+    hasReliableJoinTarget,
+  } = require('../electron/qr-join.cjs')
+  assert.equal(isShortGroupInviteUrl('https://weixin.qq.com/g/AQYAA-short'), true)
+  assert.equal(isExpandedInviteUrl('https://weixin.qq.com/g/AQYAA-short'), false)
+  assert.equal(
+    isExpandedInviteUrl('https://support.weixin.qq.com/cgi-bin/mmsupport-bin/addchatroombyinvite?ticket=abc'),
+    true,
+  )
+  assert.equal(
+    isExpandedInviteUrl('https://support.weixin.qq.com/cgi-bin/mmsupport-bin/addchatroombyqrcode?uuids=abc'),
+    true,
+  )
+  assert.equal(
+    findRoomIdInUrl('https://support.weixin.qq.com/cgi-bin/mmsupport-bin/addchatroombyinvite?username=50442591080@chatroom'),
+    '50442591080@chatroom',
+  )
+  const shortPreview = { roomId: '', roomName: '', memberCount: 0, fullUrl: 'https://weixin.qq.com/g/x' }
+  const fullPreview = {
+    roomId: '50442591080@chatroom',
+    roomName: '测试群',
+    memberCount: 10,
+    fullUrl: 'https://support.weixin.qq.com/cgi-bin/mmsupport-bin/addchatroombyinvite?ticket=1',
+  }
+  assert.equal(hasReliableJoinTarget(shortPreview), false)
+  assert.equal(hasReliableJoinTarget(fullPreview), true)
+  assert.ok(
+    scoreInvitePreviewCandidate(fullPreview, { data: { FullURL: fullPreview.fullUrl } })
+      > scoreInvitePreviewCandidate(shortPreview, {}),
+  )
+})
+
 test('findRoomId finds nested chatroom ids', () => {
   assert.equal(findRoomId({ data: { userName: '999@chatroom' } }), '999@chatroom')
   assert.equal(findRoomId({ msg: 'no room here' }), '')
+  const { findRoomIdInUrl, parseInvitePreview } = require('../electron/qr-join.cjs')
+  const fromUrl = parseInvitePreview(
+    { data: { FullURL: 'https://support.weixin.qq.com/cgi-bin/mmsupport-bin/addchatroombyinvite?username=88888@chatroom&ticket=t' } },
+    'https://weixin.qq.com/g/x',
+  )
+  assert.equal(fromUrl.roomId, '88888@chatroom')
+  assert.equal(findRoomIdInUrl(fromUrl.fullUrl), '88888@chatroom')
 })
 
 test('download-gate invite page is ignored', () => {
@@ -185,10 +278,14 @@ test('main uses Node http(s) for invite page so Cookie is kept', () => {
   assert.match(main, /Accept-Encoding/)
   assert.match(main, /require\('https'\)|require\("https"\)/)
   assert.match(main, /paramSets/)
-  assert.match(main, /a8keyResponseUseful/)
-  assert.match(main, /仅拿到 FullURL 不能提前结束/)
-  assert.match(main, /currentHeaders\.Cookie/)
+  assert.match(main, /scoreInvitePreviewCandidate/)
+  assert.match(main, /hasReliableJoinTarget|isExpandedInviteUrl/)
+  assert.match(main, /勿仅因 Cookie 提前结束|Cookie 不能单独|scoreInvitePreviewCandidate/)
   assert.match(main, /method: 'POST'/)
+  assert.match(main, /finalize:\s*false/)
+  assert.match(main, /finalize:\s*true/)
+  assert.match(main, /room_id:\s*roomId/)
+  assert.match(main, /chatroomId:\s*roomId/)
   assert.doesNotMatch(main, /async function fetchInvitePageBody[\s\S]*await fetch\(target/)
 })
 
@@ -200,10 +297,11 @@ test('main/ui wire invite preview and strict join success', () => {
   assert.match(main, /fetchInvitePreview/)
   assert.match(main, /fetchInvitePageBody/)
   assert.match(main, /buildInvitePageRequest/)
-  assert.match(main, /buildInvitePageRequest,\s*extractA8KeyHttpHeaders,\s*hasUsableInvitePreview/)
+  assert.match(main, /scoreInvitePreviewCandidate/)
   assert.match(main, /evaluateEnterRoomResult/)
   assert.match(main, /confirmJoinedFromRoomList/)
   assert.match(main, /verifyJoinedRoom/)
+  assert.match(main, /expectedRoomName/)
   assert.match(main, /readWechatRoomIds/)
   assert.match(main, /requestApi\(record, '\/api\/enter_room', joinRequest\)/)
   assert.match(main, /DEFAULT_QR_APPLY_TEXT/)
@@ -212,12 +310,21 @@ test('main/ui wire invite preview and strict join success', () => {
   assert.match(main, /isJoinApplicationPending/)
   assert.doesNotMatch(main, /requestApi\(record, '\/api\/enter_room', \{ url: joinUrl \}\)/)
   assert.match(main, /alreadyIn/)
+  assert.match(main, /resolveQrItemLookupKey/)
+  assert.match(main, /findAlreadyJoinedRoom/)
+  assert.match(main, /isTaskStopRequested/)
+  assert.match(main, /skippedNoRoomList/)
+  assert.match(main, /确认需要真正进群后再占当日额度/)
+  assert.match(main, /取消前再核验一次/)
   assert.match(main, /apiVerdict\.hardFail/)
+  assert.match(main, /qrFrequentInstanceIds/)
+  assert.match(main, /仅暂停该微信本任务剩余项/)
   assert.match(main, /qr:preview-invites/)
   assert.match(main, /优先用 a8key 解析出的完整邀请 URL/)
+  assert.match(main, /短链尚未解析为完整邀请链/)
   assert.match(preload, /previewQrInvites/)
   assert.match(page, /previewQrInvites/)
-  assert.match(page, /确认进群目标/)
+  assert.match(page, /创建进群任务/)
   assert.match(page, /正在解析群资料/)
   assert.match(page, /dangerouslyUseHTMLString/)
   assert.match(page, /pendingPreviewCount/)
@@ -228,6 +335,22 @@ test('main/ui wire invite preview and strict join success', () => {
   assert.match(page, /qrType \? \{ qrType \}/)
   assert.match(page, /path: localPath, localPath/)
   assert.match(page, /previewByUrl\.set\(url, preview\)/)
+  assert.match(main, /qrRoomStateByInstance/)
+  assert.match(main, /qrHelpersFor/)
+  assert.match(main, /rememberJoinedRoom/)
+  assert.match(main, /includeDetail:\s*needNameMatch/)
+  assert.match(main, /整次核验最多补一次详情|出现「无名称的新群」/)
+  assert.match(main, /loadRoomState,/)
+  // 核验轮询禁止每轮打 readWechatRooms / get_all_room_detail
+  const verifyFn = main.slice(main.indexOf('async function verifyJoinedRoom'), main.indexOf('async function applyQrOptions'))
+  assert.doesNotMatch(verifyFn, /readWechatRooms\(/)
+  assert.doesNotMatch(verifyFn, /get_all_room_detail/)
+  assert.match(page, /previewLimit = 20/)
+  assert.match(page, /避免狂打接口/)
+  assert.match(page, /config-panel\.panel-scroll/)
+  assert.match(page, /max-height:\s*min\(78vh/)
+  assert.match(page, /targetKey = `\$\{instanceId\}::\$\{qrKey\}`/)
+  assert.match(page, /sourceLabel/)
   assert.match(main, /urls\.slice\(0, 100\)/)
   assert.match(main, /normalizeQrText\(link\)/)
   assert.match(main, /进群前群资料：\$\{preview\.label\}/)
@@ -244,6 +367,7 @@ test('QR execution preserves a confirmed group link and retries transient contro
   assert.match(main, /usableQrRoomName/)
   assert.match(main, /storedQr\?\.qrType === 'GROUP_LINK'/)
   assert.match(main, /effectiveDecodedText = storedGroupText \|\| decodedText/)
-  assert.match(main, /attempt < 12/)
+  assert.match(main, /attempt < 16/)
+  assert.match(main, /expectedRoomName/)
   assert.doesNotMatch(main, /for \(const roomId of current\) if \(!beforeRoomIds\.has\(roomId\)\) return roomId/)
 })

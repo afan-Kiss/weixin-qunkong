@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import PageHeader from '../components/app/PageHeader.vue'
@@ -14,6 +14,7 @@ const router = useRouter()
 interface ChatAddRule {
   enabled: boolean
   instanceId: string
+  accountWxid?: string
   roomIds: string[]
   keywords: string[]
   excludeText: string
@@ -57,6 +58,13 @@ const selectedIds = ref<number[]>([])
 const friendStatuses = ref<Record<string, FriendStatus>>({})
 const saving = ref(false)
 const creating = ref(false)
+const tableRef = ref<{ clearSelection: () => void, toggleRowSelection: (row: unknown, selected?: boolean) => void } | null>(null)
+/** 程序化恢复勾选时忽略 selection-change，避免新消息刷新把勾选冲掉 */
+let restoringSelection = false
+/** 防止并发 refresh 用旧结果覆盖新勾选 */
+let candidatesRefreshSeq = 0
+let candidateRefreshTimer: ReturnType<typeof setTimeout> | undefined
+let lastFriendStatusKey = ''
 let stopCandidateListener: (() => void) | undefined
 let refreshTimer: ReturnType<typeof setInterval> | undefined
 let applyRuleTimer: ReturnType<typeof setTimeout> | undefined
@@ -167,11 +175,94 @@ function resolveAddStatus(senderWxid: string, candidateStatus: string) {
 
 /** 加载规则回填期间不因微信变更清空已选群 */
 let loadingRule = false
+/** 最近一次从后端加载/保存的群 roomId，用于目录重载后恢复勾选 */
+let rememberedRoomIds: string[] = []
+let draftPersistTimer: ReturnType<typeof setTimeout> | undefined
 
-// 用户切换/重选微信时清空群选；加载规则回填时跳过
+/**
+ * 按已保存的 roomId 回填群勾选；目录只匹配到一部分时，其余用 ownershipKey 占位，禁止截断落库。
+ */
+function applyRoomSelectionFromIds(roomIds: string[], instanceId: string) {
+  const saved = [...new Set((roomIds || []).map(String).filter(Boolean))]
+  rememberedRoomIds = saved
+  if (!saved.length) {
+    selectedGroupKeys.value = []
+    return
+  }
+  const savedSet = new Set(saved)
+  const matchedByRoom = new Map(
+    groups.value
+      .filter((group) => (!instanceId || group.sourceInstanceId === instanceId) && savedSet.has(group.roomId))
+      .map((group) => [group.roomId, group.id]),
+  )
+  selectedGroupKeys.value = saved.map((roomId) => {
+    const hit = matchedByRoom.get(roomId)
+    if (hit) return hit
+    return instanceId ? `${instanceId}\u0000${roomId}` : roomId
+  })
+}
+
+/**
+ * 启动/切换微信号后强制重拉群列表（已登记被踢群会被目录排除）。
+ * @param instanceId 微信实例
+ * @param options.restoreRoomIds 重载后按这些 roomId 恢复勾选；默认用当前/记忆中的选择
+ */
+async function reloadGroupsForInstance(instanceId: string, options: { restoreRoomIds?: string[] } = {}) {
+  const id = String(instanceId || '').trim()
+  if (!id) return
+  const restoreIds = options.restoreRoomIds !== undefined
+    ? options.restoreRoomIds
+    : (rememberedRoomIds.length
+      ? rememberedRoomIds
+      : selectedGroupKeys.value.map(roomIdFromSelectKey).filter(Boolean))
+  try {
+    await refreshDirectory([id], { force: true })
+    applyRoomSelectionFromIds(restoreIds, id)
+  } catch (error) {
+    ElMessage.warning(userErrorMessage(error, '重载群聊列表失败'))
+  }
+}
+
+/**
+ * 把当前表单草稿写入后台（未开启监听也保存选中的微信/群/关键词），避免跳去任务中心再回来丢失。
+ * 注意：暂停监听时不把 activeRule 换成空 roomIds，否则候选列表会被定时刷新冲掉。
+ */
+function queuePersistDraft() {
+  if (loadingRule) return
+  if (draftPersistTimer) clearTimeout(draftPersistTimer)
+  draftPersistTimer = setTimeout(() => { void persistDraft() }, 350)
+}
+
+async function persistDraft() {
+  if (loadingRule) return
+  try {
+    const previous = await window.wxControl?.getChatAddRule?.() as ChatAddRule | undefined
+    const payload = buildRulePayload(previous?.roomIds || rememberedRoomIds, previous)
+    rememberedRoomIds = [...(payload.roomIds || [])]
+    const saved = await window.wxControl?.saveChatAddRule?.(payload) as ChatAddRule | undefined
+    // 仅在仍有监听范围时同步 activeRule；空群草稿不得抹掉候选查询范围
+    if (saved?.enabled || (saved?.roomIds || []).length) {
+      activeRule = saved
+    } else if (previous?.roomIds?.length && !(payload.roomIds || []).length) {
+      activeRule = {
+        ...saved!,
+        instanceId: previous.instanceId || saved?.instanceId || '',
+        roomIds: previous.roomIds,
+        accountWxid: previous.accountWxid || saved?.accountWxid,
+      }
+    } else {
+      activeRule = saved
+    }
+  } catch {
+    /* 草稿落库失败不弹错，避免打断操作 */
+  }
+}
+
+// 用户切换/重选微信时清空群选并重载该号群列表；加载规则回填时跳过
 watch(selectedInstanceId, (next, prev) => {
   if (loadingRule || prev === next) return
   selectedGroupKeys.value = []
+  rememberedRoomIds = []
   if (enabled.value) {
     enabled.value = false
     activeRule = undefined
@@ -180,14 +271,28 @@ watch(selectedInstanceId, (next, prev) => {
       void refreshCandidates()
     })
     ElMessage.info('已停止旧微信的监听，请选择群聊后重新开启')
+  } else {
+    queuePersistDraft()
   }
+  if (next) void reloadGroupsForInstance(next, { restoreRoomIds: [] })
 })
 
-// 监听中修改群、关键词或排除项时，短暂防抖后直接应用到后台。
+// 多开启动微信：当前选中号刚上线时重载群列表
+watch(
+  () => instances.value.find((item) => item.id === selectedInstanceId.value)?.status,
+  (status, prev) => {
+    if (!selectedInstanceId.value || loadingRule) return
+    if (status === 'ONLINE' && prev !== 'ONLINE') {
+      void reloadGroupsForInstance(selectedInstanceId.value, { restoreRoomIds: rememberedRoomIds })
+    }
+  },
+)
+
+// 修改群、关键词或排除项：始终防抖落库草稿；若正在监听则同步启停逻辑
 watch([selectedGroupKeys, keywordsText, excludeText], () => {
-  if (loadingRule || !enabled.value || !selectedInstanceId.value) return
+  if (loadingRule) return
   if (applyRuleTimer) clearTimeout(applyRuleTimer)
-  if (!selectedGroupKeys.value.length) {
+  if (enabled.value && selectedInstanceId.value && !selectedGroupKeys.value.length) {
     enabled.value = false
     activeRule = undefined
     void window.wxControl?.saveChatAddRule?.(buildRulePayload()).then((rule) => {
@@ -196,7 +301,12 @@ watch([selectedGroupKeys, keywordsText, excludeText], () => {
     ElMessage.info('未选择监听群，已停止监听')
     return
   }
-  applyRuleTimer = setTimeout(() => { void saveRule(true, true) }, 400)
+  if (enabled.value && selectedInstanceId.value) {
+    applyRuleTimer = setTimeout(() => { void saveRule(true, true) }, 400)
+    return
+  }
+  rememberedRoomIds = selectedGroupKeys.value.map(roomIdFromSelectKey).filter(Boolean)
+  queuePersistDraft()
 }, { deep: true })
 
 /**
@@ -214,8 +324,9 @@ function roomIdFromSelectKey(key: string) {
 /**
  * 将页面表单组装为可保存规则。
  * 通讯录未就绪时，绝不把已勾选群写成空 roomIds（否则监听会静默丢光）。
+ * accountWxid 空值不覆盖已存账号，避免探测未完成时抹掉改绑锚点。
  */
-function buildRulePayload(previousRoomIds: string[] = []): Partial<ChatAddRule> {
+function buildRulePayload(previousRoomIds: string[] = [], previousRule?: Partial<ChatAddRule> | null): Partial<ChatAddRule> {
   const selectedRooms = groups.value.filter((group) => selectedGroupKeys.value.includes(group.id)
     && (!selectedInstanceId.value || group.sourceInstanceId === selectedInstanceId.value))
   let roomIds = selectedRooms.map((group) => group.roomId)
@@ -226,9 +337,12 @@ function buildRulePayload(previousRoomIds: string[] = []): Partial<ChatAddRule> 
     roomIds = previousRoomIds
   }
   const keywords = keywordsText.value.split(/[\r\n,，]+/).map((item) => item.trim()).filter(Boolean)
+  const liveWxid = instances.value.find((item) => item.id === selectedInstanceId.value)?.accountWxid || ''
+  const accountWxid = String(liveWxid || previousRule?.accountWxid || '').trim()
   return {
     enabled: enabled.value,
     instanceId: selectedInstanceId.value,
+    accountWxid,
     roomIds,
     keywords,
     excludeText: excludeText.value,
@@ -249,12 +363,7 @@ async function loadRule() {
     excludeText.value = rule.excludeText || ''
     activeRule = rule
     // 仅回填规则里明确保存的群；空 roomIds = 不选中任何群（绝不默认全选）
-    const savedRoomIds = new Set((rule.roomIds || []).map(String).filter(Boolean))
-    selectedGroupKeys.value = savedRoomIds.size
-      ? groups.value
-        .filter((group) => (!rule.instanceId || group.sourceInstanceId === rule.instanceId) && savedRoomIds.has(group.roomId))
-        .map((group) => group.id)
-      : []
+    applyRoomSelectionFromIds(rule.roomIds || [], rule.instanceId || '')
   } finally {
     loadingRule = false
   }
@@ -263,27 +372,81 @@ async function loadRule() {
 /**
  * 刷新候选列表与好友添加状态。
  * 下拉展开时跳过，避免输入搜索时被定时刷新打断卡顿。
+ * 刷新后会恢复仍有效的表格勾选（新消息入库不得清空用户已勾选项）。
  */
 async function refreshCandidates() {
   if (groupSelectOpen.value) return
+  const seq = ++candidatesRefreshSeq
+  const keepIds = [...selectedIds.value]
   // 停止监听只阻止新增候选，不清空已有候选；只有“清空候选”按钮可以删除。
   if (!activeRule?.instanceId || !activeRule.roomIds.length) {
+    if (seq !== candidatesRefreshSeq) return
     candidates.value = []
     friendStatuses.value = {}
+    lastFriendStatusKey = ''
+    await restoreCandidateSelection(keepIds)
     return
   }
-  candidates.value = (await window.wxControl?.listChatAddCandidates?.({
+  const nextRows = (await window.wxControl?.listChatAddCandidates?.({
     instanceId: activeRule.instanceId,
     roomIds: activeRule.roomIds,
     limit: 2000,
   }) ?? []) as CandidateRow[]
-  // 仅查待创建候选的状态，减轻 IPC 与渲染压力
-  const keys = candidates.value.filter((item) => item.status === 'PENDING').map((item) => item.senderWxid)
-  if (!keys.length) {
+  if (seq !== candidatesRefreshSeq) return
+  candidates.value = nextRows
+  // 仅查待创建候选的状态；key 未变则跳过 IPC，降低 CPU/IPC
+  const pendingKeys = nextRows.filter((item) => item.status === 'PENDING').map((item) => item.senderWxid)
+  const statusKey = pendingKeys.slice().sort().join('\n')
+  if (!pendingKeys.length) {
     friendStatuses.value = {}
-    return
+    lastFriendStatusKey = ''
+  } else if (statusKey !== lastFriendStatusKey) {
+    friendStatuses.value = (await window.wxControl?.listFriendAddStatuses?.(pendingKeys) ?? {}) as Record<string, FriendStatus>
+    if (seq !== candidatesRefreshSeq) return
+    lastFriendStatusKey = statusKey
   }
-  friendStatuses.value = (await window.wxControl?.listFriendAddStatuses?.(keys) ?? {}) as Record<string, FriendStatus>
+  await restoreCandidateSelection(keepIds)
+}
+
+/** 新消息突发时合并刷新，避免每条消息全量拉候选+重绘表格 */
+function scheduleRefreshCandidates(delayMs = 600) {
+  if (candidateRefreshTimer) clearTimeout(candidateRefreshTimer)
+  candidateRefreshTimer = setTimeout(() => {
+    candidateRefreshTimer = undefined
+    void refreshCandidates()
+  }, delayMs)
+}
+
+/**
+ * 表格勾选变化：同步到 selectedIds（程序化恢复期间忽略）。
+ */
+function onCandidateSelectionChange(rows: CandidateRow[]) {
+  if (restoringSelection) return
+  selectedIds.value = rows.map((item) => item.id)
+}
+
+/**
+ * 按仍存在的候选 ID 恢复 el-table 勾选。
+ */
+async function restoreCandidateSelection(keepIds: number[]) {
+  const alive = new Set(
+    candidates.value
+      .filter((row) => (row.status === 'PENDING' || row.status === 'TASKED') && keepIds.includes(row.id))
+      .map((row) => row.id),
+  )
+  selectedIds.value = keepIds.filter((id) => alive.has(id))
+  await nextTick()
+  const table = tableRef.value
+  if (!table) return
+  restoringSelection = true
+  try {
+    table.clearSelection()
+    for (const row of tableRows.value) {
+      if (alive.has(row.id)) table.toggleRowSelection(row, true)
+    }
+  } finally {
+    restoringSelection = false
+  }
 }
 
 /**
@@ -301,11 +464,12 @@ async function saveRule(nextEnabled = enabled.value, automatic = false) {
   try {
     const previous = await window.wxControl?.getChatAddRule?.() as ChatAddRule | undefined
     enabled.value = nextEnabled
-    const payload = buildRulePayload(previous?.roomIds || [])
+    const payload = buildRulePayload(previous?.roomIds || [], previous)
     if (nextEnabled && !(payload.roomIds || []).length) {
       return ElMessage.warning('未解析到监听群 ID，请刷新通讯录后重新勾选群聊再开启')
     }
     activeRule = await window.wxControl?.saveChatAddRule?.(payload) as ChatAddRule | undefined
+    rememberedRoomIds = [...(activeRule?.roomIds || payload.roomIds || [])]
     // 停止后仍按原微信和群范围读取数据库中的候选，不因规则更新时间变化而消失。
     await refreshCandidates()
     if (!automatic) ElMessage.success(nextEnabled ? '已开启群聊发言监听' : '已保存并关闭监听')
@@ -396,6 +560,8 @@ async function createAddFriendTask(rows?: CandidateRow[]) {
     await refreshCandidates()
     const skipped = [skippedSelf ? `排除本人 ${skippedSelf} 人` : '', unavailable ? `资料暂不可用 ${unavailable} 人` : ''].filter(Boolean).join('，')
     const total = Number(created?.total || items.length) || items.length
+    if (draftPersistTimer) clearTimeout(draftPersistTimer)
+    await persistDraft()
     await promptGoToTaskCenter(router, `已创建 ${total} 项加好友任务${skipped ? `，${skipped}` : ''}`)
   } catch (error) {
     ElMessage.error(userErrorMessage(error, '创建加好友任务失败'))
@@ -409,11 +575,16 @@ async function createAddFriendTask(rows?: CandidateRow[]) {
  */
 async function initialize() {
   await refreshInstances()
-  await refreshDirectory()
+  await refreshDirectory(undefined, { force: true })
   await loadRule()
+  // 目录强制刷新后再按已存 roomId 勾选，避免跳页返回时空选
+  if (selectedInstanceId.value) {
+    await reloadGroupsForInstance(selectedInstanceId.value, { restoreRoomIds: rememberedRoomIds })
+  }
   await refreshCandidates()
-  stopCandidateListener = window.wxControl?.onChatAddCandidate?.(() => { void refreshCandidates() })
-  refreshTimer = setInterval(() => { void refreshCandidates() }, 12000)
+  stopCandidateListener = window.wxControl?.onChatAddCandidate?.(() => { scheduleRefreshCandidates(600) })
+  // 定时兜底：有事件监听时不必太密，降低空闲 CPU
+  refreshTimer = setInterval(() => { void refreshCandidates() }, 20000)
 }
 
 onMounted(() => { void initialize() })
@@ -421,13 +592,17 @@ onBeforeUnmount(() => {
   stopCandidateListener?.()
   if (refreshTimer) clearInterval(refreshTimer)
   if (applyRuleTimer) clearTimeout(applyRuleTimer)
+  if (draftPersistTimer) clearTimeout(draftPersistTimer)
+  if (candidateRefreshTimer) clearTimeout(candidateRefreshTimer)
+  // 离开页面前立刻落库，保证去任务中心再回来仍能还原
+  void persistDraft()
 })
 </script>
 
 <template>
   <div class="app-page">
     <PageHeader title="群聊加好友" subtitle="1.选微信与群并开启监听 → 2.勾选候选 → 3.创建任务 → 4.到任务中心确认执行。">
-      <el-button @click="refreshDirectory(); refreshCandidates()">刷新</el-button>
+      <el-button @click="selectedInstanceId ? reloadGroupsForInstance(selectedInstanceId) : refreshDirectory(undefined, { force: true }); refreshCandidates()">刷新</el-button>
       <el-button :loading="saving" @click="saveRule()">保存规则</el-button>
       <el-button type="primary" :loading="saving" @click="saveRule(!enabled)">{{ enabled ? '停止监听' : '开启监听' }}</el-button>
     </PageHeader>
@@ -496,8 +671,14 @@ onBeforeUnmount(() => {
           <el-button type="primary" :loading="creating" @click="createAddFriendTask()">创建加好友任务</el-button>
         </div>
       </div>
-      <el-table :data="tableRows" height="420" @selection-change="(rows: CandidateRow[]) => selectedIds = rows.map((item) => item.id)">
-        <el-table-column type="selection" width="42" :selectable="(row: CandidateRow) => row.status === 'PENDING' || row.status === 'TASKED'" />
+      <el-table
+        ref="tableRef"
+        :data="tableRows"
+        height="420"
+        row-key="id"
+        @selection-change="onCandidateSelectionChange"
+      >
+        <el-table-column type="selection" width="42" :reserve-selection="true" :selectable="(row: CandidateRow) => row.status === 'PENDING' || row.status === 'TASKED'" />
         <el-table-column prop="nickname" label="昵称" min-width="120" />
         <el-table-column prop="senderWxid" label="WXID" min-width="150" show-overflow-tooltip />
         <el-table-column prop="groupName" label="来自群" min-width="140" show-overflow-tooltip />

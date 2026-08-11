@@ -175,14 +175,23 @@ function isExcluded(sender, excludeList) {
 /**
  * 用监听规则判断消息是否应进入候选。
  * @param {unknown} event 原始消息
- * @param {{ enabled?: boolean, instanceId?: string, roomIds?: string[], keywords?: string[]|string, excludeText?: string|string[], accountWxid?: string }} rule 规则
+ * @param {{ enabled?: boolean, instanceId?: string, accountWxid?: string, roomIds?: string[], keywords?: string[]|string, excludeText?: string|string[] }} rule 规则
  * @param {string} instanceId 当前实例 ID
  * @returns {{ accepted: boolean, reason?: string, hit?: object }}
  */
 function matchChatAddRule(event, rule, instanceId) {
   if (!rule || !rule.enabled) return { accepted: false, reason: 'DISABLED' }
-  if (rule.instanceId && String(rule.instanceId) !== String(instanceId)) return { accepted: false, reason: 'INSTANCE_MISMATCH' }
-  const parsed = parseGroupTextMessage(event, { accountWxid: rule.accountWxid })
+  const ruleInstanceId = String(rule.instanceId || '')
+  const currentInstanceId = String(instanceId || '')
+  const ruleWxid = String(rule.accountWxid || '').trim()
+  // 实例 ID 不一致时：若规则已绑定账号，允许同账号瞬时不一致（由 ensureChatAddRuleBound 改绑）；跨账号一律拒绝
+  if (ruleInstanceId && ruleInstanceId !== currentInstanceId) {
+    // 无账号锚点时仍按实例严格匹配（兼容旧规则）
+    if (!ruleWxid) return { accepted: false, reason: 'INSTANCE_MISMATCH' }
+    // 有账号锚点：match 阶段仍报 INSTANCE_MISMATCH，改绑由 ensureChatAddRuleBound 负责；此处不放行以免绕过改绑写错 instanceId
+    return { accepted: false, reason: 'INSTANCE_MISMATCH' }
+  }
+  const parsed = parseGroupTextMessage(event, { accountWxid: ruleWxid })
   if (!parsed) return { accepted: false, reason: 'NOT_GROUP_TEXT' }
   const roomIds = Array.isArray(rule.roomIds) ? rule.roomIds.map(String) : []
   if (!roomIds.length || !roomIds.includes(parsed.roomId)) return { accepted: false, reason: 'ROOM_FILTER' }

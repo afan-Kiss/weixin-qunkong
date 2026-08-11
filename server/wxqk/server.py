@@ -9,11 +9,12 @@ import json
 import os
 import re
 import secrets
+import socket
 import threading
 import time
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from wsutil import handshake_response, recv_json, send_json
+from wsutil import handshake_response, recv_json, send_frame, send_json
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -96,6 +97,9 @@ def _parse_admin_token_ttl() -> int:
 TOKEN_TTL = _parse_admin_token_ttl()
 ONLINE_TTL = 90  # seconds
 DATA_DIR = Path(_env("WXQK_DATA", "FACAI888_DATA", "SIREN_DATA", default="/opt/wxqk/data"))
+PUBLIC_BASE_URL = str(
+    _env("FACAI888_PUBLIC_BASE_URL", "WXQK_PUBLIC_BASE_URL", default="https://120.27.219.138:8443/wxqk") or ""
+).strip().rstrip("/") or "https://120.27.219.138:8443/wxqk"
 _TRUSTED_PROXIES_RAW = str(_env("FACAI888_TRUSTED_PROXIES", "SIREN_TRUSTED_PROXIES", default="127.0.0.1,::1"))
 LOG_DIR = DATA_DIR / "logs"
 META_DIR = DATA_DIR / "clients"
@@ -193,6 +197,10 @@ _ip_log_rotator = (
 # --- realtime desktop WS hubs ---
 _agent_ws: dict[str, Any] = {}   # clientId -> socket
 _viewer_ws: dict[str, list] = {}  # clientId -> [sockets]
+# viewer socket -> desktopSessionId（WebRTC 信令按会话隔离，避免多路抢 answer）
+_viewer_desktop_session: dict[int, str] = {}
+# viewer socket -> bound LiveKit session：跳过 JPEG/delta 扇出
+_viewer_skip_jpeg: dict[int, float] = {}
 _ws_lock = threading.RLock()
 _viewer_tickets: dict[str, dict[str, Any]] = {}
 
@@ -246,6 +254,37 @@ def unregister_viewer(cid: str, sock) -> None:
         _viewer_ws[cid] = [s for s in arr if s is not sock]
         if not _viewer_ws[cid]:
             _viewer_ws.pop(cid, None)
+        _viewer_desktop_session.pop(id(sock), None)
+        _viewer_skip_jpeg.pop(id(sock), None)
+
+
+def bind_viewer_desktop_session(sock, session_id: str) -> None:
+    """Associate a viewer WS with a WebRTC desktopSessionId for signaling fan-out."""
+    sid = str(session_id or "").strip()
+    if not sock:
+        return
+    with _ws_lock:
+        if sid:
+            _viewer_desktop_session[id(sock)] = sid
+            # LiveKit 会话：观众走媒体面，勿再灌 JPEG/delta（省上行×观众数）
+            try:
+                import webrtc_session as wrs
+
+                sess = wrs.get_session(sid) or {}
+                if str(sess.get("transport") or "") == "livekit":
+                    _viewer_skip_jpeg[id(sock)] = time.time()
+                else:
+                    _viewer_skip_jpeg.pop(id(sock), None)
+            except Exception:
+                _viewer_skip_jpeg.pop(id(sock), None)
+        else:
+            _viewer_desktop_session.pop(id(sock), None)
+            _viewer_skip_jpeg.pop(id(sock), None)
+
+
+def viewer_desktop_session(sock) -> str:
+    with _ws_lock:
+        return str(_viewer_desktop_session.get(id(sock), "") or "")
 
 
 def save_wx_sync(client_id: str, payload: dict[str, Any]) -> None:
@@ -364,46 +403,154 @@ def viewer_count(cid: str) -> int:
         return len(_viewer_ws.get(cid) or [])
 
 
+# Cap START/STOP thrash from multi-viewer reconnect + stale kicks (works without client upgrade).
+# forceRestart still must reach the agent periodically — soft coalesce must not swallow it entirely
+# (1.62 agent ignores soft start_desktop while captureTimer is already running).
+# LiveKit 房间按设备固定：墙侧每 15~30s 新 sid 若都 force，会 DUPLICATE_IDENTITY / getDisplayMedia 风暴。
+_DESKTOP_FORCE_RESTART_MIN_SEC = 90.0
+_DESKTOP_SOFT_START_COALESCE_SEC = 12.0
+# 旧客户端(≤1.74)收到任何 start_desktop 都会 leave+重进 LiveKit；LiveKit 路径尽量少下发
+_DESKTOP_LIVEKIT_START_COALESCE_SEC = 120.0
+# last forced sessionId per client — new WebRTC session must always hard-kick
+_desktop_start_meta: dict[str, dict[str, float | str]] = {}
+_desktop_start_lock = threading.Lock()
+
+
 def start_desktop_for_agent(
     cid: str,
     *,
     quality: str = "auto",
     session_id: str = "",
     force_restart: bool = False,
+    ice_servers: list | None = None,
+    protocol_version: str = "",
+    control_mouse: bool = True,
+    control_keyboard: bool = True,
+    livekit_url: str = "",
+    livekit_token: str = "",
+    room_name: str = "",
 ) -> bool:
     """Tell agent to start continuous desktop; always queue fallback for WS miss."""
     cid = safe_id(cid)
     if not cid or cid == "unknown":
         return False
+    now = time.time()
+    with _desktop_start_lock:
+        meta = _desktop_start_meta.setdefault(
+            cid,
+            {
+                "last_soft": 0.0,
+                "last_force": 0.0,
+                "last_session_id": "",
+                "last_room": "",
+                "last_livekit_token": "",
+            },
+        )
+        prev_room = str(meta.get("last_room") or "")
+        same_room = bool(room_name and prev_room and room_name == prev_room)
+        has_livekit = bool(livekit_url and livekit_token)
+        token_changed = bool(
+            livekit_token and livekit_token != str(meta.get("last_livekit_token") or "")
+        )
+        with _online_lock:
+            already = bool((_online.get(cid) or {}).get("desktopWatching"))
+        since_soft = now - float(meta.get("last_soft") or 0.0)
+        since_force = now - float(meta.get("last_force") or 0.0)
+        demoted = False
+        if force_restart:
+            # 同房/已在看：90s 内禁止硬拉（旧客户端硬拉=拆采集）
+            if since_force < _DESKTOP_FORCE_RESTART_MIN_SEC and (same_room or already or has_livekit):
+                force_restart = False
+                demoted = True
+            else:
+                meta["last_force"] = now
+        if session_id:
+            meta["last_session_id"] = session_id
+        if room_name:
+            meta["last_room"] = room_name
+        # LiveKit：同房软续命长窗口吞掉；token 轮换限流软发（避免每秒新 sid 打穿 coalesce）
+        if (
+            has_livekit
+            and not force_restart
+            and since_soft < _DESKTOP_LIVEKIT_START_COALESCE_SEC
+            and (already or same_room)
+        ):
+            if not token_changed:
+                return True
+            # 被墙侧踢降级后至少再软发一次，否则冻屏代理永远收不到令
+            if demoted:
+                pass
+            elif since_soft < 25.0:
+                return True
+        if not force_restart:
+            if already and not session_id and since_soft < _DESKTOP_SOFT_START_COALESCE_SEC:
+                return True
+        meta["last_soft"] = now
+        if livekit_token:
+            meta["last_livekit_token"] = str(livekit_token)
     payload: dict[str, Any] = {
         "type": "start_desktop",
         "continuous": True,
         "quality": quality or "auto",
         # Viewer watch / reconnect must not wipe remote input permissions.
-        "controlMouse": True,
-        "controlKeyboard": True,
+        "controlMouse": bool(control_mouse),
+        "controlKeyboard": bool(control_keyboard),
     }
     if session_id:
         payload["desktopSessionId"] = session_id
+    if protocol_version:
+        payload["protocolVersion"] = protocol_version
+    if ice_servers:
+        payload["iceServers"] = ice_servers
+    if livekit_url and livekit_token:
+        payload["transport"] = "livekit"
+        payload["livekitUrl"] = livekit_url
+        payload["livekitToken"] = livekit_token
+        if room_name:
+            payload["roomName"] = room_name
     if force_restart:
         payload["forceRestart"] = True
         payload["kick"] = True
     ok = tell_agent(cid, payload)
-    # Queue survives agent reconnect / brief WS gaps (STOP is superseded by START in command_queue).
-    # Keep the same restart semantics as the live payload so soft-path publishers get forceRestart.
-    queued = {
-        "type": "start_desktop",
-        "continuous": True,
-        "quality": quality or "auto",
-        "controlMouse": True,
-        "controlKeyboard": True,
-    }
-    if session_id:
-        queued["desktopSessionId"] = session_id
-    if force_restart:
-        queued["forceRestart"] = True
-        queued["kick"] = True
-    set_command(cid, queued)
+    try:
+        ice_n = len(ice_servers or [])
+        line = (
+            f"[webrtc] start_desktop cid={cid[:12]} sid={str(session_id or '')[:16]} "
+            f"force={int(bool(force_restart))} ice={ice_n} livekit={int(bool(livekit_url and livekit_token))} "
+            f"ws={int(bool(ok))}\n"
+        )
+        print(line, end="", flush=True)
+        (LOG_DIR / "webrtc.log").parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "webrtc.log", "a", encoding="utf-8") as wf:
+            wf.write(line)
+    except Exception:
+        pass
+    # WS 已送达则不再入队：旧端 hello/重连再吃一遍 START_DESKTOP 会拆 LiveKit。
+    # 仅 WS 失败时排队，覆盖短暂断线。
+    if not ok:
+        queued = {
+            "type": "start_desktop",
+            "continuous": True,
+            "quality": quality or "auto",
+            "controlMouse": bool(control_mouse),
+            "controlKeyboard": bool(control_keyboard),
+        }
+        if session_id:
+            queued["desktopSessionId"] = session_id
+        if protocol_version:
+            queued["protocolVersion"] = protocol_version
+        if ice_servers:
+            queued["iceServers"] = ice_servers
+        if livekit_url and livekit_token:
+            queued["transport"] = "livekit"
+            queued["livekitUrl"] = livekit_url
+            queued["livekitToken"] = livekit_token
+            if room_name:
+                queued["roomName"] = room_name
+        if force_restart:
+            queued["forceRestart"] = True
+            queued["kick"] = True
+        set_command(cid, queued)
     with _online_lock:
         if cid in _online:
             _online[cid]["desktopWatching"] = True
@@ -417,7 +564,9 @@ def resume_desktop_if_viewers(cid: str) -> None:
         return
     if viewer_count(cid) <= 0:
         return
-    start_desktop_for_agent(cid)
+    # 有观众时只等带 LiveKit 凭证的 watch；无 sid / 无 token 的软拉只会刷 JPEG 噪声。
+    # （旧逻辑空 sid start_desktop 会在日志里刷 livekit=0，并与真正会话打架。）
+    return
 
 
 _stop_desktop_timers: dict[str, threading.Timer] = {}
@@ -437,6 +586,8 @@ def schedule_stop_desktop_if_idle(cid: str, delay_sec: float = 2.0) -> None:
             return
         tell_agent(cid, {"type": "stop_desktop"})
         set_command(cid, {"type": "stop_desktop"})
+        with _desktop_start_lock:
+            _desktop_start_meta.pop(cid, None)
         with _online_lock:
             if cid in _online:
                 _online[cid]["desktopWatching"] = False
@@ -469,8 +620,27 @@ def push_to_viewers(cid: str, obj: dict) -> None:
     cid = safe_id(cid)
     with _ws_lock:
         viewers = list(_viewer_ws.get(cid) or [])
+        session_map = dict(_viewer_desktop_session)
+        skip_jpeg = dict(_viewer_skip_jpeg)
+    typ = str((obj or {}).get("type") or "")
+    sid = str((obj or {}).get("desktopSessionId") or "").strip()
+    # WebRTC 信令按会话隔离：
+    # - 有 sid：发给「同 sid」或「尚未绑定」的 viewer（未绑定常见于 session 刚建、watch 尚未到达）
+    # - 无 sid：只给未绑定 viewer，避免串到其它会话
+    webrtc_signal = typ.startswith("webrtc_")
+    jpeg_like = typ in ("frame", "frame_delta")
     dead = []
     for s in viewers:
+        if jpeg_like and id(s) in skip_jpeg:
+            continue
+        if webrtc_signal:
+            viewer_sid = str(session_map.get(id(s), "") or "")
+            if sid:
+                if viewer_sid and viewer_sid != sid:
+                    continue
+            elif viewer_sid:
+                # 代理旧包无 sessionId：勿打给已绑定其它会话的 viewer
+                continue
         try:
             send_json(s, obj)
         except Exception:
@@ -1291,11 +1461,13 @@ def list_online() -> list[dict[str, Any]]:
             _online.pop(k, None)
             _latest_shot.pop(k, None)
             _latest_shot_image.pop(k, None)
+            _shot_last_disk_at.pop(k, None)
         live = set(_online.keys())
         for k in list(_latest_shot.keys()):
             if k not in live:
                 _latest_shot.pop(k, None)
                 _latest_shot_image.pop(k, None)
+                _shot_last_disk_at.pop(k, None)
         rows = list(_online.values())
     # Stable order: first online time, then clientId. Never reshuffle by heartbeat lastSeen.
     rows.sort(key=lambda x: (float(x.get("firstSeen") or x.get("lastSeen") or 0), str(x.get("clientId") or "")))
@@ -2148,7 +2320,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         # Agent/admin calls are same-origin or non-browser; do not reflect *.
         origin = (self.headers.get("Origin") or "").strip()
-        if origin in ("https://xiangyuzhubao.xyz", "https://www.xiangyuzhubao.xyz"):
+        allowed_origins = {
+            "https://xiangyuzhubao.xyz",
+            "https://www.xiangyuzhubao.xyz",
+            "https://120.27.219.138:8443",
+            "http://120.27.219.138",
+            "http://120.27.219.138:888",
+        }
+        if origin in allowed_origins:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token, Authorization, X-Build-Id, X-Client-Version, X-Protocol-Version, X-Security-Protocol-Version, X-Desktop-Protocol-Version, X-Updater-Protocol-Version, X-Device-Id, X-Device-Timestamp, X-Device-Nonce, X-Device-Signature, X-Release-Sequence, X-File-Name")
@@ -2213,7 +2392,12 @@ class Handler(BaseHTTPRequestHandler):
                     online_lookup=lambda cid: get_online_meta(cid),
                     clients_by_ip=lambda tip: clients_by_ip(tip),
                 )
-                self._send(200, {"ok": True, "manifest": man, "signature": sig})
+                self._send(200, {
+                    "ok": True,
+                    "manifest": man,
+                    "signature": sig,
+                    "publicKey": um.public_key_b64(DATA_DIR),
+                })
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})
             return
@@ -2881,9 +3065,24 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                         delta["clientId"] = cid
                         push_to_viewers(cid, delta)
-                    elif typ in ("webrtc_offer", "webrtc_ice", "webrtc_answer", "webrtc_stop", "file_result"):
+                    elif typ in ("webrtc_offer", "webrtc_ice", "webrtc_answer", "webrtc_stop", "webrtc_error", "file_result"):
                         if cid:
-                            push_to_viewers(cid, msg)
+                            if typ in ("webrtc_offer", "webrtc_answer", "webrtc_error"):
+                                try:
+                                    line = (
+                                        f"[webrtc] agent→viewers {typ} cid={cid[:12]} "
+                                        f"sid={str(msg.get('desktopSessionId') or '')[:16]} "
+                                        f"viewers={viewer_count(cid)} "
+                                        f"msg={str(msg.get('message') or '')[:120]}\n"
+                                    )
+                                    print(line, end="", flush=True)
+                                    (LOG_DIR / "webrtc.log").parent.mkdir(parents=True, exist_ok=True)
+                                    with open(LOG_DIR / "webrtc.log", "a", encoding="utf-8") as wf:
+                                        wf.write(line)
+                                except Exception:
+                                    pass
+                            if typ != "webrtc_error":
+                                push_to_viewers(cid, msg)
                     elif typ == "pong":
                         pass
             except Exception:
@@ -2897,18 +3096,44 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             return
 
-        # viewer
+        # viewer — 进房只注册；带 LiveKit 凭证的 start 由 watch(desktopSessionId) 下发
+        # （空 start_desktop 会 livekit=0，与正式会话打架、引发推流端反复拆房）
         cancel_pending_stop_desktop(cid)
         register_viewer(cid, sock)
-        start_desktop_for_agent(cid)
         try:
             send_json(sock, {"type": "ready", "clientId": cid})
-            # send last cached frame if any (may be stale; live frames follow via agent WS)
-            shot = get_shot(cid)
-            if shot and shot.get("image"):
-                send_json(sock, {"type": "frame", "clientId": cid, "t": shot.get("t") or "", "image": shot["image"], "cached": True})
+            # LiveKit 已启用时不预灌缓存全图：墙/桌面会走媒体面，重连时省一轮大包
+            send_cached = True
+            try:
+                import livekit_session as _lks
+
+                if _lks.livekit_enabled():
+                    send_cached = False
+            except Exception:
+                send_cached = True
+            if send_cached:
+                shot = get_shot(cid)
+                if shot and shot.get("image"):
+                    send_json(
+                        sock,
+                        {
+                            "type": "frame",
+                            "clientId": cid,
+                            "t": shot.get("t") or "",
+                            "image": shot["image"],
+                            "cached": True,
+                        },
+                    )
             while True:
-                msg = recv_json(sock, timeout=120)
+                # LiveKit 出画不走本 WS，长时间无业务消息属正常；超时发 ping 续命，勿掐观众连接
+                try:
+                    msg = recv_json(sock, timeout=45)
+                except (TimeoutError, socket.timeout):
+                    try:
+                        send_frame(sock, 9, b"ping")
+                    except Exception:
+                        break
+                    continue
                 if not isinstance(msg, dict):
                     continue
                 typ = str(msg.get("type") or "")
@@ -2916,14 +3141,101 @@ class Handler(BaseHTTPRequestHandler):
                     cancel_pending_stop_desktop(cid)
                     quality = str(msg.get("quality") or "auto")
                     sid = str(msg.get("desktopSessionId") or "")
+                    if sid:
+                        bind_viewer_desktop_session(sock, sid)
                     force = bool(msg.get("kick") or msg.get("forceRestart"))
-                    start_desktop_for_agent(cid, quality=quality, session_id=sid, force_restart=force)
-                elif typ == "unwatch":
-                    schedule_stop_desktop_if_idle(cid, delay_sec=0.5)
-                elif typ.startswith("webrtc_") or typ in ("control", "file"):
-                    tell_agent(cid, msg)
+                    # 无 sid 的硬拉只会启动空 WebRTC/堵 publisher；JPEG 软续命即可
+                    if force and not sid:
+                        force = False
+                    with _online_lock:
+                        caps = dict((_online.get(cid) or {}).get("capabilities") or {})
+                        already_watching = bool((_online.get(cid) or {}).get("desktopWatching"))
+                    livekit_on = False
+                    try:
+                        import livekit_session as _lks
+                        livekit_on = bool(_lks.livekit_enabled())
+                    except Exception:
+                        livekit_on = False
+                    # LiveKit 已启用时禁止空 sid start（agents 常不报 capabilities.webrtc，仍会 livekit=0 打架）
+                    if not sid and (livekit_on or caps.get("webrtc") or caps.get("livekit")):
+                        continue
+                    # 已在推流且无新 sid：忽略重复软 watch，避免 ~2min 重连风暴
+                    if not sid and already_watching and not force:
+                        continue
+                    ice_servers = None
+                    protocol_version = ""
+                    control_mouse = True
+                    control_keyboard = True
+                    livekit_url = ""
+                    livekit_token = ""
+                    room_name = ""
+                    if sid:
+                        try:
+                            import webrtc_session as wrs
+                            sess = wrs.get_session(sid) or {}
+                            # 服务重启后旧 sid 失效：勿用空凭证 start（日志 ice=0 livekit=0）
+                            if not sess:
+                                continue
+                            ice = sess.get("iceServers")
+                            if isinstance(ice, list) and ice:
+                                ice_servers = ice
+                            protocol_version = str(sess.get("protocolVersion") or "desktop-livekit-v1")
+                            perms = sess.get("permissions") or {}
+                            if "CONTROL_MOUSE" in perms:
+                                control_mouse = bool(perms.get("CONTROL_MOUSE"))
+                            if "CONTROL_KEYBOARD" in perms:
+                                control_keyboard = bool(perms.get("CONTROL_KEYBOARD"))
+                            if not quality or quality == "auto":
+                                quality = str(sess.get("quality") or quality or "auto")
+                            if str(sess.get("transport") or "") == "livekit":
+                                livekit_url = str(sess.get("livekitUrl") or "")
+                                livekit_token = str(sess.get("agentToken") or "")
+                                room_name = str(sess.get("roomName") or "")
+                                if not (livekit_url and livekit_token):
+                                    continue
+                        except Exception:
+                            continue
+                    start_desktop_for_agent(
+                        cid,
+                        quality=quality,
+                        session_id=sid,
+                        force_restart=force,
+                        ice_servers=ice_servers,
+                        protocol_version=protocol_version,
+                        control_mouse=control_mouse,
+                        control_keyboard=control_keyboard,
+                        livekit_url=livekit_url,
+                        livekit_token=livekit_token,
+                        room_name=room_name,
+                    )
                 elif typ == "ping":
-                    send_json(sock, {"type": "pong"})
+                    try:
+                        send_json(sock, {"type": "pong", "t": int(time.time())})
+                    except Exception:
+                        pass
+                elif typ == "unwatch":
+                    # Match disconnect debounce — brief unwatch/reconnect must not STOP then START.
+                    schedule_stop_desktop_if_idle(cid, delay_sec=3.0)
+                elif typ.startswith("webrtc_") or typ in ("control", "file"):
+                    sid = str(msg.get("desktopSessionId") or "")
+                    if sid and typ.startswith("webrtc_"):
+                        bind_viewer_desktop_session(sock, sid)
+                    if typ in ("webrtc_offer", "webrtc_answer"):
+                        try:
+                            line = (
+                                f"[webrtc] viewer→agent {typ} cid={cid[:12]} "
+                                f"sid={str(sid or '')[:16]}\n"
+                            )
+                            print(line, end="", flush=True)
+                            with open(
+                                os.path.join(DATA_DIR, "logs", "webrtc.log"),
+                                "a",
+                                encoding="utf-8",
+                            ) as wf:
+                                wf.write(line)
+                        except Exception:
+                            pass
+                    tell_agent(cid, msg)
         except Exception:
             pass
         finally:
@@ -3059,40 +3371,49 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 cid = safe_id(str((body or {}).get("deviceId") or (body or {}).get("clientId") or ""))
-                with _lock:
+                with _online_lock:
                     capabilities = dict((_online.get(cid) or {}).get("capabilities") or {})
                 source = str((body or {}).get("source") or "desktop").lower()
                 needed = "camera" if source == "camera" else "webrtc"
-                if not capabilities.get(needed):
+                livekit_on = False
+                try:
+                    import livekit_session as _lks
+                    livekit_on = bool(_lks.livekit_enabled())
+                except Exception:
+                    livekit_on = False
+                # 旧客户端常不报 capabilities.webrtc；LiveKit 已配置时仍允许建会话
+                if needed == "webrtc" and not capabilities.get("webrtc") and not livekit_on:
+                    self._send(409, {"ok": False, "message": "当前客户端使用稳定画面模式，该加速功能未启用"})
+                    return
+                if needed == "camera" and not capabilities.get("camera"):
                     self._send(409, {"ok": False, "message": "当前客户端使用稳定画面模式，该加速功能未启用"})
                     return
                 import webrtc_session as wrs
                 sess = wrs.create_session(body if isinstance(body, dict) else {})
                 cid = str((body or {}).get("deviceId") or (body or {}).get("clientId") or "").strip()
-                if sess.get("ok") and cid:
+                # deferStart：只发 sid/ICE，等 viewer 绑好 PC 后再用 watch 拉起代理（屏幕墙默认）
+                defer_start = bool((body or {}).get("deferStart"))
+                if sess.get("ok") and cid and not defer_start:
                     perms = sess.get("permissions") or {}
                     src = str((body or {}).get("source") or "desktop").strip().lower() or "desktop"
-                    start_type = "start_camera" if src == "camera" else "start_desktop"
-                    tell_agent(cid, {
-                        "type": start_type,
-                        "continuous": True,
-                        "desktopSessionId": sess.get("desktopSessionId"),
-                        "quality": sess.get("quality") or "auto",
-                        "source": src,
-                        "controlMouse": bool(perms.get("CONTROL_MOUSE")) and src != "camera",
-                        "controlKeyboard": bool(perms.get("CONTROL_KEYBOARD")) and src != "camera",
-                        "browseFiles": bool(perms.get("BROWSE_FILES")),
-                        "downloadFiles": bool(perms.get("DOWNLOAD_FILES")),
-                        "protocolVersion": "desktop-webrtc-v1",
-                    })
-                    set_command(cid, {
-                        "type": "start_desktop",
-                        "continuous": True,
-                        "desktopSessionId": sess.get("desktopSessionId"),
-                        "quality": sess.get("quality") or "auto",
-                        "controlMouse": bool(perms.get("CONTROL_MOUSE")),
-                        "controlKeyboard": bool(perms.get("CONTROL_KEYBOARD")),
-                    })
+                    ice_servers = sess.get("iceServers") or []
+                    # HTTP 响应当场剥掉 agentToken；下发代理须从内存会话再取
+                    sid = str(sess.get("desktopSessionId") or "")
+                    stored = wrs.get_session(sid) or {}
+                    # 单次 coalesced 下发（含 iceServers / LiveKit），避免墙+后台连环 forceRestart
+                    start_desktop_for_agent(
+                        cid,
+                        quality=str(sess.get("quality") or "auto"),
+                        session_id=sid,
+                        force_restart=True,
+                        ice_servers=ice_servers if isinstance(ice_servers, list) else None,
+                        protocol_version=str(sess.get("protocolVersion") or "desktop-livekit-v1"),
+                        control_mouse=bool(perms.get("CONTROL_MOUSE")) and src != "camera",
+                        control_keyboard=bool(perms.get("CONTROL_KEYBOARD")) and src != "camera",
+                        livekit_url=str(stored.get("livekitUrl") or sess.get("livekitUrl") or ""),
+                        livekit_token=str(stored.get("agentToken") or ""),
+                        room_name=str(stored.get("roomName") or sess.get("roomName") or ""),
+                    )
                 self._send(200, sess)
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})
@@ -3700,7 +4021,40 @@ class Handler(BaseHTTPRequestHandler):
             quality = str(body.get("quality") or "auto")
             sid = str(body.get("desktopSessionId") or "")
             force = bool(body.get("kick") or body.get("forceRestart"))
-            ok = start_desktop_for_agent(cid, quality=quality, session_id=sid, force_restart=force)
+            if force and not sid:
+                force = False
+            ice_servers = None
+            protocol_version = ""
+            livekit_url = ""
+            livekit_token = ""
+            room_name = ""
+            if sid:
+                try:
+                    import webrtc_session as wrs
+                    sess = wrs.get_session(sid) or {}
+                    ice = sess.get("iceServers")
+                    if isinstance(ice, list) and ice:
+                        ice_servers = ice
+                    protocol_version = str(sess.get("protocolVersion") or "desktop-livekit-v1")
+                    if not quality or quality == "auto":
+                        quality = str(sess.get("quality") or quality or "auto")
+                    if str(sess.get("transport") or "") == "livekit":
+                        livekit_url = str(sess.get("livekitUrl") or "")
+                        livekit_token = str(sess.get("agentToken") or "")
+                        room_name = str(sess.get("roomName") or "")
+                except Exception:
+                    pass
+            ok = start_desktop_for_agent(
+                cid,
+                quality=quality,
+                session_id=sid,
+                force_restart=force,
+                ice_servers=ice_servers,
+                protocol_version=protocol_version,
+                livekit_url=livekit_url,
+                livekit_token=livekit_token,
+                room_name=room_name,
+            )
             self._send(200, {"ok": True, "ws": ok})
             return
 
@@ -3714,6 +4068,8 @@ class Handler(BaseHTTPRequestHandler):
             cancel_pending_stop_desktop(cid)
             ok = tell_agent(cid, {"type": "stop_desktop"})
             set_command(cid, {"type": "stop_desktop"})
+            with _desktop_start_lock:
+                _desktop_start_meta.pop(cid, None)
             with _online_lock:
                 if cid in _online:
                     _online[cid]["desktopWatching"] = False
@@ -3814,7 +4170,7 @@ class Handler(BaseHTTPRequestHandler):
                         file_name=str(body.get("fileName") or "").strip(),
                         download_url=str(body.get("downloadURL") or "").strip(),
                         seed_b64=seed,
-                        public_base_url="https://xiangyuzhubao.xyz/wxqk",
+                        public_base_url=PUBLIC_BASE_URL,
                     ))
                 else:
                     self._send(200, um.publish_release(
@@ -3826,7 +4182,7 @@ class Handler(BaseHTTPRequestHandler):
                         file_name=str(body.get("fileName") or "").strip(),
                         download_url=str(body.get("downloadURL") or "").strip(),
                         seed_b64=seed,
-                        public_base_url="https://xiangyuzhubao.xyz/wxqk",
+                        public_base_url=PUBLIC_BASE_URL,
                     ))
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})

@@ -116,6 +116,17 @@ test('QR history collector derives the room message table and accurate file name
     }, 'D:\\self.jpg'),
     { fileid: '305702010004selfmid', asekey: '05f8f6033dcfbc67af458799dda91bce', imgType: 2, out: 'D:\\self.jpg' },
   )
+  // 嵌套 img 对象也能解析
+  assert.deepEqual(
+    cdnDownloadRequest({
+      msgType: 3,
+      img: {
+        aesKey: 'aabbccddeeff00112233445566778899',
+        cdnMidImgUrl: '305702010004nested',
+      },
+    }, 'D:\\nested.jpg'),
+    { fileid: '305702010004nested', asekey: 'aabbccddeeff00112233445566778899', imgType: 2, out: 'D:\\nested.jpg' },
+  )
   const fixed = new Date(2026, 7, 2, 12, 0, 0).getTime()
   const name = accurateFileName('微信群二维码', '测试/群', '123', 'ABCDEF1234567890', '.jpg', fixed)
   assert.equal(name, '微信群二维码_测试_群_123_20260802120000_ABCDEF123456.jpg')
@@ -144,7 +155,9 @@ test('QR history UI supports multi-room collection and offline decoding', () => 
   assert.doesNotMatch(page, /一次最多采集 8 个群/)
   assert.match(page, /clearHistoryGroups|startMonitorQueuePolling/)
   const selectUtil = readFileSync(path.join(root, 'src/utils/searchableSelect.ts'), 'utf8')
-  assert.match(selectUtil, /SELECTED_OPTION_RENDER_CAP/)
+  assert.doesNotMatch(selectUtil, /SELECTED_OPTION_RENDER_CAP/)
+  assert.doesNotMatch(selectUtil, /selectedItems = selectedItems\.slice/)
+  assert.match(selectUtil, /已选项必须全部出现/)
   assert.match(page, /保存文件夹/)
   assert.match(page, /分组名称/)
   assert.match(page, /function isExecutableQr/)

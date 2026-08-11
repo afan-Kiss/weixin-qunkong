@@ -48,6 +48,14 @@ test('filterSelectOptions limits idle render and keeps selected', () => {
   assert.ok(visible.some((item) => item.value === 'g-10'))
 })
 
+test('filterSelectOptions never truncates select-all selection', () => {
+  const options = Array.from({ length: 200 }, (_, index) => ({ label: `群${index}`, value: `g-${index}` }))
+  const selected = options.map((item) => item.value)
+  const visible = filterSelectOptions(options, '', selected, 80)
+  assert.equal(visible.filter((item) => selected.includes(item.value)).length, 200)
+  assert.ok(visible.every((item) => selected.includes(item.value)))
+})
+
 test('filterSelectOptions matches label or value case-insensitively', () => {
   const options = [
     { label: '客户A群', value: '111@chatroom' },
@@ -68,10 +76,14 @@ test('pages wire debounced searchable selects', () => {
   assert.match(util, /useSelectSearchQuery/)
   assert.match(util, /SELECT_OPTION_LIMIT_IDLE = 80/)
   assert.match(util, /SELECT_OPTION_LIMIT_SEARCH = 120/)
+  assert.doesNotMatch(util, /SELECTED_OPTION_RENDER_CAP/)
+  assert.doesNotMatch(util, /selectedItems = selectedItems\.slice/)
+  assert.match(util, /已选项必须全部出现/)
   assert.match(chat, /useSelectSearchQuery/)
   assert.match(chat, /groupSelectOpen/)
   assert.match(chat, /输入群名\/群ID搜索/)
   assert.match(groups, /groupSearch\.setQuery/)
+  assert.match(groups, /实例集合未变时不要动群勾选/)
   assert.match(qr, /groupSearch\.setQuery/)
   assert.match(layout, /setInterval\(refreshMetrics, 5000\)/)
 })

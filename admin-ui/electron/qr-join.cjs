@@ -193,6 +193,44 @@ function findRoomId(raw) {
 }
 
 /**
+ * 是否已是完整进群邀请链（可可靠 enter_room）。
+ * 兼容邀请票链接 addchatroombyinvite 与扫码进群链 addchatroombyqrcode。
+ * @param {unknown} url
+ * @returns {boolean}
+ */
+function isExpandedInviteUrl(url) {
+  return /addchatroomby(?:invite|qrcode)/i.test(String(url || ''))
+}
+
+/**
+ * 是否微信群短链（weixin.qq.com/g/...）。
+ * @param {unknown} url
+ * @returns {boolean}
+ */
+function isShortGroupInviteUrl(url) {
+  return /weixin\.qq\.com\/g\//i.test(String(url || ''))
+}
+
+/**
+ * 从邀请 URL 查询参数或路径中提取 @chatroom。
+ * @param {unknown} url
+ * @returns {string}
+ */
+function findRoomIdInUrl(url) {
+  const text = String(url || '').trim()
+  if (!text) return ''
+  try {
+    const parsed = new URL(text)
+    for (const key of ['username', 'userName', 'chatroomusername', 'chatroomUserName', 'roomid', 'roomId', 'chatroomid']) {
+      const value = String(parsed.searchParams.get(key) || '').trim()
+      if (value.endsWith('@chatroom')) return value
+    }
+  } catch { /* ignore */ }
+  const match = text.match(/(\d{5,}@chatroom)/i)
+  return match ? match[1] : ''
+}
+
+/**
  * 提取完整邀请 URL。
  * @param {unknown} raw
  * @param {string} [sourceUrl]
@@ -200,16 +238,17 @@ function findRoomId(raw) {
  */
 function findInviteFullUrl(raw, sourceUrl = '') {
   const keyed = findByNames(raw, ['FullURL', 'fullURL', 'fullUrl', 'full_url', 'ShareURL', 'shareUrl'])
-  if (typeof keyed === 'string' && /addchatroombyinvite|weixin\.qq\.com\/g\//i.test(keyed)) {
-    return keyed.trim()
+  const keyedText = unwrapProtoString(keyed) || (typeof keyed === 'string' ? keyed.trim() : '')
+  if (keyedText && /addchatroomby(?:invite|qrcode)|weixin\.qq\.com\/g\//i.test(keyedText)) {
+    return keyedText
   }
-  const urlCandidates = collectStrings(raw).filter((text) => /addchatroombyinvite|weixin\.qq\.com\/g\//i.test(text))
-  const fullUrl = urlCandidates.find((text) => /addchatroombyinvite/i.test(text))
+  const urlCandidates = collectStrings(raw).filter((text) => /addchatroomby(?:invite|qrcode)|weixin\.qq\.com\/g\//i.test(text))
+  const fullUrl = urlCandidates.find((text) => /addchatroomby(?:invite|qrcode)/i.test(text))
     || urlCandidates[0]
     || ''
   if (fullUrl) return fullUrl
   // 仅当源链接本身已是邀请链时才回退，避免把短链误当成“已解析完成”
-  if (/addchatroombyinvite/i.test(String(sourceUrl || ''))) return String(sourceUrl)
+  if (/addchatroomby(?:invite|qrcode)/i.test(String(sourceUrl || ''))) return String(sourceUrl)
   return String(sourceUrl || '')
 }
 
@@ -266,8 +305,9 @@ function parseInvitePreview(raw, sourceUrl = '') {
   }
 
   const fullUrl = findInviteFullUrl(raw, sourceUrl)
+  const roomIdFromUrl = findRoomIdInUrl(fullUrl) || findRoomIdInUrl(sourceUrl)
   return {
-    roomId,
+    roomId: roomId || roomIdFromUrl,
     roomName,
     memberCount: Number.isFinite(memberCount) && memberCount > 0 ? memberCount : 0,
     fullUrl,
@@ -297,8 +337,13 @@ function mergeInvitePreview(...parts) {
     if (part.roomId) base.roomId = part.roomId
     if (part.roomName) base.roomName = part.roomName
     if (Number(part.memberCount) > 0) base.memberCount = Number(part.memberCount)
-    if (part.fullUrl && /addchatroombyinvite/i.test(part.fullUrl)) base.fullUrl = part.fullUrl
+    if (part.fullUrl && /addchatroomby(?:invite|qrcode)/i.test(part.fullUrl)) base.fullUrl = part.fullUrl
     else if (part.fullUrl && !base.fullUrl) base.fullUrl = part.fullUrl
+    else if (part.fullUrl && isShortGroupInviteUrl(base.fullUrl) && isExpandedInviteUrl(part.fullUrl)) base.fullUrl = part.fullUrl
+    if (!base.roomId && part.fullUrl) {
+      const fromUrl = findRoomIdInUrl(part.fullUrl)
+      if (fromUrl) base.roomId = fromUrl
+    }
     if (part.expired) base.expired = true
     if (part.needApply) base.needApply = true
     if (part.rawText) base.rawText = String(part.rawText).slice(0, 2000)
@@ -354,15 +399,52 @@ function evaluateEnterRoomResult(responseOk, raw) {
 }
 
 /**
+ * 进群前判断是否已在目标群：优先 roomId，其次精确群名。
+ * 短链常无 roomId；若不按群名拦截，会对已在群再次 enter_room，微信会话会出现「欢迎回到群聊」。
+ * @param {Array<{ roomId?: string, name?: string }>} rooms
+ * @param {{ roomId?: string, roomName?: string }} preview
+ * @returns {{ roomId: string, roomName: string, reason: string } | null}
+ */
+function findAlreadyJoinedRoom(rooms, preview = {}) {
+  const list = Array.isArray(rooms) ? rooms : []
+  const expectedId = String(preview?.roomId || '').trim()
+  if (expectedId.endsWith('@chatroom')) {
+    const hit = list.find((row) => String(row?.roomId || '').trim() === expectedId)
+    if (hit) {
+      const roomName = normalizeRoomName(hit.name) || normalizeRoomName(preview.roomName) || ''
+      return {
+        roomId: expectedId,
+        roomName,
+        reason: '进群前已在该群中，不算本次进群成功',
+      }
+    }
+  }
+  const expectedName = normalizeRoomName(preview?.roomName)
+  if (!expectedName) return null
+  const exact = list.filter((row) => {
+    const id = String(row?.roomId || '').trim()
+    if (!id.endsWith('@chatroom')) return false
+    return normalizeRoomName(row?.name) === expectedName
+  })
+  if (exact.length !== 1) return null
+  return {
+    roomId: String(exact[0].roomId || '').trim(),
+    roomName: expectedName,
+    reason: '进群前已在该群中（按群名确认），不算本次进群成功',
+  }
+}
+
+/**
  * 用进群前后群列表判定是否真正新进目标群。
  * - 有 expectedRoomId：进群前不在、进群后出现 → JOINED
  * - 无 expectedRoomId（短链常见）：仅当恰好新增 1 个 @chatroom 才认成功，避免任意新群误判
  * @param {Iterable<string>|Set<string>} beforeRoomIds
  * @param {Iterable<string>|Set<string>} currentRoomIds
  * @param {string} expectedRoomId
+ * @param {{ expectedRoomName?: string, roomNameById?: Map<string, string>|Record<string, string> }} [options]
  * @returns {{ status: 'JOINED'|'ALREADY_IN'|'MISSING_TARGET'|'NOT_YET', roomId: string, reason: string }}
  */
-function confirmJoinedFromRoomList(beforeRoomIds, currentRoomIds, expectedRoomId = '') {
+function confirmJoinedFromRoomList(beforeRoomIds, currentRoomIds, expectedRoomId = '', options = {}) {
   const before = beforeRoomIds instanceof Set ? beforeRoomIds : new Set(beforeRoomIds || [])
   const current = currentRoomIds instanceof Set ? currentRoomIds : new Set(currentRoomIds || [])
   const target = String(expectedRoomId || '').trim()
@@ -384,10 +466,30 @@ function confirmJoinedFromRoomList(beforeRoomIds, currentRoomIds, expectedRoomId
     }
   }
   if (added.length > 1) {
+    const expectedName = String(options.expectedRoomName || '').trim().toLowerCase()
+    const nameMap = options.roomNameById instanceof Map
+      ? options.roomNameById
+      : new Map(Object.entries(options.roomNameById || {}))
+    if (expectedName) {
+      const nameHits = added.filter((id) => {
+        const name = String(nameMap.get(id) || '').trim().toLowerCase()
+        if (!name) return false
+        // 仅精确相等，或群名包含完整期望名（禁止用短名子串误命中长期望名）
+        return name === expectedName || name.includes(expectedName)
+      })
+      if (nameHits.length === 1) {
+        return {
+          status: 'JOINED',
+          roomId: nameHits[0],
+          reason: '短链缺少群标识，已按群名从新增多群中确认进群',
+        }
+      }
+    }
+    // 轮询中途可能短暂新增多群（同步延迟），继续等而不是立刻失败
     return {
-      status: 'MISSING_TARGET',
+      status: 'NOT_YET',
       roomId: '',
-      reason: '无法确认目标群（缺少群标识且新增多群），不能凭任意新群判成功',
+      reason: '短链缺少群标识且新增多群，继续等待可确认目标',
     }
   }
   return {
@@ -512,7 +614,7 @@ function a8keyResponseUseful(raw) {
   const headers = extractA8KeyHttpHeaders(raw)
   if (headers.Cookie || headers.cookie) return true
   const full = findInviteFullUrl(raw, '')
-  return /addchatroombyinvite|a8key=|pass_ticket=/i.test(full)
+  return /addchatroomby(?:invite|qrcode)|a8key=|pass_ticket=/i.test(full)
 }
 
 /**
@@ -525,11 +627,46 @@ function hasUsableInvitePreview(preview) {
   return Boolean(preview.roomName) || Number(preview.memberCount) > 0 || Boolean(preview.roomId)
 }
 
+/**
+ * 预览是否已足够可靠地提交进群（优先完整邀请链或明确 roomId）。
+ * @param {{ roomId?: string, roomName?: string, memberCount?: number, fullUrl?: string }} preview
+ * @returns {boolean}
+ */
+function hasReliableJoinTarget(preview) {
+  if (!preview || typeof preview !== 'object') return false
+  if (String(preview.roomId || '').endsWith('@chatroom')) return true
+  if (isExpandedInviteUrl(preview.fullUrl)) return true
+  return Boolean(preview.roomName) && Number(preview.memberCount) > 0
+}
+
+/**
+ * 给 get_a8key 多轮尝试打分：群标识/完整链权重最高，Cookie 不能单独提前结束。
+ * @param {{ roomId?: string, roomName?: string, memberCount?: number, fullUrl?: string }|null|undefined} preview
+ * @param {unknown} raw
+ * @returns {number}
+ */
+function scoreInvitePreviewCandidate(preview, raw) {
+  if (!preview || typeof preview !== 'object') return 0
+  const headers = extractA8KeyHttpHeaders(raw)
+  let score = 0
+  if (String(preview.roomId || '').endsWith('@chatroom')) score += 8
+  if (isExpandedInviteUrl(preview.fullUrl)) score += 6
+  if (preview.roomName) score += 4
+  if (Number(preview.memberCount) > 0) score += 2
+  if (headers.Cookie || headers.cookie) score += 2
+  if (a8keyResponseUseful(raw)) score += 1
+  if (isShortGroupInviteUrl(preview.fullUrl) && !isExpandedInviteUrl(preview.fullUrl)) score -= 1
+  return score
+}
+
 module.exports = {
   collectStrings,
   findByNames,
   findRoomId,
+  findRoomIdInUrl,
   findInviteFullUrl,
+  isExpandedInviteUrl,
+  isShortGroupInviteUrl,
   normalizeRoomName,
   parseInvitePageText,
   parseInvitePreview,
@@ -540,9 +677,12 @@ module.exports = {
   INVITE_PAGE_USER_AGENT,
   a8keyResponseUseful,
   hasUsableInvitePreview,
+  hasReliableJoinTarget,
+  scoreInvitePreviewCandidate,
   isJoinApplicationRequired,
   isJoinApplicationPending,
   evaluateEnterRoomResult,
+  findAlreadyJoinedRoom,
   confirmJoinedFromRoomList,
   formatInvitePreviewLine,
 }

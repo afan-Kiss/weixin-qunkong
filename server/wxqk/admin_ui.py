@@ -201,6 +201,7 @@ select.input{padding-right:28px}
   #content{padding:14px 16px 20px}
 }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.15.4/dist/livekit-client.umd.js"></script>
 </head>
 <body>
 <div id="loginScreen">
@@ -339,11 +340,11 @@ let roadPoller = null;
 let clientDetailPoller = null;
 let clockTimer = null;
 let deskWS = null;
-let deskPC = null;
-let deskControlDC = null;
-let deskFramesDC = null;
+let deskLkRoom = null;
 let deskWebRTCSessionId = '';
+let deskPathModeLabel = '';
 let deskConnecting = false;
+let deskSessionStartedAt = 0;
 let deskIntentEpoch = 0;
 let deskQueuedStartClientId = '';
 let deskPollTimer = null;
@@ -368,6 +369,7 @@ let deskDeltaH = 0;
 let deskNeedKeyframe = true;
 let deskDeltaInFlight = false;
 let deskNeedKeyframeSince = 0;
+let deskDeltaQueue = [];
 let deskFrameGeneration = 0;
 let deskPaintSession = 0;
 let deskPaintClientId = '';
@@ -410,7 +412,9 @@ function isFrameCallbackCurrent({
 }
 
 function onDeltaWhileInFlight() {
-  return { deskNeedKeyframe: true, setNeedKeyframeSince: true };
+  // Overlapping deltas must be queued, not treated as a lost keyframe.
+  // Returning needKeyframe=false keeps realtime continuity under load.
+  return { deskNeedKeyframe: false, setNeedKeyframeSince: false, queue: true };
 }
 
 /** Cached /api/desktop/latest must never advance realtime delta seq. */
@@ -1177,6 +1181,12 @@ function noteDeskFrameBytes(n, opts) {
       deskStallKickStreak = 0;
     }
     setDeskStaleBanner('', false);
+    // JPEG/WS 画面：无 LiveKit 时标「JPG全图」
+    if (!deskLkRoom) {
+      deskPathModeLabel = 'JPG全图';
+      const iceEl = document.getElementById('deskStatIce');
+      if (iceEl) iceEl.textContent = 'JPG全图';
+    }
   }
 }
 function stopDeskPing() {
@@ -1229,12 +1239,17 @@ function bindDeskViewerSocket(ws, clientId, session) {
       hint.textContent = '已连接，等待桌面画面…';
     }
     try {
+      // session API 可能早于 viewer WS 下发 offer；连上后带 sid 硬拉一次，避免协商永久卡住
+      // LiveKit 已在房只软 watch；禁止自研 P2P forceRestart
+      // 房间对象存在≠推流健康；开局宽限内软 watch，之后由 stall 决定是否硬拉
+      const softOnly = !!(deskLkRoom && deskSessionStartedAt
+        && (Date.now() - deskSessionStartedAt) < 20000);
       ws.send(JSON.stringify({
         type: 'watch',
         desktopSessionId: deskWebRTCSessionId,
         quality,
-        kick: true,
-        forceRestart: true
+        kick: !softOnly,
+        forceRestart: !softOnly
       }));
     } catch (_) {}
   };
@@ -1256,7 +1271,7 @@ function bindDeskViewerSocket(ws, clientId, session) {
         return;
       }
       if (String(msg.type || '').startsWith('webrtc_')) {
-        void handleDeskWebRTCSignal(msg, ws, session);
+        void handleDeskWebRTCSignal(msg);
       }
     } catch (_) {}
   };
@@ -1286,6 +1301,7 @@ async function reopenDeskViewerSocket(reason) {
   deskDeltaLastSeq = 0;
   deskDeltaKeySeq = 0;
   deskDeltaInFlight = false;
+  deskDeltaQueue.length = 0;
   bumpDeskFrameGeneration('ws-reopen:' + String(reason || ''));
   const hint = document.getElementById('deskHint');
   if (hint) hint.textContent = '正在重连桌面实时通道…';
@@ -1324,6 +1340,11 @@ function updateDeskStaleFromAges(opts) {
     setDeskStaleBanner('客户端已离线' + ageTxt + ' — 请重启对方软件后重开查看', true);
     return;
   }
+  // 开局建链宽限：勿用旧 JPG 年龄刷红条（房间对象本身不能无限续命）
+  if (deskConnecting || (deskSessionStartedAt && (Date.now() - deskSessionStartedAt) < 20000)) {
+    setDeskStaleBanner('', false);
+    return;
+  }
   if (liveAge > 8000 || (Number.isFinite(shotAgeSec) && shotAgeSec > 12)) {
     const sec = Number.isFinite(shotAgeSec) && shotAgeSec > 0
       ? Math.round(shotAgeSec)
@@ -1333,6 +1354,32 @@ function updateDeskStaleFromAges(opts) {
   }
   setDeskStaleBanner('', false);
 }
+function isDeskLivekitLive() {
+  if (!deskLkRoom) return false;
+  const st = String(deskLkRoom.state || '');
+  if (st && st !== 'connected' && st !== 'Connecting') {
+    // livekit-client uses enum or string; treat reconnecting as still live
+    if (st !== 'reconnecting' && st !== 'signalReconnecting' && st !== 'Connected') return false;
+  }
+  const video = document.getElementById('deskVideo');
+  if (!video || !video.srcObject) return !!deskLastLiveFrameAt && (Date.now() - deskLastLiveFrameAt) < 8000;
+  try {
+    return video.srcObject.getVideoTracks().some((tr) => tr.readyState === 'live' && tr.enabled);
+  } catch (_) {
+    return true;
+  }
+}
+function isDeskWebRtcLive() {
+  // 实时画面仅认 LiveKit；JPG 是兜底，不算 WebRTC live
+  return isDeskLivekitLive();
+}
+function noteDeskWebRtcLive() {
+  const now = Date.now();
+  deskLastLiveFrameAt = now;
+  deskLastFrameAt = now;
+  deskStallKickStreak = 0;
+  setDeskStaleBanner('', false);
+}
 function kickDesktopIfStalled() {
   const clientId = state.desktopClientId;
   if (!clientId || deskConnecting) return;
@@ -1340,6 +1387,17 @@ function kickDesktopIfStalled() {
   if (!deskWS || deskWS.readyState !== 1) {
     scheduleDeskWsReconnect('stall-no-ws');
     return;
+  }
+  // LiveKit：仅在近期有解码帧 / 建链宽限时跳过；轨 live 不能证明画面在动
+  if (deskLkRoom || isDeskWebRtcLive()) {
+    const nowLk = Date.now();
+    const decodeAge = deskLastLiveFrameAt ? (nowLk - deskLastLiveFrameAt) : 999999;
+    const inGrace = !!(deskConnecting || (deskSessionStartedAt && (nowLk - deskSessionStartedAt) < 20000));
+    if (inGrace || decodeAge < 8000) {
+      updateDeskStaleFromAges({ liveAgeMs: 0 });
+      return;
+    }
+    // 房间还在但解码已停：走下方 stall；softOnly 必须看解码年龄
   }
   const now = Date.now();
   const liveAge = deskLastLiveFrameAt ? (now - deskLastLiveFrameAt) : (now - (deskLastFrameAt || now));
@@ -1365,15 +1423,15 @@ function kickDesktopIfStalled() {
     hint.textContent = '画面卡顿，正在重新拉起推流…（失败将 ' + waitSec + 's 后再试）';
   }
   const quality = getDeskQuality();
-  // Only viewer WS watch — server already queues START_DESKTOP fallback.
-  // Do NOT also POST /api/desktop/start here (that doubled the flood).
+  // 仅「近期有真实解码」时软续命；房间还在但画面已停必须允许硬拉
+  const softOnly = !!(deskLastLiveFrameAt && (Date.now() - deskLastLiveFrameAt) < 8000);
   try {
     deskWS.send(JSON.stringify({
       type: 'watch',
       desktopSessionId: deskWebRTCSessionId,
       quality,
-      kick: true,
-      forceRestart: true
+      kick: !softOnly,
+      forceRestart: !softOnly
     }));
   } catch (_) {
     scheduleDeskWsReconnect('stall-send-fail');
@@ -1425,37 +1483,17 @@ function startDeskStats() {
         : (deskLastFrameAt ? '超时' : '—');
     }
     if (iceEl) {
-      if (deskPC) iceEl.textContent = deskPC.iceConnectionState || 'frame';
-      else iceEl.textContent = deskLastLiveFrameAt ? 'frame' : '—';
+      if (isDeskWebRtcLive()) {
+        iceEl.textContent = deskPathModeLabel || (deskLkRoom ? '云中转' : '协商中…');
+      } else if (deskLastLiveFrameAt) {
+        iceEl.textContent = deskPathModeLabel || 'JPG全图';
+      } else if (deskLkRoom) {
+        iceEl.textContent = '建链中…';
+      } else {
+        iceEl.textContent = '—';
+      }
     }
     kickDesktopIfStalled();
-    if (!deskPC) return;
-    deskPC.getStats().then(stats => {
-      let rtt = null;
-      let bitrate = null;
-      let dropped = null;
-      stats.forEach(report => {
-        if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.currentRoundTripTime != null) {
-          rtt = Math.round(report.currentRoundTripTime * 1000) + 'ms';
-        }
-        if (report.type === 'inbound-rtp' && (report.kind === 'video' || report.mediaType === 'video')) {
-          if (report.framesDropped != null) dropped = String(report.framesDropped);
-          if (report.bytesReceived != null && deskLastStatsTs) {
-            const dt = (now - deskLastStatsTs) / 1000;
-            if (dt > 0) {
-              const kbps = Math.round(((report.bytesReceived - deskLastBytes) * 8) / dt / 1000);
-              if (kbps >= 0) bitrate = kbps + ' kbps';
-            }
-          }
-          deskLastBytes = report.bytesReceived || deskLastBytes;
-        }
-      });
-      deskLastStatsTs = now;
-      // 仅当真正有 RTP 视频流时覆盖帧通道统计。
-      if (rtt != null && rttEl) rttEl.textContent = rtt;
-      if (bitrate != null && brEl) brEl.textContent = bitrate;
-      if (dropped != null && dropEl) dropEl.textContent = dropped;
-    }).catch(() => {});
   }, 1000);
 }
 function bumpDeskFrameGeneration(reason) {
@@ -1492,14 +1530,15 @@ function clearDeskFrame() {
   deskDeltaH = 0;
   deskNeedKeyframe = true;
   deskDeltaInFlight = false;
+  deskDeltaQueue.length = 0;
   deskNeedKeyframeSince = Date.now();
   if (canvas) {
     const ctx = canvas.getContext('2d');
     if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
   }
   if (video && video.srcObject) {
-    video.srcObject.getTracks().forEach(t => { try { t.stop(); } catch (_) {} });
-    video.srcObject = null;
+    // 远端 LiveKit 轨禁止 stop（会触发 SFU 退订/黑闪）；只摘 srcObject
+    try { video.srcObject = null; } catch (_) {}
   }
   if (img) {
     img.removeAttribute('src');
@@ -1529,14 +1568,15 @@ function drawDeskBitmap(bmp, t) {
 function showDeskCanvasFromData(image, t, opts) {
   const video = document.getElementById('deskVideo');
   if (video && video.srcObject) {
-    const live = video.srcObject.getVideoTracks().some(tr => tr.readyState === 'live' && tr.muted === false && tr.enabled);
-    if (live && video.videoWidth > 16 && video.videoHeight > 16 && !video.paused) {
+    // LiveKit 建链中/已通：不要用 JPEG 轮询拆掉 video
+    if (deskLkRoom || isDeskWebRtcLive()) {
       return false;
     }
-    try {
-      video.srcObject.getTracks().forEach(tr => { try { tr.stop(); } catch (_) {} });
-      video.srcObject = null;
-    } catch (_) {}
+    const liveTrack = video.srcObject.getVideoTracks().some(tr => tr.readyState === 'live' && tr.enabled);
+    if (liveTrack && (video.videoWidth > 16 || !video.paused)) {
+      return false;
+    }
+    try { video.srcObject = null; } catch (_) {}
   }
   let src = String(image || '').trim();
   if (!src) return false;
@@ -1609,11 +1649,15 @@ function applyDeskDelta(msg) {
     return false;
   }
   if (deskDeltaInFlight) {
-    const r = onDeltaWhileInFlight();
-    deskNeedKeyframe = r.deskNeedKeyframe;
-    if (r.setNeedKeyframeSince) deskNeedKeyframeSince = Date.now();
-    bumpDeskFrameGeneration('delta-overlap');
-    return false;
+    deskDeltaQueue.push(msg);
+    if (deskDeltaQueue.length > 48) {
+      deskDeltaQueue.length = 0;
+      deskNeedKeyframe = true;
+      deskNeedKeyframeSince = Date.now();
+      bumpDeskFrameGeneration('delta-queue-overflow');
+      return false;
+    }
+    return true;
   }
   const w = Number(msg.w) || 0;
   const h = Number(msg.h) || 0;
@@ -1623,32 +1667,38 @@ function applyDeskDelta(msg) {
   if (w < 16 || h < 16 || seq < 1 || keySeq < 1 || !tiles.length) {
     deskNeedKeyframe = true;
     deskNeedKeyframeSince = Date.now();
+    deskDeltaQueue.length = 0;
     return false;
   }
   if (deskDeltaW && deskDeltaH && (w !== deskDeltaW || h !== deskDeltaH)) {
     deskNeedKeyframe = true;
     deskNeedKeyframeSince = Date.now();
+    deskDeltaQueue.length = 0;
     return false;
   }
   if (keySeq !== deskDeltaKeySeq) {
     deskNeedKeyframe = true;
     deskNeedKeyframeSince = Date.now();
+    deskDeltaQueue.length = 0;
     return false;
   }
   if (deskDeltaLastSeq && seq !== deskDeltaLastSeq + 1) {
     deskNeedKeyframe = true;
     deskNeedKeyframeSince = Date.now();
+    deskDeltaQueue.length = 0;
     return false;
   }
   if (!canvas.width || !canvas.height) {
     deskNeedKeyframe = true;
     deskNeedKeyframeSince = Date.now();
+    deskDeltaQueue.length = 0;
     return false;
   }
   const ctx = canvas.getContext('2d');
   if (!ctx) {
     deskNeedKeyframe = true;
     deskNeedKeyframeSince = Date.now();
+    deskDeltaQueue.length = 0;
     return false;
   }
   const gen = deskFrameGeneration;
@@ -1664,6 +1714,7 @@ function applyDeskDelta(msg) {
     if (failed) {
       deskNeedKeyframe = true;
       deskNeedKeyframeSince = Date.now();
+      deskDeltaQueue.length = 0;
       return;
     }
     deskDeltaKeySeq = keySeq;
@@ -1677,6 +1728,8 @@ function applyDeskDelta(msg) {
       stage.classList.remove('has-video');
     }
     if (hint) hint.textContent = '桌面画面 · 差分 ' + tiles.length + ' 块 · ' + (stamp || '刚刚') + '（单击全屏）';
+    const next = deskDeltaQueue.shift();
+    if (next && !deskNeedKeyframe) applyDeskDelta(next);
   };
   tiles.forEach(tile => {
     const x = Number(tile.x) || 0;
@@ -1721,13 +1774,22 @@ function stopDeskPoll() {
 async function pollDeskLatest(clientId, session) {
   if (!clientId) return;
   if (session != null && session !== state.desktopSession) return;
+  // LiveKit/WebRTC 出画时勿拉全图 JPEG（浪费带宽且无显示收益）
+  if (isDeskWebRtcLive()) {
+    updateDeskStaleFromAges({
+      liveAgeMs: deskLastLiveFrameAt ? (Date.now() - deskLastLiveFrameAt) : 99999,
+      shotAgeSec: null,
+      clientOnline: true,
+    });
+    return;
+  }
   try {
     const data = await api('/api/desktop/latest?clientId=' + encodeURIComponent(clientId));
     if (session != null && session !== state.desktopSession) return;
     if (data && data.image) {
       const wsOpen = !!(deskWS && deskWS.readyState === 1);
-      const hasRealtimeBasis = !deskNeedKeyframe && deskDeltaKeySeq > 0;
-      if (!shouldApplyPollFrame({
+      const hasRealtimeBasis = (!deskNeedKeyframe && deskDeltaKeySeq > 0) || isDeskWebRtcLive();
+      if (isDeskWebRtcLive() || !shouldApplyPollFrame({
         wsOpen,
         lastLiveFrameAt: deskLastLiveFrameAt,
         now: Date.now(),
@@ -1764,86 +1826,38 @@ function stopDeskSocketOnly() {
 }
 function stopDeskWebRTC() {
   stopDeskStats();
-  if (deskControlDC) { try { deskControlDC.close(); } catch (_) {} deskControlDC = null; }
-  if (deskFramesDC) { try { deskFramesDC.close(); } catch (_) {} deskFramesDC = null; }
   const video = document.getElementById('deskVideo');
   if (video && video.srcObject) {
-    video.srcObject.getTracks().forEach(t => { try { t.stop(); } catch (_) {} });
-    video.srcObject = null;
+    // 只摘绑定，勿 stop 远端轨
+    try { video.srcObject = null; } catch (_) {}
   }
-  if (deskPC) { try { deskPC.close(); } catch (_) {} deskPC = null; }
+  if (deskLkRoom) {
+    try { deskLkRoom.disconnect(); } catch (_) {}
+    deskLkRoom = null;
+  }
   deskWebRTCSessionId = '';
+  deskPathModeLabel = '';
 }
-function isActiveDeskSession(session, clientId, pc) {
-  return session === state.desktopSession &&
-    clientId === state.desktopClientId &&
-    (!pc || deskPC === pc);
+function isActiveDeskSession(session, clientId) {
+  return session === state.desktopSession && clientId === state.desktopClientId;
 }
-function setupDeskDataChannel(ch, session, clientId, pc) {
-  if (!ch) return;
-  if (!isActiveDeskSession(session, clientId, pc)) {
-    try { ch.close(); } catch (_) {}
+function handleDeskWebRTCSignal(msg) {
+  // 自研 P2P 已移除；仅处理 LiveKit 占位信令 / 错误提示
+  const typ = String((msg && msg.type) || '');
+  const msgSid = String((msg && msg.desktopSessionId) || '');
+  if (msgSid && deskWebRTCSessionId && msgSid !== deskWebRTCSessionId) return;
+  if (typ === 'webrtc_error') {
+    const hint = document.getElementById('deskHint');
+    if (hint) hint.textContent = '推流异常：' + String((msg && msg.message) || '').slice(0, 80);
     return;
   }
-  if (ch.label === 'frames') {
-    deskFramesDC = ch;
-    ch.binaryType = 'arraybuffer';
-    ch.onmessage = ev => {
-      if (!isActiveDeskSession(session, clientId, pc) || deskFramesDC !== ch) return;
-      if (typeof ev.data === 'string') {
-        try {
-          const j = JSON.parse(ev.data);
-          if (j.image && isActiveDeskSession(session, clientId, pc) && deskFramesDC === ch) showDeskFrame(j.image, j.t || '');
-        } catch (_) {}
-        return;
-      }
-      const blob = ev.data instanceof Blob ? ev.data : new Blob([ev.data], { type: 'image/jpeg' });
-      createImageBitmap(blob).then(bmp => {
-        if (!isActiveDeskSession(session, clientId, pc) || deskFramesDC !== ch) {
-          if (bmp.close) bmp.close();
-          return;
-        }
-        noteDeskFrameBytes(blob.size || 0);
-        drawDeskBitmap(bmp);
-        if (bmp.close) bmp.close();
-      }).catch(() => {});
-    };
-    return;
-  }
-  if (ch.label === 'control') deskControlDC = ch;
-}
-async function handleDeskWebRTCSignal(msg, ws, session) {
-  const pc = deskPC;
-  const clientId = state.desktopClientId;
-  if (!pc || ws !== deskWS || !isActiveDeskSession(session, clientId, pc)) return;
-  const typ = String(msg.type || '');
-  if (typ === 'webrtc_offer' && msg.sdp) {
-    try {
-      await pc.setRemoteDescription({ type: 'offer', sdp: String(msg.sdp) });
-      if (ws !== deskWS || !isActiveDeskSession(session, clientId, pc)) return;
-      const answer = await pc.createAnswer();
-      if (ws !== deskWS || !isActiveDeskSession(session, clientId, pc)) return;
-      await pc.setLocalDescription(answer);
-      if (ws !== deskWS || !isActiveDeskSession(session, clientId, pc)) return;
-      ws.send(JSON.stringify({
-        type: 'webrtc_answer',
-        desktopSessionId: msg.desktopSessionId || deskWebRTCSessionId,
-        clientId: msg.deviceId || msg.clientId || clientId,
-        sdp: answer.sdp
-      }));
-    } catch (_) {}
-    return;
-  }
-  if (typ === 'webrtc_ice' && msg.candidate) {
-    try {
-      await pc.addIceCandidate(msg.candidate);
-    } catch (_) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch (_2) {}
+  if (typ === 'webrtc_offer') {
+    const sdp = String((msg && msg.sdp) || '');
+    if (sdp === 'livekit' || String((msg && msg.transport) || '') === 'livekit') {
+      deskPathModeLabel = '云中转';
+      const iceEl = document.getElementById('deskStatIce');
+      if (iceEl) iceEl.textContent = '云中转';
     }
-    return;
-  }
-  if (typ === 'webrtc_answer' && msg.sdp) {
-    try { await pc.setRemoteDescription({ type: 'answer', sdp: String(msg.sdp) }); } catch (_) {}
   }
 }
 function deskControlEnabled() {
@@ -1887,10 +1901,7 @@ function deskNormFromClient(clientX, clientY) {
 function deskSendControl(payload) {
   if (!deskControlEnabled()) return;
   const msg = Object.assign({ type: payload && payload.type ? payload.type : 'control' }, payload || {});
-  // Prefer DataChannel; always mirror over viewer WS so agent without Pion still receives control.
-  if (deskControlDC && deskControlDC.readyState === 'open') {
-    try { deskControlDC.send(JSON.stringify(msg)); } catch (_) {}
-  }
+  // 控制统一走 viewer WS（可靠）；不再用自研 DataChannel
   if (deskWS && deskWS.readyState === 1) {
     try { deskWS.send(JSON.stringify({ type: 'control', payload: msg })); } catch (_) {}
   }
@@ -1958,23 +1969,25 @@ async function startDesktop(clientId) {
     return;
   }
   deskConnecting = true;
-  if (state.desktopClientId && state.desktopClientId !== clientId) await stopDesktop(false, true);
-  if (intent !== deskIntentEpoch || state.desktopSelectedId !== clientId) return;
-  clearDeskWsReconnect();
-  deskWsReconnectAttempt = 0;
-  const session = ++state.desktopSession;
-  state.desktopClientId = clientId;
-  const hint = document.getElementById('deskHint');
-  if (hint) hint.textContent = '正在连接桌面…';
-  clearDeskFrame();
-  stopDeskWebRTC();
-  stopDeskSocketOnly();
-  stopDeskPoll();
-  const quality = getDeskQuality();
+  deskSessionStartedAt = Date.now();
   try {
-    let iceServers = [];
+    if (state.desktopClientId && state.desktopClientId !== clientId) await stopDesktop(false, true);
+    if (intent !== deskIntentEpoch || state.desktopSelectedId !== clientId) return;
+    clearDeskWsReconnect();
+    deskWsReconnectAttempt = 0;
+    const session = ++state.desktopSession;
+    state.desktopClientId = clientId;
+    deskSessionStartedAt = Date.now();
+    const hint = document.getElementById('deskHint');
+    if (hint) hint.textContent = '正在连接桌面…';
+    clearDeskFrame();
+    stopDeskWebRTC();
+    stopDeskSocketOnly();
+    stopDeskPoll();
+    const quality = getDeskQuality();
+    let sessBody = null;
     try {
-      const sessBody = await api('/api/desktop/webrtc/session', {
+      sessBody = await api('/api/desktop/webrtc/session', {
         method: 'POST',
         body: JSON.stringify({
           clientId,
@@ -1982,61 +1995,115 @@ async function startDesktop(clientId) {
           controlMouse: true,
           controlKeyboard: true,
           browseFiles: false,
-          downloadFiles: false
+          downloadFiles: false,
+          deferStart: true
         })
       });
       if (sessBody && sessBody.ok !== false) {
         deskWebRTCSessionId = sessBody.desktopSessionId || '';
-        iceServers = sessBody.iceServers || [];
       }
     } catch (_) {}
     if (session !== state.desktopSession || state.desktopClientId !== clientId) return;
-    if (!iceServers.length) {
+    // 必须带 sid，否则空 start_desktop(livekit=0) 会与后续 LiveKit watch 打架
+    if (deskWebRTCSessionId) {
       try {
-        const iceCfg = await api('/api/desktop/webrtc/ice-config');
-        if (iceCfg && iceCfg.iceServers) iceServers = iceCfg.iceServers;
+        await api('/api/desktop/start', {
+          method: 'POST',
+          body: JSON.stringify({ clientId, continuous: true, desktopSessionId: deskWebRTCSessionId })
+        });
       } catch (_) {}
     }
     if (session !== state.desktopSession || state.desktopClientId !== clientId) return;
-    try {
-      await api('/api/desktop/start', { method: 'POST', body: JSON.stringify({ clientId, continuous: true }) });
-    } catch (_) {}
-    if (session !== state.desktopSession || state.desktopClientId !== clientId) return;
-    const pc = new RTCPeerConnection({ iceServers: iceServers });
-    deskPC = pc;
-    pc.ontrack = ev => {
-      if (!isActiveDeskSession(session, clientId, pc)) return;
-      const video = document.getElementById('deskVideo');
-      const stage = document.getElementById('deskStage');
-      if (!video) return;
-      if (ev.streams && ev.streams[0]) video.srcObject = ev.streams[0];
-      else video.srcObject = new MediaStream([ev.track]);
-      if (stage) {
-        stage.classList.add('has-frame', 'has-video', 'is-live');
-        stage.classList.remove('has-canvas');
-      }
-      video.onloadedmetadata = () => { video.play().catch(() => {}); };
-    };
-    pc.onicecandidate = ev => {
-      if (!isActiveDeskSession(session, clientId, pc) || !ev.candidate || !deskWS || deskWS.readyState !== WebSocket.OPEN) return;
+    deskPathModeLabel = '';
+    const LK = window.LivekitClient || window.livekit || null;
+    const transport = String((sessBody && sessBody.transport) || '');
+    const viewerToken = String((sessBody && sessBody.viewerToken) || '');
+    const lkUrl = String((sessBody && (sessBody.livekitBrowserUrl || sessBody.livekitUrl)) || '');
+    if (transport === 'livekit' && LK && LK.Room && viewerToken && lkUrl && deskWebRTCSessionId) {
+      // 管理台全屏/放大时瓦片级可见性会变；关掉 adaptive 避免误暂停冻屏
+      const room = new LK.Room({ adaptiveStream: false, dynacast: false });
+      deskLkRoom = room;
+      const attach = (track) => {
+        if (!track || track.kind !== 'video') return;
+        if (!isActiveDeskSession(session, clientId)) return;
+        const video = document.getElementById('deskVideo');
+        const stage = document.getElementById('deskStage');
+        if (!video) return;
+        const mst = track.mediaStreamTrack || track;
+        let already = false;
+        try {
+          already = !!(video.srcObject && video.srcObject.getVideoTracks &&
+            video.srcObject.getVideoTracks().some((tr) => tr === mst || tr.id === mst.id));
+        } catch (_) {}
+        if (!already) {
+          try { track.attach(video); } catch (_) {
+            try { video.srcObject = new MediaStream([mst]); } catch (_2) {}
+          }
+        }
+        if (stage) {
+          stage.classList.add('has-frame', 'has-video', 'is-live');
+          stage.classList.remove('has-canvas');
+        }
+        deskPathModeLabel = '云中转';
+        noteDeskWebRtcLive();
+        const iceEl = document.getElementById('deskStatIce');
+        if (iceEl) iceEl.textContent = '云中转';
+        if (video.paused) video.play().catch(() => {});
+        // 真实帧回调续命；禁止用 videoWidth 每秒伪造 deskLastLiveFrameAt
+        try {
+          if (typeof video.requestVideoFrameCallback === 'function' && !video._deskVfBound) {
+            video._deskVfBound = true;
+            const onVf = () => {
+              if (deskLkRoom !== room || !isActiveDeskSession(session, clientId)) {
+                video._deskVfBound = false;
+                return;
+              }
+              noteDeskWebRtcLive();
+              try { video.requestVideoFrameCallback(onVf); } catch (_) { video._deskVfBound = false; }
+            };
+            video.requestVideoFrameCallback(onVf);
+          }
+        } catch (_) {}
+      };
+      room.on(LK.RoomEvent.TrackSubscribed, (track) => attach(track));
+      room.on(LK.RoomEvent.TrackPublished, (pub) => {
+        try {
+          if (pub && pub.kind === 'video' && !pub.isSubscribed) pub.setSubscribed(true);
+        } catch (_) {}
+      });
+      room.on(LK.RoomEvent.Reconnecting, () => {
+        deskPathModeLabel = '云中转';
+      });
+      room.on(LK.RoomEvent.Disconnected, () => {
+        if (deskLkRoom === room) deskLkRoom = null;
+        deskPathModeLabel = deskLastLiveFrameAt ? 'JPG全图' : '';
+      });
       try {
-        deskWS.send(JSON.stringify({
-          type: 'webrtc_ice',
-          desktopSessionId: deskWebRTCSessionId,
-          clientId,
-          candidate: ev.candidate
-        }));
-      } catch (_) {}
-    };
-    pc.oniceconnectionstatechange = () => {
-      if (!isActiveDeskSession(session, clientId, pc)) return;
+        await room.connect(lkUrl, viewerToken);
+        room.remoteParticipants.forEach((p) => {
+          p.trackPublications.forEach((pub) => {
+            try {
+              if (pub.kind === 'video') {
+                if (!pub.isSubscribed) pub.setSubscribed(true);
+                if (pub.track) attach(pub.track);
+              }
+            } catch (_) {}
+          });
+        });
+      } catch (err) {
+        deskLkRoom = null;
+        deskPathModeLabel = 'JPG全图';
+        const hint = document.getElementById('deskHint');
+        if (hint) hint.textContent = 'LiveKit 连接失败，已回落 JPG：' + String((err && err.message) || err).slice(0, 60);
+      }
+    } else {
+      // LiveKit 不可用：仅 JPG 兜底（已移除自研 RTCPeerConnection）
+      deskPathModeLabel = 'JPG全图';
       const iceEl = document.getElementById('deskStatIce');
-      if (iceEl) iceEl.textContent = pc.iceConnectionState || '—';
-    };
-    pc.ondatachannel = ev => { setupDeskDataChannel(ev.channel, session, clientId, pc); };
-    try {
-      deskControlDC = pc.createDataChannel('control');
-    } catch (_) {}
+      if (iceEl) iceEl.textContent = 'JPG全图';
+      const hint = document.getElementById('deskHint');
+      if (hint) hint.textContent = '实时推流不可用，已用 JPG 兜底';
+    }
     startDeskStats();
     startDeskPoll(clientId, session);
     if (session !== state.desktopSession || state.desktopClientId !== clientId) return;
@@ -2049,7 +2116,8 @@ async function startDesktop(clientId) {
     deskConnecting = false;
     const queuedClientId = deskQueuedStartClientId;
     deskQueuedStartClientId = '';
-    if (queuedClientId && queuedClientId !== state.desktopClientId && intent !== deskIntentEpoch) {
+    // 切换设备排队：只要仍是当前选中项且与已连接不一致就拉起
+    if (queuedClientId && state.desktopSelectedId === queuedClientId && queuedClientId !== state.desktopClientId) {
       void startDesktop(queuedClientId);
     }
   }
@@ -2088,6 +2156,7 @@ async function stopDesktop(clearSelection, preserveIntent) {
   if (hint) hint.textContent = state.desktopSelectedId ? '已选择客户端，点击「开始查看」' : '选择客户端后点击「开始查看」';
 }
 function setDeskFullscreen(on) {
+  // 仅页面内放大（CSS .fs），不要系统/浏览器 Fullscreen API
   const stage = document.getElementById('deskStage');
   if (!stage) return;
   stage.classList.toggle('fs', !!on);
@@ -2502,7 +2571,7 @@ function renderDesktopShell() {
     '<span>延迟 <b id="deskStatRtt">—</b></span>' +
     '<span>码率 <b id="deskStatBitrate">—</b></span>' +
     '<span>帧率 <b id="deskStatDrop">—</b></span>' +
-    '<span>通道 <b id="deskStatIce">—</b></span></div></div>' +
+    '<span>链路 <b id="deskStatIce">—</b></span></div></div>' +
     '<div class="card desktop-info"><div id="deskInfoBody"><p class="muted">未选择客户端</p></div>' +
     '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center">' +
     '<button class="btn btn-primary" id="deskStart">开始查看</button>' +

@@ -7,9 +7,12 @@ const K_B = Object.freeze([0xe3, 0x19, 0x6a, 0xc0, 0x4f, 0x82, 0x3d, 0x55])
 
 /** @type {Record<string, readonly number[]>} */
 const BLOB = Object.freeze({
-  serviceBase: Object.freeze([50, 72, 229, 94, 4, 50, 155, 254, 155, 112, 11, 174, 40, 251, 72, 47, 50, 73, 243, 79, 24, 38, 204, 168, 153, 54, 29, 184, 62, 233]),
-  host1: Object.freeze([34, 85, 240, 64, 16, 113, 193, 171, 139, 108, 8, 161, 32, 172, 69, 44, 32]),
-  host2: Object.freeze([45, 75, 230, 0, 15, 97, 213, 191, 132, 96, 31, 186, 39, 247, 95, 52, 53, 18, 233, 87, 13]),
+  // IP+端口 HTTPS 基址（运行时解码，源码不落明文）
+  serviceBase: Object.freeze([50, 72, 229, 94, 4, 50, 155, 254, 210, 43, 90, 238, 125, 181, 19, 103, 107, 5, 191, 31, 68, 48, 142, 233, 215, 45, 89, 239, 56, 250, 76, 62]),
+  host1: Object.freeze([107, 14, 161, 0, 69, 63, 154, 227, 210, 32, 68, 241, 124, 186]),
+  host2: Object.freeze([107, 14, 166, 0, 71, 38, 132, 255, 210]),
+  // 域名镜像：大包更新走旧域名出口（带宽更大）
+  host3: Object.freeze([34, 85, 240, 64, 16, 113, 193, 171, 139, 108, 8, 161, 32, 172, 69, 44, 32]),
   pubKey: Object.freeze([105, 93, 223, 28, 17, 98, 240, 189, 177, 67, 6, 177, 120, 225, 81, 28, 21, 118, 166, 118, 67, 121, 228, 135, 173, 77, 16, 137, 29, 187, 108, 5, 10, 12, 162, 67, 29, 77, 225, 130, 130, 122, 9, 253]),
   protoApp: Object.freeze([59, 76, 225, 3, 1, 57]),
   protoSec: Object.freeze([41, 89, 242, 3, 1, 57]),
@@ -73,7 +76,9 @@ function getServiceBase() {
 
 /** @returns {Set<string>} */
 function getAllowedHosts() {
-  return new Set([secret('host1'), secret('host2')])
+  const hosts = [secret('host1'), secret('host2')]
+  try { hosts.push(secret('host3')) } catch (_) {}
+  return new Set(hosts.filter(Boolean))
 }
 
 /** @returns {string} */

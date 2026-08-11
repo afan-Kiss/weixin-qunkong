@@ -44,6 +44,7 @@ EXTRA_PY = [
     # back to the previous tiny-part behavior.
     "chunk_upload.py",
     "webrtc_session.py",
+    "livekit_session.py",
     "current_table_store.py",
     "predictor_ws.py",
 ]

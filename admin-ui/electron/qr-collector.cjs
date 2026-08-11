@@ -316,7 +316,28 @@ function yieldMain() {
 }
 
 /**
- * 根据消息 XML 或「自己发送图片」回调顶层字段构造 /api/cdn_download 请求。
+ * 深层查找字段（自己发图回调常把 CDN 参数嵌在 img / ImageObject / content 对象里）。
+ * @param {unknown} row
+ * @param {string[]} names
+ * @param {number} [depth]
+ * @param {WeakSet<object>} [seen]
+ * @returns {string}
+ */
+function deepFieldString(row, names, depth = 0, seen = new WeakSet()) {
+  const top = fieldString(row, names)
+  if (top) return top
+  if (!row || typeof row !== 'object' || depth > 4 || seen.has(row)) return ''
+  seen.add(row)
+  for (const value of Object.values(row)) {
+    if (!value || typeof value !== 'object') continue
+    const found = deepFieldString(value, names, depth + 1, seen)
+    if (found) return found
+  }
+  return ''
+}
+
+/**
+ * 根据消息 XML 或「自己发送图片」回调顶层/嵌套字段构造 /api/cdn_download 请求。
  * 自己发图回调常见：cdnmidImgUrl / aeskey（camelCase，不在 XML 里）。
  * @param {unknown} row 消息行或回调事件
  * @param {string} outputPath 落盘路径
@@ -326,15 +347,18 @@ function cdnDownloadRequest(row, outputPath) {
   const joined = row && typeof row === 'object' && typeof row._decodedBlob === 'string'
     ? row._decodedBlob
     : messageTextBlob(row)
-  const mid = xmlString(joined, ['cdnmidimgurl'])
-    || fieldString(row, ['cdnmidImgUrl', 'cdnmidimgurl', 'cdn_mid_img_url', 'cdnMidImgUrl'])
-  const big = xmlString(joined, ['cdnbigimgurl'])
-    || fieldString(row, ['cdnbigImgUrl', 'cdnbigimgurl', 'cdn_big_img_url', 'cdnBigImgUrl'])
-  const thumb = xmlString(joined, ['cdnthumburl'])
-    || fieldString(row, ['cdnthumbImgUrl', 'cdnthumburl', 'cdn_thumb_img_url', 'cdnThumbImgUrl'])
-  const fileid = mid || big || thumb || xmlString(joined, ['fileid', 'cdndataurl']) || fieldString(row, ['fileid', 'fileId', 'cdndataurl'])
-  const asekey = xmlString(joined, ['aeskey', 'cdnthumbaeskey'])
-    || fieldString(row, ['aeskey', 'aesKey', 'cdnthumbAeskey', 'cdnthumbaeskey', 'cdnThumbAeskey'])
+  const unescaped = unescapeXmlEntities(joined)
+  const mid = xmlString(joined, ['cdnmidimgurl']) || xmlString(unescaped, ['cdnmidimgurl'])
+    || deepFieldString(row, ['cdnmidImgUrl', 'cdnmidimgurl', 'cdn_mid_img_url', 'cdnMidImgUrl'])
+  const big = xmlString(joined, ['cdnbigimgurl']) || xmlString(unescaped, ['cdnbigimgurl'])
+    || deepFieldString(row, ['cdnbigImgUrl', 'cdnbigimgurl', 'cdn_big_img_url', 'cdnBigImgUrl'])
+  const thumb = xmlString(joined, ['cdnthumburl']) || xmlString(unescaped, ['cdnthumburl'])
+    || deepFieldString(row, ['cdnthumbImgUrl', 'cdnthumburl', 'cdn_thumb_img_url', 'cdnThumbImgUrl'])
+  const fileid = mid || big || thumb
+    || xmlString(joined, ['fileid', 'cdndataurl']) || xmlString(unescaped, ['fileid', 'cdndataurl'])
+    || deepFieldString(row, ['fileid', 'fileId', 'cdndataurl', 'cdnDataUrl'])
+  const asekey = xmlString(joined, ['aeskey', 'cdnthumbaeskey']) || xmlString(unescaped, ['aeskey', 'cdnthumbaeskey'])
+    || deepFieldString(row, ['aeskey', 'aesKey', 'cdnthumbAeskey', 'cdnthumbaeskey', 'cdnThumbAeskey', 'cdnAesKey'])
   if (!fileid || !asekey) return null
   // 1 高清 2 普通 3 缩略图（与接口说明一致）；历史采集优先普通图更快
   let imgType = 2
@@ -376,14 +400,16 @@ function downloadRequest(row, roomId, accountWxid, outputPath) {
   const joined = row && typeof row === 'object' && typeof row._decodedBlob === 'string'
     ? row._decodedBlob
     : messageTextBlob(row)
+  const unescaped = unescapeXmlEntities(joined)
   const msgId = pickDownloadMsgId(row, joined)
-  const totalLen = Number(fieldString(row, ['totalLen', 'total_len', 'total_length', 'length', 'cdnmidImgSize', 'dataLen']))
+  const totalLen = Number(deepFieldString(row, ['totalLen', 'total_len', 'total_length', 'length', 'cdnmidImgSize', 'cdnMidImgSize', 'dataLen']))
     || Number(valueOf(row, ['total_len', 'total_length', 'length']))
     || xmlNumber(joined, ['hdlength', 'length', 'hevc_mid_size'])
+    || xmlNumber(unescaped, ['hdlength', 'length', 'hevc_mid_size'])
   if (!msgId || !totalLen || !accountWxid) return null
   // 自己发到群：from=自己 to=群；别人发：from=群。download_img 的 from_user 用会话方（群 ID）
-  const toName = fieldString(row, ['toUserName', 'to_user_name', 'to_user'])
-  const fromName = fieldString(row, ['fromUserName', 'from_user_name', 'from_user'])
+  const toName = deepFieldString(row, ['toUserName', 'to_user_name', 'to_user'])
+  const fromName = deepFieldString(row, ['fromUserName', 'from_user_name', 'from_user'])
   const peer = String(roomId || '').endsWith('@chatroom')
     ? String(roomId)
     : (toName.endsWith('@chatroom') ? toName : (fromName.endsWith('@chatroom') ? fromName : String(roomId || '')))
