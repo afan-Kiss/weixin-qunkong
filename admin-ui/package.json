@@ -1,8 +1,8 @@
 {
   "name": "wx-group-admin-ui",
   "private": true,
-  "version": "1.82.0",
-  "releaseSequence": 78,
+  "version": "1.85.0",
+  "releaseSequence": 81,
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -16,10 +16,10 @@
     "build": "vue-tsc -b && vite build",
     "bump:version": "node scripts/bump-version.cjs",
     "ensure:hooks": "node scripts/ensure-hooks.cjs",
-    "package:win": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && electron-builder --win portable",
-    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && electron-builder --win portable",
-    "publish:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory",
-    "publish:release:skip-bump": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory -SkipBump",
+    "package:win": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && node scripts/package-portable.cjs",
+    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && node scripts/package-portable.cjs",
+    "publish:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory -InsecureTls",
+    "publish:release:skip-bump": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory -SkipBump -InsecureTls",
     "preview": "vite preview",
     "electron": "electron ."
   },
@@ -80,7 +80,7 @@
       "target": [
         "portable"
       ],
-      "artifactName": "微信群控系统v1.82.${ext}",
+      "artifactName": "微信群控系统v1.85.${ext}",
       "signAndEditExecutable": false
     },
     "nsis": {

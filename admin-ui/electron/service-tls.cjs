@@ -14,7 +14,7 @@ const {
 const net = require('net')
 const https = require('https')
 const tls = require('tls')
-const { getServiceBase, getAllowedHosts } = require('./secure-config.cjs')
+const { getServiceBase, getAllowedHosts, getTlsSpkiPins } = require('./secure-config.cjs')
 
 /** @type {Map<string, string[]>} pin 格式：sha256/<base64 SPKI hash> */
 const CERT_PINS = new Map()
@@ -29,9 +29,16 @@ let pinEnforcementEnabled = false
 let unpinnedCompatWarned = false
 
 ;(function loadEnvPins() {
-  const raw = process.env.WXQK_TLS_SPKI_PINS || ''
+  let raw = process.env.WXQK_TLS_SPKI_PINS || ''
   if (!raw.trim()) {
-    try { console.warn('[TLS] TLS_PIN_NOT_CONFIGURED — 未配置 WXQK_TLS_SPKI_PINS') } catch (_) {}
+    try {
+      raw = getTlsSpkiPins().join(',')
+    } catch (_) {
+      raw = ''
+    }
+  }
+  if (!raw.trim()) {
+    try { console.warn('[TLS] TLS_PIN_NOT_CONFIGURED — 未配置 WXQK_TLS_SPKI_PINS / 内置 pin') } catch (_) {}
     return
   }
   const pins = raw.split(',').map((s) => s.trim()).filter(Boolean)

@@ -13,6 +13,8 @@ const BLOB = Object.freeze({
   host2: Object.freeze([107, 14, 166, 0, 71, 38, 132, 255, 210]),
   // 域名镜像：大包更新走旧域名出口（带宽更大）
   host3: Object.freeze([34, 85, 240, 64, 16, 113, 193, 171, 139, 108, 8, 161, 32, 172, 69, 44, 32]),
+  // 线上 8443 证书 SPKI pin（运行时解码；可用 WXQK_TLS_SPKI_PINS 覆盖/轮换）
+  tlsSpkiPins: Object.freeze([41, 84, 240, 28, 66, 62, 155, 129, 166, 106, 11, 244, 1, 231, 76, 62, 44, 75, 221, 72, 2, 88, 222, 133, 165, 43, 0, 246, 57, 250, 84, 20, 20, 91, 208, 67, 17, 74, 242, 149, 185, 117, 63, 249, 24, 250, 113, 6, 27, 87, 172]),
   pubKey: Object.freeze([105, 93, 223, 28, 17, 98, 240, 189, 177, 67, 6, 177, 120, 225, 81, 28, 21, 118, 166, 118, 67, 121, 228, 135, 173, 77, 16, 137, 29, 187, 108, 5, 10, 12, 162, 67, 29, 77, 225, 130, 130, 122, 9, 253]),
   protoApp: Object.freeze([59, 76, 225, 3, 1, 57]),
   protoSec: Object.freeze([41, 89, 242, 3, 1, 57]),
@@ -84,6 +86,15 @@ function getAllowedHosts() {
 /** @returns {string} */
 function getPublishPublicKeyB64() {
   return secret('pubKey')
+}
+
+/**
+ * 内置 TLS SPKI pin 列表（逗号分隔）；环境变量 WXQK_TLS_SPKI_PINS 可覆盖。
+ * @returns {string[]}
+ */
+function getTlsSpkiPins() {
+  const raw = secret('tlsSpkiPins')
+  return String(raw || '').split(',').map((s) => s.trim()).filter(Boolean)
 }
 
 /**
@@ -176,6 +187,7 @@ module.exports = {
   getServiceBase,
   getAllowedHosts,
   getPublishPublicKeyB64,
+  getTlsSpkiPins,
   getProtocol,
   getLegacyManifestDefaults,
   getAgentWsPath,
