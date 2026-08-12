@@ -1,8 +1,8 @@
 {
   "name": "wx-group-admin-ui",
   "private": true,
-  "version": "1.90.0",
-  "releaseSequence": 86,
+  "version": "1.93.0",
+  "releaseSequence": 89,
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -19,8 +19,9 @@
     "build": "vue-tsc -b && vite build",
     "bump:version": "node scripts/bump-version.cjs",
     "ensure:hooks": "node scripts/ensure-hooks.cjs",
-    "package:win": "node scripts/ensure-hooks.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/package-portable.cjs",
-    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/package-portable.cjs",
+    "generate:portable-splash": "node scripts/generate-portable-splash.cjs",
+    "package:win": "node scripts/ensure-hooks.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/generate-portable-splash.cjs && node scripts/package-portable.cjs",
+    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/generate-portable-splash.cjs && node scripts/package-portable.cjs",
     "publish:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory",
     "publish:release:skip-bump": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory -SkipBump",
     "preview": "vite preview",
@@ -51,6 +52,10 @@
     "appId": "cn.local.wechat.groupcontrol",
     "productName": "微信群控管理平台",
     "asar": true,
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
     "directories": {
       "output": "release-v19"
     },
@@ -92,8 +97,12 @@
       "target": [
         "portable"
       ],
-      "artifactName": "微信群控系统v1.90.${ext}",
+      "artifactName": "微信群控系统v1.93.${ext}",
       "signAndEditExecutable": false
+    },
+    "portable": {
+      "splashImage": "build/portable-splash.bmp",
+      "useZip": true
     },
     "nsis": {
       "oneClick": false,

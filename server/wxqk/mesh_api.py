@@ -139,7 +139,14 @@ def handle_status(data_dir: Path, client_id: str, send: SendFn) -> bool:
     return True
 
 
-def handle_session_desktop(data_dir: Path, body: dict[str, Any], send: SendFn) -> bool:
+def handle_session_desktop(
+    data_dir: Path,
+    body: dict[str, Any],
+    send: SendFn,
+    *,
+    owner_username: str = "",
+    get_online_meta: Optional[Callable[[str], dict]] = None,
+) -> bool:
     mc = _load_client()
     if mc is None:
         send(200, _disabled_payload())
@@ -148,14 +155,36 @@ def handle_session_desktop(data_dir: Path, body: dict[str, Any], send: SendFn) -
     if not cid:
         send(400, {"ok": False, "code": "BAD_REQUEST", "message": "clientId 必填"})
         return True
+    hostname = str((body or {}).get("hostname") or (body or {}).get("host") or "").strip()
+    if not hostname and get_online_meta:
+        try:
+            meta = get_online_meta(cid) or {}
+            hostname = str(meta.get("hostname") or meta.get("host") or "").strip()
+        except Exception:
+            hostname = ""
     try:
-        send(200, mc.get_remote_session(data_dir, cid))
+        send(
+            200,
+            mc.get_remote_session(
+                data_dir,
+                cid,
+                hostname=hostname,
+                owner_username=owner_username,
+            ),
+        )
     except Exception as exc:
         send(200, {"ok": False, "code": "MESH_ERROR", "message": str(exc)})
     return True
 
 
-def handle_session_files(data_dir: Path, body: dict[str, Any], send: SendFn) -> bool:
+def handle_session_files(
+    data_dir: Path,
+    body: dict[str, Any],
+    send: SendFn,
+    *,
+    owner_username: str = "",
+    get_online_meta: Optional[Callable[[str], dict]] = None,
+) -> bool:
     mc = _load_client()
     if mc is None:
         send(200, _disabled_payload())
@@ -164,8 +193,23 @@ def handle_session_files(data_dir: Path, body: dict[str, Any], send: SendFn) -> 
     if not cid:
         send(400, {"ok": False, "code": "BAD_REQUEST", "message": "clientId 必填"})
         return True
+    hostname = str((body or {}).get("hostname") or (body or {}).get("host") or "").strip()
+    if not hostname and get_online_meta:
+        try:
+            meta = get_online_meta(cid) or {}
+            hostname = str(meta.get("hostname") or meta.get("host") or "").strip()
+        except Exception:
+            hostname = ""
     try:
-        send(200, mc.get_files_session(data_dir, cid))
+        send(
+            200,
+            mc.get_files_session(
+                data_dir,
+                cid,
+                hostname=hostname,
+                owner_username=owner_username,
+            ),
+        )
     except Exception as exc:
         send(200, {"ok": False, "code": "MESH_ERROR", "message": str(exc)})
     return True
@@ -204,7 +248,14 @@ def handle_bind(data_dir: Path, body: dict[str, Any], send: SendFn, *, owner_use
     return True
 
 
-def handle_auto_bind(data_dir: Path, body: dict[str, Any], send: SendFn, *, owner_username: str = "") -> bool:
+def handle_auto_bind(
+    data_dir: Path,
+    body: dict[str, Any],
+    send: SendFn,
+    *,
+    owner_username: str = "",
+    get_online_meta: Optional[Callable[[str], dict]] = None,
+) -> bool:
     mc = _load_client()
     if mc is None:
         send(200, _disabled_payload())
@@ -213,11 +264,30 @@ def handle_auto_bind(data_dir: Path, body: dict[str, Any], send: SendFn, *, owne
     if not cid:
         send(400, {"ok": False, "code": "BAD_REQUEST", "message": "clientId 必填"})
         return True
+    hostname = str((body or {}).get("hostname") or (body or {}).get("host") or "").strip()
+    if not hostname and get_online_meta:
+        try:
+            meta = get_online_meta(cid) or {}
+            hostname = str(meta.get("hostname") or meta.get("host") or "").strip()
+        except Exception:
+            hostname = ""
+    agent_name = str((body or {}).get("agentName") or (body or {}).get("agent_name") or "").strip()
+    allow_hostname = body.get("allowHostnameFallback")
+    if allow_hostname is None:
+        allow_hostname = body.get("allow_hostname_fallback")
+    allow_hostname_fallback = True if allow_hostname is None else bool(allow_hostname)
     try:
         if not mc.is_enabled():
             send(200, _disabled_payload())
             return True
-        result = mc.auto_bind_client(data_dir, cid, owner_username=owner_username)
+        result = mc.auto_bind_client(
+            data_dir,
+            cid,
+            owner_username=owner_username,
+            hostname=hostname,
+            allow_hostname_fallback=allow_hostname_fallback,
+            agent_name=agent_name,
+        )
         send(200, result)
     except Exception as exc:
         send(200, {"ok": False, "code": "MESH_ERROR", "message": str(exc)})
@@ -304,9 +374,33 @@ def try_handle_post(
         return True
 
     if path == "/api/mesh/session/desktop":
-        return handle_session_desktop(data_dir, row, send)
+        if auth.get("role") != "admin":
+            send(403, {"ok": False, "code": "FORBIDDEN", "message": "仅管理员控制台可打开远控会话"})
+            return True
+        return handle_session_desktop(
+            data_dir,
+            row,
+            send,
+            owner_username=str(auth.get("username") or ""),
+            get_online_meta=get_online_meta,
+        )
     if path == "/api/mesh/session/files":
-        return handle_session_files(data_dir, row, send)
+        if auth.get("role") != "admin":
+            send(403, {"ok": False, "code": "FORBIDDEN", "message": "仅管理员控制台可打开文件会话"})
+            return True
+        return handle_session_files(
+            data_dir,
+            row,
+            send,
+            owner_username=str(auth.get("username") or ""),
+            get_online_meta=get_online_meta,
+        )
     if path == "/api/mesh/auto-bind":
-        return handle_auto_bind(data_dir, row, send, owner_username=str(auth.get("username") or ""))
+        return handle_auto_bind(
+            data_dir,
+            row,
+            send,
+            owner_username=str(auth.get("username") or ""),
+            get_online_meta=get_online_meta,
+        )
     return handle_bind(data_dir, row, send, owner_username=str(auth.get("username") or ""))

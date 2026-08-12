@@ -19,6 +19,9 @@ const LOG_TAG = '[MESH]'
 const SERVICE_NAME = 'Mesh Agent'
 const EXE_NAME = 'meshagent.exe'
 const MSH_NAME = 'meshagent.msh'
+const AGENT_NAME_PREFIX = 'WXQK-'
+/** MeshServer / MeshID / ServerID / MeshName must never be rewritten from clientId. */
+const MSH_IDENTITY_KEYS = new Set(['MeshServer', 'MeshID', 'ServerID', 'MeshName'])
 
 /** @type {{ spawn?: typeof spawn, execFile?: typeof execFile, fs?: typeof fs, platform?: NodeJS.Platform, resourcesPath?: string, isPackaged?: boolean, now?: () => number }} */
 let deps = {
@@ -111,6 +114,218 @@ function resolveMeshAgentPaths() {
 }
 
 /**
+ * Windows service install directory (where MeshAgent actually runs from).
+ * 64-bit agent installs to Program Files; older 32-bit builds use Program Files (x86).
+ * @returns {{ dir: string, exePath: string, mshPath: string } | null}
+ */
+function resolveInstalledMeshAgentPaths() {
+  if (deps.installedAgentDir) {
+    const dir = String(deps.installedAgentDir)
+    return {
+      dir,
+      exePath: path.join(dir, 'MeshAgent.exe'),
+      mshPath: path.join(dir, 'MeshAgent.msh'),
+    }
+  }
+  if ((deps.platform || process.platform) !== 'win32') return null
+  const candidates = [
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Mesh Agent'),
+    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Mesh Agent'),
+  ]
+  const fsApi = deps.fs || fs
+  for (const dir of candidates) {
+    try {
+      if (fsApi.existsSync(path.join(dir, 'MeshAgent.exe'))) {
+        const mshCap = path.join(dir, 'MeshAgent.msh')
+        const mshLow = path.join(dir, MSH_NAME)
+        return {
+          dir,
+          exePath: path.join(dir, 'MeshAgent.exe'),
+          mshPath: fsApi.existsSync(mshCap) ? mshCap : mshLow,
+        }
+      }
+    } catch { /* continue */ }
+  }
+  return null
+}
+
+/**
+ * True when a running Agent cannot be matched as WXQK-<clientId> (missing/stale msh).
+ * @param {string} clientId
+ */
+function installedAgentNeedsRepair(clientId) {
+  const expected = buildAgentName(clientId)
+  if (!expected) return false
+  const installed = resolveInstalledMeshAgentPaths()
+  if (!installed) return true
+  const fsApi = deps.fs || fs
+  try {
+    if (!fsApi.existsSync(installed.mshPath)) return true
+    const raw = fsApi.readFileSync(installed.mshPath, 'utf8')
+    const parsed = parseMshText(raw)
+    const current = String(parsed.get('agentName') || '').trim()
+    if (current !== expected) return true
+    // Also repair when packaged template endpoint/cert changed (e.g. 8444→4433).
+    const templatePath = resolveMeshAgentPaths().mshPath
+    if (fileExists(templatePath)) {
+      const tmpl = parseMshText(fsApi.readFileSync(templatePath, 'utf8'))
+      for (const key of ['MeshServer', 'ServerID', 'MeshID']) {
+        const want = String(tmpl.get(key) || '').trim()
+        const got = String(parsed.get(key) || '').trim()
+        if (want && got && want !== got) return true
+      }
+    }
+    return false
+  } catch {
+    return true
+  }
+}
+
+/**
+ * Validate clientId before writing agentName into msh.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function safeClientIdForAgent(value) {
+  const id = String(value || '').trim()
+  if (!id || id.length > 128 || !/^[A-Za-z0-9._:@-]+$/.test(id)) return ''
+  return id
+}
+
+/**
+ * MeshAgent display name sent to MeshCentral (replaces hostname for new installs).
+ * @param {string} clientId
+ * @returns {string}
+ */
+function buildAgentName(clientId) {
+  const cid = safeClientIdForAgent(clientId)
+  return cid ? `${AGENT_NAME_PREFIX}${cid}` : ''
+}
+
+/**
+ * Parse msh key=value lines (ignore blanks / comments).
+ * @param {string} text
+ * @returns {Map<string, string>}
+ */
+function parseMshText(text) {
+  const map = new Map()
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+    const eq = line.indexOf('=')
+    if (eq <= 0) continue
+    const key = line.slice(0, eq).trim()
+    const val = line.slice(eq + 1).trim()
+    if (key) map.set(key, val)
+  }
+  return map
+}
+
+/**
+ * Serialize msh map preserving identity keys; set/replace agentName only.
+ * @param {Map<string, string>} map
+ * @param {string} agentName
+ * @returns {string}
+ */
+function serializeMshWithAgentName(map, agentName) {
+  const next = new Map(map)
+  if (agentName) next.set('agentName', agentName)
+  else next.delete('agentName')
+  const lines = []
+  for (const [key, val] of next.entries()) {
+    lines.push(`${key}=${val}`)
+  }
+  return `${lines.join('\n')}\n`
+}
+
+/**
+ * Copy template msh → staging and set agentName=WXQK-<clientId>.
+ * Never mutates the shared resources template.
+ * @param {{ clientId: string, stagingDir: string, templateMshPath?: string }} opts
+ */
+function stageMshForClient(opts) {
+  const clientId = safeClientIdForAgent(opts.clientId)
+  const agentName = buildAgentName(clientId)
+  if (!clientId || !agentName) {
+    return { ok: false, code: 'BAD_CLIENT_ID', message: 'clientId 无效，无法写入 agentName' }
+  }
+  const templatePath = opts.templateMshPath || resolveMeshAgentPaths().mshPath
+  const stagingDir = String(opts.stagingDir || '').trim()
+  if (!stagingDir) {
+    return { ok: false, code: 'BAD_STAGING', message: 'staging 目录无效' }
+  }
+  const fsApi = deps.fs || fs
+  if (!fileExists(templatePath)) {
+    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 meshagent.msh 模板' }
+  }
+  try {
+    fsApi.mkdirSync(stagingDir, { recursive: true })
+  } catch (err) {
+    return { ok: false, code: 'STAGING_MKDIR_FAILED', message: String(err?.message || err) }
+  }
+  let raw = ''
+  try {
+    raw = fsApi.readFileSync(templatePath, 'utf8')
+  } catch (err) {
+    return { ok: false, code: 'MSH_READ_FAILED', message: String(err?.message || err) }
+  }
+  const parsed = parseMshText(raw)
+  for (const key of MSH_IDENTITY_KEYS) {
+    if (!parsed.has(key) || !String(parsed.get(key) || '').trim()) {
+      return { ok: false, code: 'MSH_IDENTITY_INCOMPLETE', message: `模板缺少 ${key}` }
+    }
+  }
+  // Guard: never overwrite Mesh identity with agentName accidentally
+  const beforeIdentity = Object.fromEntries([...MSH_IDENTITY_KEYS].map((k) => [k, parsed.get(k)]))
+  const stagedText = serializeMshWithAgentName(parsed, agentName)
+  const staged = parseMshText(stagedText)
+  for (const key of MSH_IDENTITY_KEYS) {
+    if (staged.get(key) !== beforeIdentity[key]) {
+      return { ok: false, code: 'MSH_IDENTITY_MUTATED', message: `拒绝修改 ${key}` }
+    }
+  }
+  if (staged.get('agentName') !== agentName) {
+    return { ok: false, code: 'MSH_AGENT_NAME_FAILED', message: 'agentName 写入失败' }
+  }
+  const outPath = path.join(stagingDir, MSH_NAME)
+  try {
+    fsApi.writeFileSync(outPath, stagedText, 'utf8')
+  } catch (err) {
+    return { ok: false, code: 'MSH_WRITE_FAILED', message: String(err?.message || err) }
+  }
+  return { ok: true, code: 'OK', agentName, mshPath: outPath, stagingDir }
+}
+
+/**
+ * Prepare staging dir with exe + agentName msh for a fresh install.
+ * @param {string} clientId
+ */
+function prepareInstallStaging(clientId) {
+  const paths = resolveMeshAgentPaths()
+  if (!fileExists(paths.exePath) || !fileExists(paths.mshPath)) {
+    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 meshagent.exe 或 meshagent.msh' }
+  }
+  const fsApi = deps.fs || fs
+  const stagingDir = path.join(os.tmpdir(), `wxqk-mesh-stage-${safeClientIdForAgent(clientId) || 'x'}-${Date.now()}`)
+  const staged = stageMshForClient({ clientId, stagingDir, templateMshPath: paths.mshPath })
+  if (!staged.ok) return staged
+  const stagedExe = path.join(stagingDir, EXE_NAME)
+  try {
+    fsApi.copyFileSync(paths.exePath, stagedExe)
+  } catch (err) {
+    return { ok: false, code: 'EXE_COPY_FAILED', message: String(err?.message || err) }
+  }
+  return {
+    ok: true,
+    code: 'OK',
+    stagingDir,
+    exePath: stagedExe,
+    mshPath: staged.mshPath,
+    agentName: staged.agentName,
+  }
+}
+
+/**
  * @param {string} filePath
  */
 function fileExists(filePath) {
@@ -157,21 +372,53 @@ function runExecFile(command, args, opts = {}) {
  * Elevate a command via PowerShell Start-Process -Verb RunAs (UAC).
  * @param {string} file
  * @param {string[]} args
+ * @param {{ cwd?: string }} [opts]
  */
-async function runElevated(file, args) {
+async function runElevated(file, args, opts = {}) {
   if ((deps.platform || process.platform) !== 'win32') {
-    return runExecFile(file, args)
+    return runExecFile(file, args, { cwd: opts.cwd })
   }
   const argList = (args || []).map((a) => `'${String(a).replace(/'/g, "''")}'`).join(',')
+  const cwd = String(opts.cwd || '').trim()
+  const wd = cwd ? ` -WorkingDirectory '${cwd.replace(/'/g, "''")}'` : ''
   const ps = [
     `$p = Start-Process -FilePath '${String(file).replace(/'/g, "''")}'`,
     argList ? ` -ArgumentList @(${argList})` : '',
+    wd,
     ' -Verb RunAs -Wait -PassThru -WindowStyle Hidden',
     '; if ($null -eq $p) { exit 1 } else { exit $p.ExitCode }',
   ].join('')
   return runExecFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
     timeoutMs: 300000,
   })
+}
+
+/**
+ * Copy staged MeshAgent.msh into the Windows install directory (requires elevation).
+ * @param {string} stagedMshPath
+ */
+async function syncInstalledMsh(stagedMshPath) {
+  const installed = resolveInstalledMeshAgentPaths()
+  if (!installed || !fileExists(stagedMshPath)) {
+    return { ok: false, code: 'MSH_SYNC_SKIP', message: 'install dir or staged msh missing' }
+  }
+  const destCap = path.join(installed.dir, 'MeshAgent.msh')
+  const destLow = path.join(installed.dir, MSH_NAME)
+  const dest = destCap
+  const src = String(stagedMshPath).replace(/'/g, "''")
+  const dst = dest.replace(/'/g, "''")
+  const dstLow = destLow.replace(/'/g, "''")
+  const ps = [
+    `Copy-Item -LiteralPath '${src}' -Destination '${dst}' -Force;`,
+    `if (Test-Path -LiteralPath '${dstLow}') { if ('${dstLow}' -ne '${dst}') { Remove-Item -LiteralPath '${dstLow}' -Force -ErrorAction SilentlyContinue } }`,
+  ].join(' ')
+  const result = await runElevated('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps])
+  return {
+    ok: result.ok,
+    code: result.ok ? 'OK' : 'MSH_SYNC_FAILED',
+    message: result.ok ? 'msh synced' : redact(result.stderr || result.error || 'msh sync failed'),
+    dest,
+  }
 }
 
 /**
@@ -257,8 +504,11 @@ async function getMeshAgentStatus() {
 /**
  * Install MeshAgent as a Windows service when possible.
  * Elevates only for install.
+ * When clientId is provided, installs from a staged msh with agentName=WXQK-<clientId>.
+ * @param {{ clientId?: string }} [options]
  */
-async function installMeshAgent() {
+async function installMeshAgent(options = {}) {
+  const clientId = safeClientIdForAgent(options.clientId)
   const paths = resolveMeshAgentPaths()
   if (!fileExists(paths.exePath) || !fileExists(paths.mshPath)) {
     log('ERROR', 'install aborted: agent files missing', { exe: paths.exePath, msh: paths.mshPath })
@@ -268,25 +518,53 @@ async function installMeshAgent() {
     return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows 安装 MeshAgent 服务' }
   }
 
-  log('INFO', 'installing MeshAgent service')
+  let installExe = paths.exePath
+  let agentName = ''
+  let stagingDir = ''
+  if (clientId) {
+    const staged = prepareInstallStaging(clientId)
+    if (!staged.ok) {
+      log('ERROR', 'staging msh failed', { code: staged.code, message: staged.message })
+      return { ok: false, code: staged.code, message: staged.message }
+    }
+    installExe = staged.exePath
+    agentName = staged.agentName
+    stagingDir = staged.stagingDir
+    log('INFO', 'installing MeshAgent from staging', { agentName })
+  } else {
+    log('INFO', 'installing MeshAgent service')
+  }
+
+  const elevateOpts = stagingDir ? { cwd: stagingDir } : {}
   // Common MeshAgent flags: -fullinstall installs service + copies files.
-  let result = await runElevated(paths.exePath, ['-fullinstall'])
+  // WorkingDirectory must be staging so MeshAgent.msh is picked up next to the exe.
+  let result = await runElevated(installExe, ['-fullinstall'], elevateOpts)
   if (!result.ok) {
-    result = await runElevated(paths.exePath, ['-install'])
+    result = await runElevated(installExe, ['-install'], elevateOpts)
   }
   if (!result.ok) {
     // Fallback: some builds use "Mesh Service install"
-    result = await runElevated(paths.exePath, ['Mesh', 'Service', 'install'])
+    result = await runElevated(installExe, ['Mesh', 'Service', 'install'], elevateOpts)
+  }
+
+  let mshSync = null
+  if (stagingDir && clientId) {
+    const stagedMsh = path.join(stagingDir, MSH_NAME)
+    mshSync = await syncInstalledMsh(stagedMsh)
+    log(mshSync.ok ? 'INFO' : 'WARN', 'post-install msh sync', mshSync)
   }
 
   const after = await getMeshAgentStatus()
   const ok = result.ok || after.servicePresent || after.status === 'running'
-  log(ok ? 'INFO' : 'ERROR', 'install finished', { ok, status: after.status })
+  log(ok ? 'INFO' : 'ERROR', 'install finished', { ok, status: after.status, agentName: agentName || undefined })
   return {
     ok,
     code: ok ? 'OK' : 'MESH_INSTALL_FAILED',
     message: ok ? 'MeshAgent 已安装' : redact(result.stderr || result.error || '安装失败'),
     status: after,
+    agentName: agentName || undefined,
+    stagingDir: stagingDir || undefined,
+    mshSynced: Boolean(mshSync && mshSync.ok),
   }
 }
 
@@ -340,15 +618,15 @@ async function restartMeshAgent() {
   return startMeshAgent()
 }
 
-async function repairMeshAgent() {
+async function repairMeshAgent(options = {}) {
   log('INFO', 'repairing MeshAgent')
   const stopped = await stopMeshAgent()
   const paths = resolveMeshAgentPaths()
   if (!fileExists(paths.exePath) || !fileExists(paths.mshPath)) {
     return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 meshagent.exe 或 meshagent.msh', status: await getMeshAgentStatus() }
   }
-  // Re-run fullinstall elevated, then start.
-  const installed = await installMeshAgent()
+  // Re-run fullinstall elevated (with agentName when clientId known), then start.
+  const installed = await installMeshAgent({ clientId: options.clientId })
   if (!installed.ok) {
     return { ok: false, code: 'MESH_REPAIR_FAILED', message: installed.message, stop: stopped, install: installed }
   }
@@ -393,17 +671,34 @@ async function uninstallMeshAgent() {
 
 /**
  * Lifecycle helper: missing→install, stopped→start, running→noop, broken→repair.
+ * New installs use staged msh with agentName=WXQK-<clientId>.
  * @param {{ clientId?: string }} [options]
  */
 async function ensureMeshAgentRunning(options = {}) {
-  const clientId = String(options.clientId || '').trim()
+  const clientId = safeClientIdForAgent(options.clientId)
   log('INFO', 'ensureMeshAgentRunning', { clientId: clientId || undefined })
   const before = await getMeshAgentStatus()
   if (before.status === 'running') {
+    // 旧安装常在“服务已运行”但无 agentName / 无 msh：MeshCentral 节点列表为空，无法绑定
+    if (clientId && installedAgentNeedsRepair(clientId)) {
+      log('WARN', 'running agent missing/stale agentName — repairing', {
+        clientId,
+        expected: buildAgentName(clientId),
+      })
+      const repaired = await repairMeshAgent({ clientId })
+      return {
+        ok: repaired.ok,
+        code: repaired.ok ? 'OK' : repaired.code,
+        action: 'repair',
+        message: repaired.message,
+        status: repaired.status || (await getMeshAgentStatus()),
+        agentName: buildAgentName(clientId),
+      }
+    }
     return { ok: true, code: 'OK', action: 'noop', message: 'MeshAgent 已在运行', status: before }
   }
   if (before.status === 'missing') {
-    const installed = await installMeshAgent()
+    const installed = await installMeshAgent({ clientId })
     if (!installed.ok) {
       return { ok: false, code: installed.code, action: 'install', message: installed.message, status: installed.status || before }
     }
@@ -414,6 +709,7 @@ async function ensureMeshAgentRunning(options = {}) {
       action: 'install_start',
       message: started.message,
       status: started.status,
+      agentName: installed.agentName,
     }
   }
   if (before.status === 'stopped' || before.status === 'installed_no_service') {
@@ -426,8 +722,8 @@ async function ensureMeshAgentRunning(options = {}) {
       status: started.status,
     }
   }
-  // broken / unknown / error
-  const repaired = await repairMeshAgent()
+  // broken / unknown / error — repair may reinstall with agentName when clientId known
+  const repaired = await repairMeshAgent({ clientId })
   return {
     ok: repaired.ok,
     code: repaired.ok ? 'OK' : repaired.code,
@@ -440,6 +736,8 @@ async function ensureMeshAgentRunning(options = {}) {
 module.exports = {
   LOG_TAG,
   SERVICE_NAME,
+  AGENT_NAME_PREFIX,
+  MSH_IDENTITY_KEYS,
   resolveMeshAgentPaths,
   getMeshAgentStatus,
   getMeshAgentVersion,
@@ -450,6 +748,14 @@ module.exports = {
   repairMeshAgent,
   uninstallMeshAgent,
   ensureMeshAgentRunning,
+  safeClientIdForAgent,
+  buildAgentName,
+  parseMshText,
+  serializeMshWithAgentName,
+  stageMshForClient,
+  prepareInstallStaging,
+  resolveInstalledMeshAgentPaths,
+  installedAgentNeedsRepair,
   setMeshAgentDepsForTest,
   resetMeshAgentDepsForTest,
   redact,

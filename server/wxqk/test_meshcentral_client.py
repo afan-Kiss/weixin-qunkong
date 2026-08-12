@@ -151,19 +151,79 @@ class MeshCentralClientTest(unittest.TestCase):
 
     def test_match_node_for_client_prefers_exact_unique(self):
         nodes = [
-            {"_id": "n1", "name": "client-a", "host": "pc1"},
+            {"_id": "n1", "name": "WXQK-client-a", "host": "pc1"},
             {"_id": "n2", "name": "other", "host": "pc2", "desc": "client-a spare"},
         ]
-        hit = mc.match_node_for_client(nodes, "client-a")
+        hit, err = mc.match_node_for_client(nodes, "client-a")
+        self.assertEqual(err, "")
         self.assertIsNotNone(hit)
         self.assertEqual(hit["_id"], "n1")
-        self.assertIsNone(mc.match_node_for_client(nodes, "missing"))
-        # Ambiguous exact matches → no bind
+        miss, miss_err = mc.match_node_for_client(nodes, "missing")
+        self.assertIsNone(miss)
+        self.assertEqual(miss_err, "MESH_NO_MATCH")
+        # Ambiguous agentName matches → no bind
         amb = [
-            {"_id": "a", "name": "cid1"},
-            {"_id": "b", "name": "cid1"},
+            {"_id": "a", "name": "WXQK-cid1"},
+            {"_id": "b", "name": "WXQK-cid1"},
         ]
-        self.assertIsNone(mc.match_node_for_client(amb, "cid1"))
+        node, code = mc.match_node_for_client(amb, "cid1")
+        self.assertIsNone(node)
+        self.assertEqual(code, "MESH_AMBIGUOUS")
+
+    def test_match_node_for_client_hostname_fallback(self):
+        nodes = [
+            {"_id": "n1", "name": "DESKTOP-ABC", "host": "desktop-abc"},
+            {"_id": "n2", "name": "other", "host": "pc2"},
+        ]
+        hit, err = mc.match_node_for_client(nodes, "wxqk-client-uuid", hostname="DESKTOP-ABC")
+        self.assertEqual(err, "")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["_id"], "n1")
+        # Ambiguous hostname → no bind
+        amb = [
+            {"_id": "a", "name": "SAME-PC", "host": "same-pc"},
+            {"_id": "b", "name": "SAME-PC", "host": "same-pc"},
+        ]
+        node, code = mc.match_node_for_client(amb, "cid-x", hostname="SAME-PC")
+        self.assertIsNone(node)
+        self.assertEqual(code, "MESH_HOSTNAME_AMBIGUOUS")
+        # Hostname fallback can be disabled for new clients
+        none, none_err = mc.match_node_for_client(
+            nodes, "wxqk-client-uuid", hostname="DESKTOP-ABC", allow_hostname_fallback=False
+        )
+        self.assertIsNone(none)
+        self.assertEqual(none_err, "MESH_NO_MATCH")
+
+    def test_agent_name_for_client(self):
+        self.assertEqual(mc.agent_name_for_client("abc"), "WXQK-abc")
+        self.assertEqual(mc.agent_name_for_client(""), "")
+
+    def test_get_remote_session_autobinds_when_unbound(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+
+            def fake_auto_bind(_data_dir, client_id, **_kwargs):
+                mc.sync_device_mapping(
+                    data_dir,
+                    client_id=client_id,
+                    mesh_node_id="node-auto",
+                    mesh_group_id="g1",
+                    mesh_agent_status="online",
+                )
+                return {
+                    "ok": True,
+                    "code": "OK",
+                    "bound": True,
+                    "meshNodeId": "node-auto",
+                    "mapping": {"mesh_node_id": "node-auto"},
+                }
+
+            with mock.patch.object(mc, "auto_bind_client", side_effect=fake_auto_bind):
+                with mock.patch.object(mc, "mint_login_token", return_value="tok"):
+                    sess = mc.get_remote_session(data_dir, "c-new", hostname="PC1")
+            self.assertTrue(sess["ok"])
+            self.assertIn("node=node-auto", sess["embedUrl"])
+            self.assertEqual(mc.get_mapping(data_dir, "c-new")["mesh_node_id"], "node-auto")
 
     def test_config_snapshot_hides_key_material(self):
         snap = mc.config_snapshot()

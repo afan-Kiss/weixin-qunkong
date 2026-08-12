@@ -1103,6 +1103,8 @@ def touch_online(meta: dict[str, Any]) -> None:
                 incoming.pop("password", None)
         if not str(incoming.get("account") or "").strip() and prev.get("account"):
             incoming.pop("account", None)
+        if not str(incoming.get("hostname") or "").strip() and prev.get("hostname"):
+            incoming.pop("hostname", None)
         if not str(incoming.get("plan") or "").strip() and prev.get("plan"):
             incoming.pop("plan", None)
         if not str(incoming.get("planSummary") or "").strip() and prev.get("planSummary"):
@@ -2570,6 +2572,7 @@ class Handler(BaseHTTPRequestHandler):
                             "ip": ip,
                             "account": str(msg.get("account") or "")[:80],
                             "version": str(msg.get("version") or "")[:40],
+                            "hostname": str(msg.get("hostname") or msg.get("host") or "")[:120],
                             "desktopWatching": bool(msg.get("desktopWatching")),
                             "capabilities": msg.get("capabilities") if isinstance(msg.get("capabilities"), dict) else {},
                             **online_runtime_fields(msg),
@@ -2586,6 +2589,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "ip": ip,
                                 "account": str(payload.get("account") or "")[:80],
                                 "version": str(payload.get("version") or "")[:40],
+                                "hostname": str(payload.get("hostname") or payload.get("host") or "")[:120],
                                 "desktopWatching": bool(payload.get("desktopWatching")),
                                 "capabilities": payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {},
                                 **online_runtime_fields(payload),

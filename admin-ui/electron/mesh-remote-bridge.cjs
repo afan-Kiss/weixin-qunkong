@@ -1,11 +1,13 @@
-/**
- * MeshCentral remote session bridge (main process only).
- * Login tokens / embed URLs never enter the Vue renderer.
- * Renderer may only pass clientId — never nodeId.
+﻿/**
+ * Silent MeshAgent bridge (main process only).
+ * Product UI must not expose remote desktop/files; admin console owns viewing.
+ *
+ * Unified prepare flow: ensureMeshReady(clientId)
+ * — single-flight, idempotent, non-blocking for UI.
  */
 'use strict'
 
-const { BrowserWindow, session } = require('electron')
+const os = require('os')
 const http = require('http')
 const https = require('https')
 const { getServiceBase } = require('./secure-config.cjs')
@@ -13,14 +15,37 @@ const { insecureTlsForService } = require('./service-tls.cjs')
 const softwareAuth = require('./software-auth.cjs')
 const meshAgent = require('./mesh-agent-manager.cjs')
 
-let sessionWindow = null
-/** @type {Electron.Session | null} */
-let sessionPartition = null
-/** @type {(() => (Electron.BrowserWindow | null)) | null} */
-let parentWindowGetter = null
+/** Wait for Mesh node registration / bind after Agent start */
+const PREPARE_RETRY_DELAYS_MS = [0, 1500, 2500, 4000, 6000, 10000, 15000, 20000, 30000]
 
-function setParentWindowGetter(fn) {
-  parentWindowGetter = typeof fn === 'function' ? fn : null
+const PHASE = {
+  IDLE: 'idle',
+  CHECKING: 'checking',
+  INSTALLING: 'installing',
+  STARTING: 'starting',
+  WAITING_NODE: 'waiting_node',
+  BINDING: 'binding',
+  READY: 'ready',
+  FAILED: 'failed',
+}
+
+/** @type {Promise<any> | null} */
+let inflightPrepare = null
+/** @type {string} */
+let inflightClientId = ''
+
+/** Latest prepare snapshot for UI / diagnostics (no secrets). */
+let prepareState = {
+  phase: PHASE.IDLE,
+  remoteReady: false,
+  clientId: '',
+  agentName: '',
+  meshNodeId: '',
+  meshGroupId: '',
+  code: '',
+  message: '',
+  userMessage: '',
+  updatedAt: 0,
 }
 
 function log(message, details) {
@@ -30,6 +55,8 @@ function log(message, details) {
         .replace(/login=[^&\s"']+/gi, 'login=***')
         .replace(/auth=[^&\s"']+/gi, 'auth=***')
         .replace(/"embedUrl"\s*:\s*"[^"]*"/gi, '"embedUrl":"***"')
+        .replace(/MeshID=[^"&\s]+/gi, 'MeshID=***')
+        .replace(/ServerID=[^"&\s]+/gi, 'ServerID=***')
       : ''
     console.log(`[MESH] ${message}${safe ? ` ${safe}` : ''}`)
   } catch {
@@ -38,9 +65,56 @@ function log(message, details) {
 }
 
 function safeClientId(value) {
-  const id = String(value || '').trim()
-  if (!id || id.length > 128 || !/^[A-Za-z0-9._:@-]+$/.test(id)) return ''
-  return id
+  return meshAgent.safeClientIdForAgent(value)
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)))
+}
+
+function redactClientId(clientId) {
+  const id = String(clientId || '')
+  if (id.length <= 8) return id ? '***' : ''
+  return `${id.slice(0, 4)}…${id.slice(-4)}`
+}
+
+function setPrepareState(patch) {
+  prepareState = {
+    ...prepareState,
+    ...patch,
+    updatedAt: Date.now(),
+  }
+  return prepareState
+}
+
+function getMeshPrepareStatus() {
+  return { ...prepareState }
+}
+
+function userMessageForCode(code, fallback) {
+  const c = String(code || '')
+  if (c === 'MESH_AGENT_FILES_MISSING' || c === 'MESH_INSTALL_FAILED' || c === 'MSH_IDENTITY_INCOMPLETE') {
+    return '远程服务安装失败'
+  }
+  if (c === 'MESH_START_FAILED' || c === 'MESH_REPAIR_FAILED') {
+    return '远程服务无法启动'
+  }
+  if (c === 'MESH_DISABLED' || c === 'MESH_UNAVAILABLE' || c === 'MESH_WS_UNAVAILABLE' || c === 'MESH_SYNC_FAILED' || c === 'MESH_WS_ERROR') {
+    return 'MeshCentral 不可用'
+  }
+  if (c === 'MESH_AMBIGUOUS' || c === 'MESH_HOSTNAME_AMBIGUOUS') {
+    return '发现重复设备'
+  }
+  if (c === 'MESH_NO_MATCH' || c === 'MESH_UNBOUND' || c === 'MESH_BIND_REQUEST_FAILED' || c === 'MESH_NODE_ID_MISSING') {
+    return '设备绑定失败'
+  }
+  if (c === 'MESH_AGENT_OFFLINE' || c === 'MESH_NODE_TIMEOUT') {
+    return 'MeshAgent 无法连接服务器'
+  }
+  if (c === 'BAD_CLIENT_ID' || c === 'BAD_REQUEST') {
+    return '远程服务准备失败'
+  }
+  return String(fallback || '远程服务准备失败')
 }
 
 async function requestMeshJson(method, pathname, body) {
@@ -78,192 +152,261 @@ async function requestMeshJson(method, pathname, body) {
   })
 }
 
-async function wipeSessionPartition() {
-  const ses = sessionPartition
-  sessionPartition = null
-  if (!ses) return
-  try { await ses.clearStorageData() } catch { /* ignore */ }
-  try { await ses.clearCache() } catch { /* ignore */ }
-  try { await ses.clearAuthCache() } catch { /* ignore */ }
+async function requestAutoBind(clientId, hostname) {
+  const body = {
+    clientId,
+    agentName: meshAgent.buildAgentName(clientId),
+    allowHostnameFallback: true,
+  }
+  if (hostname) body.hostname = hostname
+  const res = await requestMeshJson('POST', '/api/mesh/auto-bind', body)
+  return {
+    httpStatus: res.status,
+    ...(res.data && typeof res.data === 'object' ? res.data : {}),
+  }
 }
 
-async function closeSessionWindow() {
-  if (sessionWindow && !sessionWindow.isDestroyed()) {
-    try { sessionWindow.destroy() } catch { /* ignore */ }
+async function requestMeshStatus(clientId) {
+  const res = await requestMeshJson('GET', `/api/mesh/status?clientId=${encodeURIComponent(clientId)}`)
+  return {
+    httpStatus: res.status,
+    ...(res.data && typeof res.data === 'object' ? res.data : {}),
   }
-  sessionWindow = null
-  await wipeSessionPartition()
-  log('session closed')
-  return { ok: true }
+}
+
+function isBindSuccess(result) {
+  if (!result || typeof result !== 'object') return false
+  if (result.ok === false) return false
+  if (result.code === 'MESH_DISABLED') return false
+  if (result.bound === true) return true
+  if (result.code === 'OK' && (result.meshNodeId || result.mapping?.mesh_node_id)) return true
+  return false
+}
+
+function shouldStopBindRetry(result) {
+  const code = String(result?.code || '')
+  return (
+    code === 'MESH_DISABLED'
+    || code === 'BAD_REQUEST'
+    || code === 'UNAUTHORIZED'
+    || code === 'FORBIDDEN'
+    || code === 'MESH_AMBIGUOUS'
+    || code === 'MESH_HOSTNAME_AMBIGUOUS'
+  )
+}
+
+function mappingFromBind(result) {
+  const nodeId = String(result?.meshNodeId || result?.mapping?.mesh_node_id || '').trim()
+  const groupId = String(result?.mapping?.mesh_group_id || result?.meshGroupId || '').trim()
+  return { meshNodeId: nodeId, meshGroupId: groupId }
+}
+
+function finishReady(clientId, agentName, bind) {
+  const { meshNodeId, meshGroupId } = mappingFromBind(bind || {})
+  log('ready', { clientId: redactClientId(clientId), meshNodeId: meshNodeId ? `${meshNodeId.slice(0, 6)}…` : undefined })
+  return setPrepareState({
+    phase: PHASE.READY,
+    remoteReady: true,
+    clientId,
+    agentName: agentName || meshAgent.buildAgentName(clientId),
+    meshNodeId,
+    meshGroupId,
+    code: 'OK',
+    message: '远程服务已就绪',
+    userMessage: '远程服务已就绪',
+  })
+}
+
+function finishFailed(clientId, code, message) {
+  const userMessage = userMessageForCode(code, message)
+  log('prepare failed', { clientId: redactClientId(clientId), code, message })
+  return setPrepareState({
+    phase: PHASE.FAILED,
+    remoteReady: false,
+    clientId,
+    code: String(code || 'MESH_PREPARE_FAILED'),
+    message: String(message || userMessage),
+    userMessage,
+  })
 }
 
 /**
- * Open MeshCentral embed URL in a dedicated BrowserWindow (not system browser).
- * webSecurity stays enabled. Temporary partition — no persist: cookies.
- *
- * TLS: Mesh embed partition must use Chromium's default system trust only.
- * Do NOT call installServiceCertificateTrust / setCertificateVerifyProc here.
- * Do NOT attach certificate-error → callback(true).
- * Production Mesh URL uses a publicly trusted Let's Encrypt IP certificate.
+ * Unified Mesh prepare state machine (idempotent, single-flight).
+ * Does not block Electron UI — callers must fire-and-forget or await without gating window show.
+ * @param {string} clientId
+ * @param {{ force?: boolean }} [opts]
  */
-function openEmbedWindow(embedUrl, title) {
-  const url = String(embedUrl || '').trim()
-  if (!url || !/^https?:\/\//i.test(url)) {
-    return { ok: false, code: 'BAD_EMBED_URL', message: '无效的远控嵌入地址' }
-  }
-  // Never accept nodeId from renderer; URL must come from wxqk server only.
-  if (/[?&]node=/i.test(url) === false || /[?&]login=/i.test(url) === false) {
-    return { ok: false, code: 'BAD_EMBED_URL', message: '嵌入地址缺少必要参数' }
-  }
-
-  void closeSessionWindow()
-
-  const partitionName = `temp:mesh-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  sessionPartition = session.fromPartition(partitionName)
-
-  const parent = parentWindowGetter ? parentWindowGetter() : null
-  const opts = {
-    width: 1280,
-    height: 800,
-    title: title || '远程维护',
-    autoHideMenuBar: true,
-    show: false,
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-      partition: partitionName,
-    },
-  }
-  if (parent && !parent.isDestroyed()) {
-    opts.parent = parent
-  }
-
-  sessionWindow = new BrowserWindow(opts)
-  sessionWindow.setMenuBarVisibility(false)
-  sessionWindow.on('closed', () => {
-    sessionWindow = null
-    void wipeSessionPartition()
-  })
-  sessionWindow.once('ready-to-show', () => {
-    try { sessionWindow.show() } catch { /* ignore */ }
-  })
-  sessionWindow.loadURL(url).catch((err) => {
-    log('embed load failed', { error: String(err?.message || err) })
-  })
-  log('embed window opened', { title: title || '远程维护', partition: 'temp' })
-  return { ok: true }
-}
-
-function mapStatusCode(server, localStatus) {
-  if (server?.code) return String(server.code)
-  if (localStatus === 'missing') return 'AGENT_MISSING'
-  if (localStatus === 'broken') return 'AGENT_BROKEN'
-  if (localStatus === 'stopped' || localStatus === 'installed_no_service') return 'AGENT_STOPPED'
-  if (localStatus === 'pending') return 'AGENT_STARTING'
-  return 'OK'
-}
-
-async function getRemoteStatus(clientId) {
+async function ensureMeshReady(clientId, opts = {}) {
   const cid = safeClientId(clientId)
-  if (!cid) return { ok: false, code: 'BAD_REQUEST', message: 'clientId 无效' }
-  const local = await meshAgent.getMeshAgentStatus()
-  let server = null
-  try {
-    const res = await requestMeshJson('GET', `/api/mesh/status?clientId=${encodeURIComponent(cid)}`)
-    server = res.data
-    if (res.status === 401 || res.status === 403) {
-      return {
-        ok: false,
-        code: res.status === 403 ? 'FORBIDDEN' : 'UNAUTHORIZED',
-        message: String(server?.message || '无权查看该设备'),
-        clientId: cid,
-        localAgent: {
-          installed: local.status !== 'missing',
-          running: local.status === 'running',
-          status: local.status,
-          version: String(local.version || ''),
-        },
-      }
-    }
-  } catch (err) {
-    server = { ok: false, code: 'MESH_UNREACHABLE', message: String(err?.message || err) }
+  if (!cid) {
+    return finishFailed('', 'BAD_CLIENT_ID', '缺少设备标识')
   }
-  const localStatus = String(local.status || '')
-  return {
-    ok: Boolean(server?.ok ?? true) && server?.code !== 'MESH_UNREACHABLE' && server?.code !== 'MESH_DISABLED',
-    code: mapStatusCode(server, localStatus),
-    message: String(server?.message || ''),
-    clientId: cid,
-    bound: Boolean(server?.bound),
-    meshNodeId: String(server?.meshNodeId || server?.mapping?.mesh_node_id || ''),
-    meshAgentStatus: String(localStatus || server?.mapping?.mesh_agent_status || ''),
-    meshLastSeen: String(server?.mapping?.mesh_last_seen || ''),
-    version: String(local.version || ''),
-    localAgent: {
-      installed: localStatus !== 'missing',
-      running: localStatus === 'running',
-      status: localStatus,
-      version: String(local.version || ''),
-    },
-    mapping: server?.mapping || null,
-  }
-}
 
-async function openDesktopSession(clientId) {
-  const cid = safeClientId(clientId)
-  if (!cid) return { ok: false, code: 'BAD_REQUEST', message: 'clientId 无效' }
-  const res = await requestMeshJson('POST', '/api/mesh/session/desktop', { clientId: cid })
-  const data = res.data || {}
-  if (res.status === 401 || res.status === 403) {
-    return { ok: false, code: res.status === 403 ? 'FORBIDDEN' : 'UNAUTHORIZED', message: data.message || '无权操作该设备' }
+  if (
+    !opts.force
+    && prepareState.remoteReady
+    && prepareState.clientId === cid
+    && prepareState.meshNodeId
+  ) {
+    return getMeshPrepareStatus()
   }
-  if (!data.ok || !data.embedUrl) {
-    return { ok: false, code: data.code || 'MESH_SESSION_ERROR', message: data.message || '无法创建远程桌面会话' }
-  }
-  return openEmbedWindow(data.embedUrl, `远程桌面 · ${cid.slice(0, 12)}`)
-}
 
-async function openFilesSession(clientId) {
-  const cid = safeClientId(clientId)
-  if (!cid) return { ok: false, code: 'BAD_REQUEST', message: 'clientId 无效' }
-  const res = await requestMeshJson('POST', '/api/mesh/session/files', { clientId: cid })
-  const data = res.data || {}
-  if (res.status === 401 || res.status === 403) {
-    return { ok: false, code: res.status === 403 ? 'FORBIDDEN' : 'UNAUTHORIZED', message: data.message || '无权操作该设备' }
+  if (inflightPrepare && inflightClientId === cid) {
+    return inflightPrepare
   }
-  if (!data.ok || !data.embedUrl) {
-    return { ok: false, code: data.code || 'MESH_SESSION_ERROR', message: data.message || '无法创建文件管理会话' }
-  }
-  return openEmbedWindow(data.embedUrl, `文件管理 · ${cid.slice(0, 12)}`)
-}
 
-async function ensureLocalMeshAgent(clientId) {
-  const cid = safeClientId(clientId) || String(clientId || '').trim()
-  try {
-    const ensured = await meshAgent.ensureMeshAgentRunning({ clientId: cid })
-    // Best-effort auto-bind after agent is up (server matches node name/tag to clientId)
-    if (cid && ensured?.ok) {
+  inflightClientId = cid
+  inflightPrepare = (async () => {
+    const hostname = String(os.hostname() || '').trim()
+    const agentName = meshAgent.buildAgentName(cid)
+    log('prepare start', { clientId: redactClientId(cid), agentName })
+    setPrepareState({
+      phase: PHASE.CHECKING,
+      remoteReady: false,
+      clientId: cid,
+      agentName,
+      meshNodeId: '',
+      meshGroupId: '',
+      code: '',
+      message: '正在准备远程服务…',
+      userMessage: '正在准备远程服务…',
+    })
+
+    try {
       try {
-        await requestMeshJson('POST', '/api/mesh/auto-bind', { clientId: cid })
+        const st = await requestMeshStatus(cid)
+        if (isBindSuccess(st) && String(st.mapping?.mesh_node_id || st.meshNodeId || '').trim()) {
+          log('bind ok', { via: 'existing-mapping', clientId: redactClientId(cid) })
+          return finishReady(cid, agentName, st)
+        }
       } catch {
-        /* Mesh disabled / unbound — non-fatal */
+        /* continue prepare */
       }
+
+      setPrepareState({
+        phase: PHASE.STARTING,
+        message: '正在启动远程服务…',
+        userMessage: '正在启动远程服务…',
+      })
+      const ensured = await meshAgent.ensureMeshAgentRunning({ clientId: cid })
+      if (!ensured?.ok) {
+        return finishFailed(cid, ensured?.code || 'MESH_START_FAILED', ensured?.message || 'MeshAgent 启动失败')
+      }
+      log('agent running', { action: ensured.action, clientId: redactClientId(cid) })
+
+      setPrepareState({
+        phase: PHASE.WAITING_NODE,
+        message: '正在等待客户端上线…',
+        userMessage: '正在等待客户端上线…',
+      })
+      log('waiting node', { clientId: redactClientId(cid) })
+
+      let lastBind = null
+      let repairedOnce = false
+      for (let i = 0; i < PREPARE_RETRY_DELAYS_MS.length; i += 1) {
+        const waitMs = PREPARE_RETRY_DELAYS_MS[i]
+        if (waitMs > 0) await sleep(waitMs)
+
+        setPrepareState({
+          phase: PHASE.BINDING,
+          message: '正在绑定远程设备…',
+          userMessage: '正在绑定远程设备…',
+        })
+
+        try {
+          lastBind = await requestAutoBind(cid, hostname)
+        } catch (err) {
+          lastBind = { ok: false, code: 'MESH_BIND_REQUEST_FAILED', message: String(err?.message || err) }
+        }
+
+        if (isBindSuccess(lastBind)) {
+          log('node discovered', { attempt: i + 1 })
+          log('bind ok', { clientId: redactClientId(cid) })
+          return finishReady(cid, agentName, lastBind)
+        }
+
+        if (shouldStopBindRetry(lastBind)) {
+          return finishFailed(cid, lastBind.code, lastBind.message)
+        }
+
+        // 旧安装可能没有 agentName=WXQK-<clientId>：中途修复重装一次再继续等节点
+        const code = String(lastBind?.code || '')
+        if (!repairedOnce && (code === 'MESH_NO_MATCH' || code === 'MESH_NODE_TIMEOUT') && i >= 0) {
+          repairedOnce = true
+          setPrepareState({
+            phase: PHASE.INSTALLING,
+            message: '正在修复远程服务…',
+            userMessage: '正在修复远程服务…',
+          })
+          log('repair agent for agentName', { clientId: redactClientId(cid) })
+          try {
+            await meshAgent.repairMeshAgent({ clientId: cid })
+          } catch (err) {
+            log('repair failed', { message: String(err?.message || err) })
+          }
+          setPrepareState({
+            phase: PHASE.WAITING_NODE,
+            message: '正在等待客户端上线…',
+            userMessage: '正在等待客户端上线…',
+          })
+        }
+      }
+
+      return finishFailed(
+        cid,
+        lastBind?.code || 'MESH_NODE_TIMEOUT',
+        lastBind?.message || '等待远程设备上线超时',
+      )
+    } catch (err) {
+      return finishFailed(cid, 'MESH_PREPARE_FAILED', String(err?.message || err))
+    } finally {
+      inflightPrepare = null
+      inflightClientId = ''
     }
-    return ensured
-  } catch (err) {
-    log('ensure agent failed', { error: String(err?.message || err) })
-    return { ok: false, status: 'error', message: String(err?.message || err) }
+  })()
+
+  return inflightPrepare
+}
+
+/**
+ * Wait for an in-flight prepare (or start one).
+ * @param {string} clientId
+ * @param {number} [timeoutMs]
+ */
+async function waitForMeshReady(clientId, timeoutMs = 90000) {
+  const cid = safeClientId(clientId)
+  if (!cid) return finishFailed('', 'BAD_CLIENT_ID', '缺少设备标识')
+  const started = Date.now()
+  const prep = ensureMeshReady(cid)
+  const timeout = new Promise((resolve) => {
+    const left = Math.max(1000, Number(timeoutMs) || 90000)
+    setTimeout(() => {
+      resolve(finishFailed(cid, 'MESH_NODE_TIMEOUT', '等待远程服务就绪超时'))
+    }, left).unref?.()
+  })
+  const result = await Promise.race([prep, timeout])
+  if (result?.remoteReady) return result
+  if (Date.now() - started < (Number(timeoutMs) || 90000)) {
+    return ensureMeshReady(cid, { force: true })
   }
+  return result
+}
+
+/** @deprecated use ensureMeshReady */
+async function ensureLocalMeshAgent(clientId) {
+  return ensureMeshReady(clientId)
 }
 
 module.exports = {
-  getRemoteStatus,
-  openDesktopSession,
-  openFilesSession,
-  closeSessionWindow,
+  ensureMeshReady,
   ensureLocalMeshAgent,
+  waitForMeshReady,
+  getMeshPrepareStatus,
   safeClientId,
-  setParentWindowGetter,
+  PREPARE_RETRY_DELAYS_MS,
+  AUTO_BIND_RETRY_DELAYS_MS: PREPARE_RETRY_DELAYS_MS,
+  PHASE,
+  isBindSuccess,
+  shouldStopBindRetry,
+  userMessageForCode,
 }

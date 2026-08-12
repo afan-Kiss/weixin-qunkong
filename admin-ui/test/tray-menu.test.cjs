@@ -15,6 +15,7 @@ test('system tray provides the four requested menu entries', () => {
   assert.match(source, /icon: appIconPath|icon: resolveAppIconPath\(\)/)
   assert.match(source, /win\.setIcon\(appIconPath\)/)
   assert.match(source, /label: '显示主界面'/)
+  assert.match(source, /activateMainWindow/)
   assert.match(source, /label: '重启软件'/)
   assert.match(source, /label: '退出软件'/)
   assert.match(source, /function restartApp/)
@@ -23,4 +24,5 @@ test('system tray provides the four requested menu entries', () => {
   assert.match(source, /app\.relaunch\(/)
   assert.match(source, /app\.exit\(0\)/)
   assert.match(source, /click: \(\) => restartApp\(\)/)
+  assert.doesNotMatch(source, /setAlwaysOnTop/)
 })

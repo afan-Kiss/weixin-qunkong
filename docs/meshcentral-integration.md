@@ -5,9 +5,12 @@ Remote maintenance uses **MeshCentral Relay only** (pinned **1.2.4** — see `de
 ## Architecture
 
 ```
-Vue RemoteSupport → RemoteService → Electron IPC (clientId only)
-  → wxqk /api/mesh/* (auth + ownership + mapping)
-  → MeshCentral 1.2.4 (webRTC=false, allowLoginToken=true)
+Windows client (silent MeshAgent; no remote UI in product)
+  → wxqk /api/mesh/auto-bind (software Bearer)
+
+wxqk admin console (#/desktop)
+  → /api/mesh/session/desktop|files (admin token only)
+  → MeshCentral 1.2.4 (webRTC=false, allowLoginToken=true, allowFraming=true)
   → MeshAgent Windows service
 ```
 

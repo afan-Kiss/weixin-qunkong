@@ -428,14 +428,18 @@ def _ws_sslopt(url: str) -> dict[str, Any]:
 
 def _open_control_websocket(url: str, timeout_s: float):
     """
-    Open control.ashx with TLS verify + Origin.
+    Open control.ashx with TLS verify.
+
+    MeshCentral 1.2.4 closes control sockets with cause=invalidorigin when an Origin
+    header is present but not accepted for server-side control sync. Server→Mesh
+    sync therefore omits Origin by default. Set WXQK_MESH_WS_ORIGIN to force one.
     When WXQK_MESH_WS_LOCAL_HOST is set (e.g. 127.0.0.1), TCP connects locally
-    while keeping Host/SNI/Origin as the public Mesh URL — required on the
-    MeshCentral host itself (no hairpin NAT to its own public IP).
+    while keeping Host/SNI as the public Mesh URL — required on the MeshCentral
+    host itself (no hairpin NAT to its own public IP).
     """
     import socket
 
-    origin = public_url() or ""
+    origin = str(os.environ.get("WXQK_MESH_WS_ORIGIN") or "").strip()
     header = [f"Origin: {origin}"] if origin else None
     sslopt = _ws_sslopt(url)
     local_host = str(os.environ.get("WXQK_MESH_WS_LOCAL_HOST") or "").strip()
@@ -515,17 +519,17 @@ def sync_nodes_via_control(
     nodes: list[dict[str, Any]] = []
     meshes: list[dict[str, Any]] = []
     errors: list[str] = []
+    got_nodes = False
 
     try:
         # Always verify TLS for wss:// — never CERT_NONE / rejectUnauthorized bypass.
-        # Origin + optional local TCP (WXQK_MESH_WS_LOCAL_HOST) handled in helper.
+        # Origin omitted by default (see _open_control_websocket); optional local TCP via WXQK_MESH_WS_LOCAL_HOST.
         ws = _open_control_websocket(url, timeout_s)
         try:
             # Request device groups then nodes (MeshCtrl-style).
             ws.send(json.dumps({"action": "meshes", "responseid": "wxqk-meshes"}))
             ws.send(json.dumps({"action": "nodes", "responseid": "wxqk-nodes"}))
             deadline = time.time() + timeout_s
-            got_nodes = False
             while time.time() < deadline:
                 remaining = max(0.1, deadline - time.time())
                 ws.settimeout(remaining)
@@ -573,6 +577,16 @@ def sync_nodes_via_control(
             "meshes": [],
         }
 
+    if not got_nodes and not nodes:
+        return {
+            "ok": False,
+            "code": "MESH_SYNC_FAILED",
+            "message": "控制通道未返回节点列表（可能是 Origin/鉴权失败）",
+            "nodes": [],
+            "meshes": meshes,
+            "errors": errors,
+        }
+
     return {
         "ok": True,
         "code": "OK",
@@ -597,34 +611,83 @@ def _node_text_blob(node: dict[str, Any]) -> str:
     return " ".join(parts).lower()
 
 
-def match_node_for_client(nodes: list[dict[str, Any]], client_id: str) -> Optional[dict[str, Any]]:
+def agent_name_for_client(client_id: str) -> str:
+    cid = str(client_id or "").strip()
+    return f"WXQK-{cid}" if cid else ""
+
+
+def _node_still_present(nodes: list[dict[str, Any]], mesh_node_id: str) -> bool:
+    want = str(mesh_node_id or "").strip()
+    if not want:
+        return False
+    want_leaf = want.split("/")[-1]
+    for node in nodes or []:
+        nid = node_id_of(node)
+        if not nid:
+            continue
+        if nid == want or nid.split("/")[-1] == want_leaf:
+            return True
+    return False
+
+
+def match_node_for_client(
+    nodes: list[dict[str, Any]],
+    client_id: str,
+    *,
+    hostname: str = "",
+    allow_hostname_fallback: bool = True,
+) -> tuple[Optional[dict[str, Any]], str]:
     """
-    Prefer exact name/host match on wxqk clientId; never treat hostname alone as identity.
-    Mesh node id remains MeshCentral-managed — this only finds a candidate to map.
+    Match priority:
+      1) exact agentName / name == WXQK-<clientId>
+      2) exact name/host == clientId (legacy)
+      3) unique hostname fallback (old-client migration only)
+
+    Returns (node_or_None, error_code).
+    error_code empty on success; MESH_AMBIGUOUS / MESH_HOSTNAME_AMBIGUOUS / MESH_NO_MATCH / BAD_REQUEST.
     """
     cid = str(client_id or "").strip()
     if not cid:
-        return None
+        return None, "BAD_REQUEST"
     cid_l = cid.lower()
-    exact: list[dict[str, Any]] = []
-    fuzzy: list[dict[str, Any]] = []
+    agent_name = agent_name_for_client(cid).lower()
+    host_hint = str(hostname or "").strip().lower()
+
+    by_agent: list[dict[str, Any]] = []
+    by_client_id: list[dict[str, Any]] = []
+    by_hostname: list[dict[str, Any]] = []
+
     for node in nodes or []:
         if not isinstance(node, dict):
             continue
         name = str(node.get("name") or "").strip().lower()
         host = str(node.get("host") or node.get("hostname") or "").strip().lower()
-        blob = _node_text_blob(node)
-        if name == cid_l or host == cid_l:
-            exact.append(node)
-        elif cid_l in blob:
-            fuzzy.append(node)
-    if len(exact) == 1:
-        return exact[0]
-    if len(exact) > 1:
-        return None
-    if len(fuzzy) == 1:
-        return fuzzy[0]
-    return None
+        agent_field = str(node.get("agentName") or node.get("agentname") or "").strip().lower()
+        # MeshAgent agentName is exposed primarily as the device "name"
+        if name == agent_name or agent_field == agent_name:
+            by_agent.append(node)
+        elif name == cid_l or host == cid_l:
+            by_client_id.append(node)
+        if host_hint and (name == host_hint or host == host_hint or agent_field == host_hint):
+            by_hostname.append(node)
+
+    if len(by_agent) == 1:
+        return by_agent[0], ""
+    if len(by_agent) > 1:
+        return None, "MESH_AMBIGUOUS"
+
+    if len(by_client_id) == 1:
+        return by_client_id[0], ""
+    if len(by_client_id) > 1:
+        return None, "MESH_AMBIGUOUS"
+
+    if allow_hostname_fallback and host_hint:
+        if len(by_hostname) == 1:
+            return by_hostname[0], ""
+        if len(by_hostname) > 1:
+            return None, "MESH_HOSTNAME_AMBIGUOUS"
+
+    return None, "MESH_NO_MATCH"
 
 
 def node_id_of(node: dict[str, Any]) -> str:
@@ -643,42 +706,122 @@ def auto_bind_client(
     *,
     owner_username: str = "",
     userid: str = "",
+    hostname: str = "",
+    allow_hostname_fallback: bool = True,
+    agent_name: str = "",
 ) -> dict[str, Any]:
     """
-    Sync MeshCentral nodes via control.ashx and bind when exactly one node matches clientId.
-    Soft-fails when Mesh is disabled or unreachable.
+    Sync MeshCentral nodes and bind clientId ↔ meshNodeId.
+
+    Priority:
+      1) agentName == WXQK-<clientId>
+      2) existing DB mapping if node still present
+      3) unique hostname fallback (legacy migration only)
+
+    Remaps when old mapped node is gone and a new agentName node appears.
     """
     if not is_enabled():
         return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
     cid = str(client_id or "").strip()
     if not cid:
         return {"ok": False, "code": "BAD_REQUEST", "message": "clientId 必填"}
-    existing = get_mapping(data_dir, cid)
-    if existing and str(existing.get("mesh_node_id") or "").strip():
-        return {
-            "ok": True,
-            "code": "OK",
-            "message": "already bound",
-            "mapping": existing,
-            "bound": True,
-        }
+    host_hint = str(hostname or "").strip()
+    expected_agent = str(agent_name or "").strip() or agent_name_for_client(cid)
+
     synced = sync_nodes_via_control(userid=userid)
     if not synced.get("ok"):
+        # Soft path: if mapping already exists, keep it while Mesh sync is down
+        existing = get_mapping(data_dir, cid)
+        if existing and str(existing.get("mesh_node_id") or "").strip():
+            return {
+                "ok": True,
+                "code": "OK",
+                "message": "already bound (mesh sync unavailable)",
+                "mapping": existing,
+                "bound": True,
+                "meshNodeId": str(existing.get("mesh_node_id") or ""),
+            }
         return {
             "ok": False,
             "code": str(synced.get("code") or "MESH_SYNC_FAILED"),
             "message": str(synced.get("message") or "同步节点失败"),
             "nodes": synced.get("nodes") or [],
         }
+
     nodes = [n for n in (synced.get("nodes") or []) if isinstance(n, dict)]
-    matched = match_node_for_client(nodes, cid)
-    if not matched:
+    matched, match_err = match_node_for_client(
+        nodes,
+        cid,
+        hostname=host_hint,
+        allow_hostname_fallback=allow_hostname_fallback,
+    )
+
+    existing = get_mapping(data_dir, cid)
+    existing_nid = str((existing or {}).get("mesh_node_id") or "").strip()
+    if existing_nid and _node_still_present(nodes, existing_nid):
+        return {
+            "ok": True,
+            "code": "OK",
+            "message": "already bound",
+            "mapping": existing,
+            "bound": True,
+            "meshNodeId": existing_nid,
+        }
+
+    # Old mapping stale + new agentName node → remap
+    if existing_nid and matched and not _node_still_present(nodes, existing_nid):
+        new_nid = node_id_of(matched)
+        if new_nid and new_nid != existing_nid:
+            group_id = str(matched.get("meshid") or matched.get("meshId") or matched.get("mesh") or "").strip()
+            mapping = sync_device_mapping(
+                data_dir,
+                client_id=cid,
+                mesh_node_id=new_nid,
+                mesh_group_id=group_id,
+                mesh_agent_status="online" if matched.get("conn") or matched.get("online") else "bound",
+                mesh_last_seen=_utcnow_iso(),
+                owner_username=owner_username,
+            )
+            return {
+                "ok": True,
+                "code": "OK",
+                "message": "remapped after agent reinstall",
+                "mapping": mapping,
+                "bound": True,
+                "meshNodeId": new_nid,
+                "agentName": expected_agent,
+            }
+
+    if match_err in ("MESH_AMBIGUOUS", "MESH_HOSTNAME_AMBIGUOUS"):
         return {
             "ok": False,
-            "code": "MESH_NO_MATCH",
-            "message": "未找到唯一匹配的 Mesh 节点（请将 Agent 名称设为 clientId 或手动 bind）",
+            "code": match_err,
+            "message": "发现重复设备，无法自动绑定",
             "nodeCount": len(nodes),
+            "hostname": host_hint or None,
+            "agentName": expected_agent,
         }
+
+    if not matched:
+        # Keep stale mapping only if sync listed zero nodes (transient); otherwise clear path fails
+        if existing_nid and not nodes:
+            return {
+                "ok": True,
+                "code": "OK",
+                "message": "already bound (nodes empty)",
+                "mapping": existing,
+                "bound": True,
+                "meshNodeId": existing_nid,
+            }
+        return {
+            "ok": False,
+            "code": match_err or "MESH_NO_MATCH",
+            "message": "未找到可绑定的远程设备（Agent 可能尚未上线）",
+            "nodeCount": len(nodes),
+            "hostname": host_hint or None,
+            "agentName": expected_agent,
+        }
+
     nid = node_id_of(matched)
     if not nid:
         return {"ok": False, "code": "MESH_NODE_ID_MISSING", "message": "匹配节点缺少 node id"}
@@ -699,40 +842,89 @@ def auto_bind_client(
         "mapping": mapping,
         "bound": True,
         "meshNodeId": nid,
+        "agentName": expected_agent,
     }
 
 
 def get_device_status(data_dir: Path, client_id: str) -> dict[str, Any]:
     if not is_enabled():
-        return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
+        return {"ok": False, "code": "MESH_DISABLED", "message": "远程服务不可用"}
     row = get_mapping(data_dir, client_id)
-    if not row:
+    node_id = str((row or {}).get("mesh_node_id") or "").strip() if row else ""
+    if not node_id:
         return {
             "ok": True,
-            "code": "MESH_UNBOUND",
-            "message": "设备未绑定 Mesh 节点",
+            "code": "MESH_PREPARING",
+            "message": "正在准备远程服务…",
+            "userMessage": "正在准备远程服务…",
             "clientId": client_id,
             "bound": False,
-            "mapping": None,
+            "mapping": row,
         }
     return {
         "ok": True,
         "code": "OK",
-        "message": "ok",
+        "message": "远程服务已就绪",
+        "userMessage": "远程服务已就绪",
         "clientId": client_id,
-        "bound": bool(row.get("mesh_node_id")),
+        "bound": True,
         "mapping": row,
         "config": config_snapshot(),
     }
 
 
-def get_remote_session(data_dir: Path, client_id: str, *, userid: str = "") -> dict[str, Any]:
-    if not is_enabled():
-        return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
+def _ensure_bound_node_id(
+    data_dir: Path,
+    client_id: str,
+    *,
+    userid: str = "",
+    hostname: str = "",
+    owner_username: str = "",
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """Return (mesh_node_id, failure_payload_or_None). Auto-binds once when unbound."""
     row = get_mapping(data_dir, client_id)
     node_id = str((row or {}).get("mesh_node_id") or "").strip()
-    if not node_id:
-        return {"ok": False, "code": "MESH_UNBOUND", "message": "设备未绑定 Mesh 节点"}
+    if node_id:
+        return node_id, None
+    bound = auto_bind_client(
+        data_dir,
+        client_id,
+        owner_username=owner_username,
+        userid=userid,
+        hostname=hostname,
+    )
+    if bound.get("ok"):
+        node_id = str(bound.get("meshNodeId") or (bound.get("mapping") or {}).get("mesh_node_id") or "").strip()
+        if node_id:
+            return node_id, None
+    return "", {
+        "ok": False,
+        "code": str(bound.get("code") or "MESH_PREPARE_FAILED"),
+        "message": str(bound.get("message") or "远程服务准备失败"),
+        "userMessage": str(bound.get("message") or "远程服务准备失败"),
+        "bound": False,
+    }
+
+
+def get_remote_session(
+    data_dir: Path,
+    client_id: str,
+    *,
+    userid: str = "",
+    hostname: str = "",
+    owner_username: str = "",
+) -> dict[str, Any]:
+    if not is_enabled():
+        return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
+    node_id, fail = _ensure_bound_node_id(
+        data_dir,
+        client_id,
+        userid=userid,
+        hostname=hostname,
+        owner_username=owner_username,
+    )
+    if fail:
+        return fail
     try:
         url = build_embed_url(node_id, VIEWMODE_DESKTOP, userid=userid)
     except Exception as exc:
@@ -748,13 +940,25 @@ def get_remote_session(data_dir: Path, client_id: str, *, userid: str = "") -> d
     }
 
 
-def get_files_session(data_dir: Path, client_id: str, *, userid: str = "") -> dict[str, Any]:
+def get_files_session(
+    data_dir: Path,
+    client_id: str,
+    *,
+    userid: str = "",
+    hostname: str = "",
+    owner_username: str = "",
+) -> dict[str, Any]:
     if not is_enabled():
         return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
-    row = get_mapping(data_dir, client_id)
-    node_id = str((row or {}).get("mesh_node_id") or "").strip()
-    if not node_id:
-        return {"ok": False, "code": "MESH_UNBOUND", "message": "设备未绑定 Mesh 节点"}
+    node_id, fail = _ensure_bound_node_id(
+        data_dir,
+        client_id,
+        userid=userid,
+        hostname=hostname,
+        owner_username=owner_username,
+    )
+    if fail:
+        return fail
     try:
         url = build_embed_url(node_id, VIEWMODE_FILES, userid=userid)
     except Exception as exc:

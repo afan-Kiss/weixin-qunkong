@@ -102,9 +102,4 @@ contextBridge.exposeInMainWorld('wxControl', {
     ipcRenderer.on('update:progress', handler)
     return () => ipcRenderer.removeListener('update:progress', handler)
   },
-  remoteGetStatus: (clientId) => ipcRenderer.invoke('mesh:status', String(clientId || '')),
-  remoteOpenDesktop: (clientId) => ipcRenderer.invoke('mesh:open-desktop', String(clientId || '')),
-  remoteOpenFiles: (clientId) => ipcRenderer.invoke('mesh:open-files', String(clientId || '')),
-  remoteCloseSession: () => ipcRenderer.invoke('mesh:close-session'),
-  remoteAgentStatus: () => ipcRenderer.invoke('remote:status'),
 })

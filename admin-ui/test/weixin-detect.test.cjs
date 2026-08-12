@@ -22,7 +22,7 @@ test('startup auto-detects weixin path and settings expose redetect', () => {
   assert.match(detect, /versionCache/)
   assert.match(main, /ensureWeixinPathConfigured/)
   assert.match(main, /禁止为读版本再拉起 PowerShell/)
-  assert.match(main, /setImmediate\(\(\) => \{\s*try \{ ensureWeixinPathConfigured/)
+  assert.match(main, /setImmediate\(\(\) => \{[\s\S]*?ensureWeixinPathConfigured/)
   assert.match(main, /void softwareAuth\.session\(\)/)
   assert.match(main, /weixin:detect/)
   assert.match(main, /detectPreferredWeixin/)

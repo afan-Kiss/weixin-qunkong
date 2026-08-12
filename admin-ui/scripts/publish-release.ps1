@@ -150,6 +150,9 @@ if (-not $SkipPackage) {
   Write-Host '== vite build =='
   npm run build
   if ($LASTEXITCODE -ne 0) { throw "npm run build failed: $LASTEXITCODE" }
+  Write-Host '== portable splash bmp =='
+  node scripts/generate-portable-splash.cjs
+  if ($LASTEXITCODE -ne 0) { throw "generate portable splash failed: $LASTEXITCODE" }
   $meta = Get-PackageDisplayVersion
   $script:PackageOutputDir = Resolve-BuilderOutputDir -PreferredName (Get-DefaultOutputDirName -Pkg $meta.Pkg)
   $builderOut = [string]$script:PackageOutputDir

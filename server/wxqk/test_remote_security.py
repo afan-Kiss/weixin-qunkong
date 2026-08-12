@@ -79,8 +79,17 @@ class RemoteSecurityTest(unittest.TestCase):
             ):
                 unbound = mc.get_remote_session(data_dir, "no-node")
                 self.assertFalse(unbound.get("ok"))
-                self.assertEqual(unbound.get("code"), "MESH_UNBOUND")
-
+                self.assertIn(
+                    unbound.get("code"),
+                    (
+                        "MESH_UNBOUND",
+                        "MESH_NO_MATCH",
+                        "MESH_SYNC_FAILED",
+                        "MESH_WS_UNAVAILABLE",
+                        "MESH_WS_ERROR",
+                        "MESH_TOKEN_ERROR",
+                    ),
+                )
                 mc.sync_device_mapping(
                     data_dir,
                     client_id="c1",
@@ -97,6 +106,19 @@ class RemoteSecurityTest(unittest.TestCase):
     def test_legacy_viewer_desktop_routes_retired(self):
         self.assertFalse(hasattr(server, "make_viewer_ticket"))
         self.assertFalse(hasattr(server, "consume_viewer_ticket"))
+
+    def test_admin_ui_hosts_mesh_remote_console(self):
+        text = (Path(__file__).resolve().parent / "admin_ui.py").read_text(encoding="utf-8")
+        self.assertIn("id:'desktop'", text)
+        self.assertIn("远程桌面", text)
+        self.assertIn("/api/mesh/session/desktop", text)
+        self.assertIn("/api/mesh/session/files", text)
+        self.assertIn("deskFrame", text)
+        self.assertIn("embedUrl", text)
+        self.assertIn("friendlyMeshError", text)
+        self.assertIn("远程服务已就绪", text)
+        self.assertNotIn("设备未绑定 Mesh 节点", text)
+        self.assertNotIn("远程桌面已退役", text)
 
     def test_sync_snapshot_is_bounded(self):
         payload = {

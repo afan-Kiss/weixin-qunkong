@@ -1,17 +1,34 @@
-# MeshCentral ↔ Electron wiring — COMPLETED
+# MeshCentral wiring (silent client + admin console)
 
-Wiring is implemented. See:
+## Architecture
 
-| Piece | Path |
-|-------|------|
-| Agent lifecycle | `admin-ui/electron/mesh-agent-manager.cjs` |
-| Session bridge | `admin-ui/electron/mesh-remote-bridge.cjs` |
-| IPC | `main.cjs` `mesh:*` + `preload.cjs` `remote*` |
-| Vue service / UI | `remote-service.ts` / `RemoteSupport.vue` |
-| Server | `meshcentral_client.py` / `mesh_api.py` |
+```
+Windows client
+  → login success (non-blocking)
+  → ensureMeshReady(clientId)  [single-flight]
+       1. check resources / Mesh Agent service
+       2. missing→install (staged msh agentName=WXQK-<clientId>)
+       3. stopped→start / broken→repair
+       4. wait node + POST /api/mesh/auto-bind
+       5. remoteReady=true
 
-Hard rules unchanged: `webRTC: false`, no secrets in renderer, no `webSecurity: false`.
+wxqk admin console (#/desktop · 远程桌面)
+  → /api/mesh/session/desktop|files (admin token)
+  → auto-bind self-heal if needed (shared for Desktop + Files)
+  → MeshCentral 1.2.4 embed (?login=&node=&viewmode=11|13&hide=63)
+```
 
-Embed: parented BrowserWindow + `temp:` partition; close clears cookies.
-Agent: login/start → `ensureLocalMeshAgent` → best-effort `/api/mesh/auto-bind`.
-Scripts: `npm run fetch:mesh-agent`, `npm run check:mesh`, `deploy/meshcentral/manage.py`.
+## Bind priority (server)
+
+1. Exact `name` / `agentName` == `WXQK-<clientId>` (new installs via `agentName=` in msh)
+2. Existing `clientId ↔ meshNodeId` mapping if node still present
+3. Unique hostname fallback only for legacy migration (admin/console auto-bind fills hostname from online hello meta)  
+   Ambiguous hostname → never auto-bind
+
+Client prepare: if bind keeps returning `MESH_NO_MATCH`, repair MeshAgent once with staged `agentName` then continue waiting.
+
+## UX
+
+- Never show users: `MESH_UNBOUND`, `meshNodeId`, `auto-bind`, Mesh node jargon
+- Preparing: 「正在准备远程服务…」 etc.
+- Failure only after prepare exhausted: 「远程服务准备失败」+ understandable reason

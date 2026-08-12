@@ -1,4 +1,39 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, clipboard, screen, shell, session } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, clipboard, screen, shell, session, Notification } = require('electron')
+
+/** 轻量启动计时；额外写 %TEMP%\wxqk-startup-marks.json（单次很小，便于外部测速） */
+const startupEpochNs = process.hrtime.bigint()
+const startupWallClockMs = Date.now()
+/** Electron Splash 进度与真实启动阶段绑定（不人为拖时间） */
+const SPLASH_PROGRESS_BY_LABEL = Object.freeze({
+  'app ready': { pct: 12, text: '正在启动…' },
+  'storage initialized': { pct: 32, text: '正在初始化数据…' },
+  'auth initialized': { pct: 44, text: '正在准备登录…' },
+  'ipc registered': { pct: 56, text: '正在注册通道…' },
+  'main window created': { pct: 70, text: '正在加载界面…' },
+  'renderer dom ready': { pct: 88, text: '正在渲染界面…' },
+  'ready-to-show': { pct: 100, text: '启动完成' },
+  'ready-to-show fallback': { pct: 100, text: '启动完成' },
+})
+function markStartup(label) {
+  try {
+    const ms = Number(process.hrtime.bigint() - startupEpochNs) / 1e6
+    console.log(`[STARTUP] ${label} +${ms.toFixed(1)}ms`)
+    const fs = require('fs')
+    const path = require('path')
+    const os = require('os')
+    const file = path.join(os.tmpdir(), 'wxqk-startup-marks.json')
+    let data = {}
+    try { data = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { /* first mark */ }
+    data[label] = Math.round(ms)
+    data.wallClockStartMs = startupWallClockMs
+    data.updatedAt = Date.now()
+    data.pid = process.pid
+    fs.writeFileSync(file, JSON.stringify(data))
+    const step = SPLASH_PROGRESS_BY_LABEL[label]
+    if (step) setSplashProgress(step.pct, step.text)
+  } catch { /* ignore timing / splash */ }
+}
+markStartup('process start')
 
 // 部分机器 GPU/驱动异常会导致进程在但窗口不显示/白屏
 try { app.disableHardwareAcceleration() } catch {}
@@ -30,7 +65,6 @@ const { resolveIpcApiTimeout } = require('./ipc-api-timeout.cjs')
 const { buildHistoryImagePageSql } = require('./qr-history-pagination.cjs')
 const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
 const meshRemote = require('./mesh-remote-bridge.cjs')
-meshRemote.setParentWindowGetter(() => mainWindow)
 const softwareAuth = require('./software-auth.cjs')
 const { safeFolderName, classifyQrText, qrTypeLabel, contentHash, messageTableName, rowsFromApi, valueOf, fieldString, existingImagePath, cdnDownloadRequest, downloadRequest, decodeNativeImages, accurateFileName, prepareHistoryMessageRow, yieldMain, normalizeQrText } = require('./qr-collector.cjs')
 const {
@@ -106,14 +140,32 @@ const {
   resolvePortableExePath,
 } = require('./client-updater.cjs')
 const { safeCloneForIpc } = require('./ipc-safe.cjs')
+const {
+  createSecondInstanceGate,
+  shouldActivateOnSecondInstance,
+} = require('./window-activation.cjs')
+
+const secondInstanceGate = createSecondInstanceGate()
+/** 首次 ready-to-show 完成前，second-instance 不得抢焦点 */
+let mainWindowFirstShowDone = false
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (app.isReady()) showMainWindow()
-    else app.once('ready', showMainWindow)
+    // 便携版连续双击会产生多个延迟启动器，随后陆续触发；节流避免持续抢前台
+    const at = Date.now()
+    try { appLog('INFO', '[WINDOW] second-instance', { at }) } catch { /* appLog 尚未就绪时忽略 */ }
+    if (!shouldActivateOnSecondInstance({
+      appReady: app.isReady(),
+      firstShowDone: mainWindowFirstShowDone,
+      gate: secondInstanceGate,
+      now: at,
+    })) {
+      return
+    }
+    activateMainWindow()
   })
 }
 
@@ -145,7 +197,11 @@ const enqueueStart = createSerialExecutor()
 const execFileAsync = promisify(execFile)
 let diskMetricsCache = { bytes: 0, measuredAt: 0 }
 let mainWindow = null
+/** @type {import('electron').BrowserWindow | null} */
 let splashWindow = null
+let splashContentReady = false
+/** @type {{ pct: number, text: string }} */
+let splashPending = { pct: 4, text: '正在启动，请稍候…' }
 let tray = null
 let quitting = false
 /** @type {{ t0: number, bytes0: number, lastT: number, lastBytes: number, speedBps: number } | null} */
@@ -627,6 +683,28 @@ function pauseActiveTasks(reason = '管理员已暂停软件运行') {
   }
 }
 
+/**
+ * 后台提示：不得 focus / restore 主窗口。
+ * 仅系统通知 + 渲染进程广播；窗口已在前台时才允许模态框。
+ */
+function notifyWithoutFocus(title, body, channel, payload) {
+  const text = String(body || '')
+  const headline = String(title || '微信群控管理平台')
+  try {
+    if (channel) safeBroadcast(channel, payload || { title: headline, message: text })
+  } catch { /* ignore */ }
+  try {
+    if (Notification && Notification.isSupported()) {
+      new Notification({ title: headline, body: text.slice(0, 250) }).show()
+      return
+    }
+  } catch { /* fall through */ }
+  const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+  if (win && win.isVisible() && win.isFocused()) {
+    dialog.showMessageBox(win, { type: 'info', title: headline, message: text }).catch(() => {})
+  }
+}
+
 function remoteAgentOptions(account, baseUrl = DEFAULT_BASE) {
   return {
     userDataDir: app.getPath('userData'), baseUrl, account,
@@ -635,10 +713,22 @@ function remoteAgentOptions(account, baseUrl = DEFAULT_BASE) {
       runtimeAllowed = Boolean(allowed)
       appLog(allowed ? 'INFO' : 'ERROR', allowed ? '后台已恢复软件运行' : '后台已暂停软件运行', { reason: message?.message || '' })
       if (!allowed) pauseActiveTasks('后台暂停运行，任务已停止')
-      if (!allowed && mainWindow && !mainWindow.isDestroyed()) await dialog.showMessageBox(mainWindow, { type: 'warning', title: '软件已暂停', message: String(message?.message || '管理员已暂停本软件运行') })
+      if (!allowed) {
+        notifyWithoutFocus(
+          '软件已暂停',
+          String(message?.message || '管理员已暂停本软件运行'),
+          'runtime:policy',
+          { allowed: false, message: String(message?.message || '管理员已暂停本软件运行') },
+        )
+      }
     },
     onAnnouncement: async (message) => {
-      if (mainWindow && !mainWindow.isDestroyed()) await dialog.showMessageBox(mainWindow, { type: 'info', title: String(message?.title || '公告'), message: String(message?.text || '管理员发送了一条公告') })
+      notifyWithoutFocus(
+        String(message?.title || '公告'),
+        String(message?.text || '管理员发送了一条公告'),
+        'runtime:announcement',
+        { title: String(message?.title || '公告'), text: String(message?.text || '') },
+      )
     },
     getSyncSnapshot: () => remoteSyncSnapshot(),
     onFriendCredentialDiagnostic: async (message) => {
@@ -4762,7 +4852,8 @@ function registerIpc() {
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
       const selfId = String(getRemoteAgentStatus()?.clientId || '')
-      meshRemote.ensureLocalMeshAgent(selfId).catch(() => {})
+      // 后台 prepare：不 await，不挡登录返回
+      meshRemote.ensureMeshReady(selfId).catch(() => {})
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '登录失败，请稍后重试') } }
   })
@@ -4776,7 +4867,8 @@ function registerIpc() {
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
       const selfId = String(getRemoteAgentStatus()?.clientId || '')
-      meshRemote.ensureLocalMeshAgent(selfId).catch(() => {})
+      // 后台 prepare：不 await，不挡登录返回
+      meshRemote.ensureMeshReady(selfId).catch(() => {})
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '注册失败，请稍后重试') } }
   })
@@ -5323,28 +5415,9 @@ function registerIpc() {
   ipcMain.handle('remote:start', async (_event, options = {}) => startRemoteAgent(remoteAgentOptions(options.account || '微信群控本机', options.baseUrl || DEFAULT_BASE)))
   ipcMain.handle('remote:stop', () => { stopRemoteAgent(); return getRemoteAgentStatus() })
   ipcMain.handle('remote:open-console', (_event, token, baseUrl) => openAdminConsole(token || '', baseUrl || DEFAULT_BASE))
-  // MeshCentral remote maintenance (tokens stay in main; never expose embedUrl to renderer)
-  // Renderer may only pass clientId — nodeId is resolved server-side.
-  ipcMain.handle('mesh:status', async (_event, clientId) => meshRemote.getRemoteStatus(clientId))
-  ipcMain.handle('mesh:open-desktop', async (_event, clientId) => meshRemote.openDesktopSession(clientId))
-  ipcMain.handle('mesh:open-files', async (_event, clientId) => meshRemote.openFilesSession(clientId))
-  ipcMain.handle('mesh:close-session', async () => meshRemote.closeSessionWindow())
-  ipcMain.handle('mesh:agent-status', async () => {
-    try {
-      return await require('./mesh-agent-manager.cjs').getMeshAgentStatus()
-    } catch (err) {
-      return { ok: false, status: 'error', message: String(err?.message || err) }
-    }
-  })
-  ipcMain.handle('mesh:agent-ensure', async (_event, clientId) => meshRemote.ensureLocalMeshAgent(clientId))
-  // Internal ops cleanup — not exposed in Vue menus; IPC still validates.
-  ipcMain.handle('mesh:agent-uninstall', async () => {
-    try {
-      return await require('./mesh-agent-manager.cjs').uninstallMeshAgent()
-    } catch (err) {
-      return { ok: false, code: 'MESH_UNINSTALL_FAILED', message: String(err?.message || err) }
-    }
-  })
+  // Silent MeshAgent only — no desktop/files UI IPC (admin console owns remote viewing).
+  ipcMain.handle('mesh:agent-ensure', async (_event, clientId) => meshRemote.ensureMeshReady(clientId))
+  ipcMain.handle('mesh:prepare-status', async () => meshRemote.getMeshPrepareStatus())
 }
 
 function resolveUiEntry() {
@@ -5380,12 +5453,6 @@ function fitWindowBounds() {
   }
 }
 
-function closeSplashWindow() {
-  const win = splashWindow
-  splashWindow = null
-  if (win && !win.isDestroyed()) win.destroy()
-}
-
 /**
  * 与便携包/桌面快捷方式同一套图标（electron-builder win.icon）。
  * @returns {string}
@@ -5418,35 +5485,100 @@ function resolveAppNativeImage(size = {}) {
   return icon
 }
 
+/**
+ * 更新启动 Splash 进度（真实阶段驱动，不空转等待）。
+ * @param {number} pct
+ * @param {string} [text]
+ */
+function setSplashProgress(pct, text) {
+  const n = Math.max(0, Math.min(100, Number(pct) || 0))
+  const t = String(text || splashPending.text || '正在启动，请稍候…')
+  splashPending = { pct: n, text: t }
+  if (!splashWindow || splashWindow.isDestroyed() || !splashContentReady) return
+  try {
+    const payload = JSON.stringify(splashPending)
+    splashWindow.webContents.executeJavaScript(
+      `window.__setProgress && window.__setProgress(${payload})`,
+      true,
+    ).catch(() => {})
+  } catch { /* splash 已销毁 */ }
+}
+
+function closeSplashWindow() {
+  const win = splashWindow
+  splashWindow = null
+  splashContentReady = false
+  if (!win || win.isDestroyed()) return
+  try { win.close() } catch { /* ignore */ }
+}
+
+/**
+ * 启动反馈窗：圆形转圈 + 进度条。
+ * 立刻 show（避免加载完成前被主窗关闭导致“完全看不到”）；
+ * 转圈用 canvas 重绘，不依赖 CSS transform（主进程禁用了硬件加速）。
+ * @returns {import('electron').BrowserWindow | null}
+ */
 function createSplashWindow() {
   if (splashWindow && !splashWindow.isDestroyed()) return splashWindow
-  const win = new BrowserWindow({
-    width: 300,
-    height: 132,
-    show: false,
-    frame: false,
-    resizable: false,
-    movable: true,
-    center: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    icon: resolveAppIconPath(),
-    backgroundColor: '#ffffff',
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  })
+  const splashPath = path.join(__dirname, 'splash.html')
+  let win
+  try {
+    win = new BrowserWindow({
+      width: 480,
+      height: 220,
+      resizable: false,
+      maximizable: false,
+      minimizable: false,
+      fullscreenable: false,
+      frame: false,
+      transparent: false,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      // 立刻可见：白底窗口先出来，再填 HTML；否则极速启动会在 did-finish-load 前关掉
+      show: true,
+      center: true,
+      backgroundColor: '#ffffff',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    })
+  } catch {
+    return null
+  }
   splashWindow = win
-  win.on('closed', () => { if (splashWindow === win) splashWindow = null })
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
-    *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;background:#fff;color:#202124;font-family:"Microsoft YaHei UI","Microsoft YaHei",sans-serif;user-select:none;border:1px solid #dfe3e8}
-    .content{display:flex;align-items:center;gap:18px}.spinner{width:34px;height:34px;border:4px solid #dce8ff;border-top-color:#1677ff;border-radius:50%;animation:spin .75s linear infinite}.title{font-size:16px;font-weight:600}.status{margin-top:7px;font-size:13px;color:#70757a}@keyframes spin{to{transform:rotate(360deg)}}
-  </style></head><body><div class="content"><div class="spinner"></div><div><div class="title">微信群控管理平台</div><div class="status">正在启动，请稍候...</div></div></div></body></html>`
-  win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
-    .then(() => { if (!win.isDestroyed()) win.show() })
-    .catch(() => { if (!win.isDestroyed()) win.show() })
+  splashContentReady = false
+  win.setMenu(null)
+  try { win.setAlwaysOnTop(true, 'screen-saver') } catch { /* ignore */ }
+  try { win.moveTop() } catch { /* ignore */ }
+  try { win.focus() } catch { /* ignore */ }
+  win.on('closed', () => {
+    if (splashWindow === win) {
+      splashWindow = null
+      splashContentReady = false
+    }
+  })
+  const markContentReady = () => {
+    if (win.isDestroyed()) return
+    splashContentReady = true
+    setSplashProgress(splashPending.pct, splashPending.text)
+    try { win.center() } catch { /* ignore */ }
+    try { win.setAlwaysOnTop(true, 'screen-saver') } catch { /* ignore */ }
+    if (!win.isVisible()) {
+      try { win.show() } catch { /* ignore */ }
+    }
+    try { win.moveTop() } catch { /* ignore */ }
+  }
+  win.webContents.once('did-finish-load', markContentReady)
+  win.once('ready-to-show', markContentReady)
+  // asar 内 path 偶发 existsSync 误判，直接 loadFile；失败则关掉空窗
+  win.loadFile(splashPath).catch(() => {
+    try { win.close() } catch { /* ignore */ }
+  })
+  setTimeout(() => {
+    if (!win.isDestroyed()) markContentReady()
+  }, 600).unref()
   return win
 }
 
@@ -5475,18 +5607,27 @@ function createWindow() {
     win.hide()
   })
   win.on('closed', () => { if (mainWindow === win) mainWindow = null })
+  win.webContents.once('dom-ready', () => {
+    markStartup('renderer dom ready')
+  })
   win.once('ready-to-show', () => {
     if (win.isDestroyed()) return
+    markStartup('ready-to-show')
+    setSplashProgress(100, '启动完成')
+    closeSplashWindow()
+    // 全应用唯一允许的“首次启动主动 focus”
     win.show()
     win.focus()
-    closeSplashWindow()
+    mainWindowFirstShowDone = true
   })
-  // 防止 ready-to-show 未触发时界面一直不出现
+  // 防止 ready-to-show 未触发时界面一直不出现；兜底只 show，不抢焦点
   setTimeout(() => {
     if (!win.isDestroyed() && !win.isVisible()) {
-      win.show()
-      win.focus()
+      markStartup('ready-to-show fallback')
+      setSplashProgress(100, '启动完成')
       closeSplashWindow()
+      win.show()
+      mainWindowFirstShowDone = true
     }
   }, 2500).unref()
 
@@ -5515,13 +5656,22 @@ function createWindow() {
   return win
 }
 
-function showMainWindow() {
+/**
+ * 显示主窗口。默认不抢焦点（后台恢复可见用）。
+ * @param {{ focus?: boolean }} [opts]
+ */
+function showMainWindow(opts = {}) {
+  const focus = Boolean(opts && opts.focus)
   const win = createWindow()
   if (win.isMinimized()) win.restore()
   if (!win.isVisible()) win.show()
-  win.setAlwaysOnTop(true)
-  win.focus()
-  setTimeout(() => { if (!win.isDestroyed()) win.setAlwaysOnTop(false) }, 300).unref()
+  // 主窗口正常情况下永远不得 alwaysOnTop
+  if (focus) win.focus()
+}
+
+/** 用户明确要求激活主窗口（托盘、二次启动等） */
+function activateMainWindow() {
+  showMainWindow({ focus: true })
 }
 
 function restartApp() {
@@ -5554,11 +5704,11 @@ function createTray() {
     const displayVersion = String(app.getVersion() || '').replace(/^(\d+\.\d+).*$/, '$1')
     tray.setContextMenu(Menu.buildFromTemplate([
       { label: `版本号 ${displayVersion}`, click: () => {} },
-      { label: '显示主界面', click: showMainWindow },
+      { label: '显示主界面', click: () => activateMainWindow() },
       { label: '重启软件', click: () => restartApp() },
       { label: '退出软件', click: () => { quitting = true; app.quit() } },
     ]))
-    tray.on('double-click', showMainWindow)
+    tray.on('double-click', () => activateMainWindow())
   } catch (error) {
     appLog('ERROR', '系统托盘创建失败', { error: rawErrorMessage(error) })
     tray = null
@@ -5568,31 +5718,19 @@ function createTray() {
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
+  try { createSplashWindow() } catch { /* splash 失败不挡启动 */ }
+  markStartup('app ready')
   try { installServiceCertificateTrust(session.defaultSession) } catch {}
-  createSplashWindow()
   try {
     initStorage(app.getPath('userData'))
+    markStartup('storage initialized')
     softwareAuth.initSoftwareAuth(app.getPath('userData'))
+    markStartup('auth initialized')
     // 尽早注册 IPC：后续步骤失败时登录页仍能拿到 auth:login 等通道
     registerIpc()
-    // 新版首次启动：清旧缓存/诊断落盘，保留设置、任务、登录态与设备身份
-    try {
-      const scrub = scrubLegacyCachesOnStartup({
-        userDataDir: app.getPath('userData'),
-        version: VERSION,
-        portableExePath: resolvePortableExePath(),
-        storage: { clearApiSamplesOnly },
-      })
-      if (!scrub.skipped) {
-        appLog('INFO', '已清理旧版缓存目录', {
-          module: '启动清理',
-          removed: scrub.removed.length,
-          dbRows: scrub.dbRows,
-        })
-      }
-    } catch (error) {
-      appLog('WARN', '启动缓存清理未完成', { module: '启动清理', error: rawErrorMessage(error) })
-    }
+    markStartup('ipc registered')
+
+    // 首屏必需的轻量设置恢复（无磁盘扫描）
     saveSetting('general', normalizeSettings(getSettings().general))
     const storedQrMonitor = getSettings().qrMonitor
     if (storedQrMonitor && typeof storedQrMonitor === 'object') {
@@ -5608,20 +5746,50 @@ app.whenReady().then(async () => {
         ensureQrMonitorSyncTimer()
       }
     }
-    // 轻量同步工作：先出界面；重活放到窗口之后
-    recoverInterruptedTasks()
-    loadApiContracts()
-    createWindow()
-    createTray()
-    showMainWindow()
 
-    // 已配置微信路径时几乎零开销；未配置才后台探测，避免挡住首屏
+    // 首次 show/focus 仅由 createWindow → ready-to-show 负责，此处不再 showMainWindow 抢焦点
+    createWindow()
+    markStartup('main window created')
+
+    // 非首屏必需：窗口创建后再跑，避免同步磁盘 IO / SQL / 托盘挡住首屏
     setImmediate(() => {
+      try {
+        const scrub = scrubLegacyCachesOnStartup({
+          userDataDir: app.getPath('userData'),
+          version: VERSION,
+          portableExePath: resolvePortableExePath(),
+          storage: { clearApiSamplesOnly },
+        })
+        markStartup('startup cache scrub completed')
+        if (!scrub.skipped) {
+          appLog('INFO', '已清理旧版缓存目录', {
+            module: '启动清理',
+            removed: scrub.removed.length,
+            dbRows: scrub.dbRows,
+          })
+        }
+      } catch (error) {
+        markStartup('startup cache scrub completed')
+        appLog('WARN', '启动缓存清理未完成', { module: '启动清理', error: rawErrorMessage(error) })
+      }
+      try {
+        recoverInterruptedTasks()
+        markStartup('tasks recovered')
+      } catch (error) {
+        appLog('ERROR', '恢复中断任务失败', { error: rawErrorMessage(error) })
+      }
+      try {
+        loadApiContracts()
+        markStartup('contracts loaded')
+      } catch (error) {
+        appLog('ERROR', '加载接口配置失败', { error: rawErrorMessage(error) })
+      }
+      try { createTray() } catch (error) {
+        appLog('ERROR', '系统托盘创建失败', { error: rawErrorMessage(error) })
+      }
       try { ensureWeixinPathConfigured() } catch (error) {
         appLog('ERROR', '自动探测微信路径失败', { error: rawErrorMessage(error) })
       }
-    })
-    setImmediate(() => {
       try { repairConfirmedSendTextResults() } catch (error) {
         appLog('ERROR', '修复发送结果失败', { error: rawErrorMessage(error) })
       }
@@ -5648,14 +5816,18 @@ app.whenReady().then(async () => {
       startRemoteAgent(remoteAgentOptions(account.username))
         .then((st) => {
           const selfId = String(st?.clientId || getRemoteAgentStatus()?.clientId || '')
-          return meshRemote.ensureLocalMeshAgent(selfId)
+          // 后台 ensureMeshReady：绝不 await 挡主界面
+          return meshRemote.ensureMeshReady(selfId)
         })
         .catch((error) => appLog('ERROR', '设备连接失败', { error: rawErrorMessage(error) }))
       restoreInstancesThenResumeQueuedTasks()
         .catch((error) => appLog('ERROR', '恢复微信实例失败', { error: rawErrorMessage(error) }))
     }).catch((error) => appLog('ERROR', '读取登录会话失败', { error: rawErrorMessage(error) }))
 
-    app.on('activate', () => { showMainWindow() })
+    // macOS Dock activate；Windows 不靠 activate 自动拉前台
+    if (process.platform === 'darwin') {
+      app.on('activate', () => { activateMainWindow() })
+    }
   } catch (error) {
     appLog('ERROR', '软件启动失败', { error: rawErrorMessage(error) })
     try {
@@ -5669,7 +5841,6 @@ app.whenReady().then(async () => {
       appLog('ERROR', '启动失败后注册 IPC 仍失败', { error: rawErrorMessage(ipcError) })
     }
     createWindow()
-    showMainWindow()
   }
 })
 
@@ -5679,7 +5850,6 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   quitting = true
-  closeSplashWindow()
   if (runtimeCacheCleanupTimer) {
     clearInterval(runtimeCacheCleanupTimer)
     runtimeCacheCleanupTimer = null

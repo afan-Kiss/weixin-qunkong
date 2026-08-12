@@ -14,26 +14,42 @@ test('safeClientId rejects empty, oversized, and unsafe ids', () => {
   assert.equal(safeClientId('ab:cd@ef'), 'ab:cd@ef')
 })
 
-test('preload remote API surface does not expose raw ipcRenderer', () => {
+test('preload does not expose remote UI APIs (silent client)', () => {
   const fs = require('fs')
   const path = require('path')
   const preload = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.cjs'), 'utf8')
-  assert.match(preload, /remoteGetStatus/)
-  assert.match(preload, /remoteOpenDesktop/)
   assert.match(preload, /contextBridge\.exposeInMainWorld/)
+  assert.doesNotMatch(preload, /remoteGetStatus|remoteOpenDesktop|remoteOpenFiles|remoteCloseSession/)
   assert.doesNotMatch(preload, /exposeInMainWorld\(['"]ipcRenderer['"]/)
   assert.doesNotMatch(preload, /MESH_LOGIN_KEY|loginTokenKey|adminPassword/)
-  // Renderer never receives embedUrl helpers
   assert.doesNotMatch(preload, /embedUrl|openExternal.*mesh/i)
+  assert.doesNotMatch(preload, /mesh:open-desktop|mesh:open-files|mesh:status/)
 })
 
-test('main mesh handlers only take clientId (no nodeId IPC)', () => {
+test('main keeps silent agent IPC only (no desktop/files session UI)', () => {
   const fs = require('fs')
   const path = require('path')
   const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
-  assert.match(main, /mesh:open-desktop/)
-  assert.match(main, /mesh:open-files/)
-  assert.doesNotMatch(main, /mesh:open-desktop[^\n]*nodeId/)
+  const bridge = fs.readFileSync(path.join(__dirname, '..', 'electron', 'mesh-remote-bridge.cjs'), 'utf8')
+  assert.match(main, /mesh:agent-ensure/)
+  assert.match(main, /ensureMeshReady/)
+  assert.doesNotMatch(main, /mesh:open-desktop|mesh:open-files|mesh:close-session|mesh:status/)
+  assert.doesNotMatch(bridge, /BrowserWindow|openEmbedWindow|openDesktopSession|openFilesSession/)
   assert.doesNotMatch(main, /webSecurity:\s*false/)
   assert.doesNotMatch(main, /nodeIntegration:\s*true/)
+  assert.match(bridge, /ensureMeshReady/)
+  assert.match(bridge, /PREPARE_RETRY_DELAYS_MS|AUTO_BIND_RETRY_DELAYS_MS/)
+  assert.match(bridge, /agentName/)
+  assert.match(bridge, /\/api\/mesh\/auto-bind/)
+  assert.match(bridge, /\[MESH\] prepare start|prepare start/)
+})
+
+test('bind success helper accepts already-bound and fresh bind payloads', () => {
+  const { isBindSuccess, shouldStopBindRetry } = require('../electron/mesh-remote-bridge.cjs')
+  assert.equal(isBindSuccess({ ok: true, code: 'OK', bound: true, meshNodeId: 'n1' }), true)
+  assert.equal(isBindSuccess({ ok: true, code: 'OK', mapping: { mesh_node_id: 'n2' } }), true)
+  assert.equal(isBindSuccess({ ok: false, code: 'MESH_NO_MATCH' }), false)
+  assert.equal(shouldStopBindRetry({ code: 'MESH_DISABLED' }), true)
+  assert.equal(shouldStopBindRetry({ code: 'MESH_NO_MATCH' }), false)
+  assert.equal(shouldStopBindRetry({ code: 'MESH_AMBIGUOUS' }), true)
 })

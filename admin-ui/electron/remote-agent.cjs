@@ -6,6 +6,7 @@ const { shell } = require('electron')
 const WebSocket = require('ws')
 const http = require('http')
 const https = require('https')
+const os = require('os')
 const { loadOrCreate, signRaw, authHeaders, BUILD_ID, VERSION, PROTOCOL, agentWsRequestPath } = require('./device-identity.cjs')
 const { getServiceBase, getDesktopHashPath } = require('./secure-config.cjs')
 const { insecureTlsForService } = require('./service-tls.cjs')
@@ -241,7 +242,7 @@ async function connect() {
       if (socket !== ws || stopping || !state.running) return
       state.connected = true; state.lastError = ''
       reconnectAttempt = 0; lastServerAt = Date.now()
-      send({ type: 'hello', clientId: state.identity.clientId, account: state.account, version: VERSION, desktopWatching: false, ...PROTOCOL })
+      send({ type: 'hello', clientId: state.identity.clientId, account: state.account, version: VERSION, desktopWatching: false, hostname: os.hostname(), ...PROTOCOL })
       heartbeat()
       if (heartbeatTimer) clearInterval(heartbeatTimer)
       heartbeatTimer = setInterval(() => {
