@@ -3,7 +3,7 @@
  * 生产环境强制校验清单 Ed25519 签名。
  */
 const { createHash, createPublicKey, verify } = require('crypto')
-const { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, unlinkSync, statSync, writeFileSync, rmSync, readdirSync } = require('fs')
+const { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, unlinkSync, statSync, writeFileSync, readFileSync, rmSync, readdirSync } = require('fs')
 const http = require('http')
 const https = require('https')
 const path = require('path')
@@ -461,8 +461,8 @@ function downloadRangeToFile(url, dest, start, end, onChunk) {
 }
 
 /**
- * 多连接 Range 并发下载 + 断点续传。
- * 窄带（如 5Mbps）用 2 并发 + 2MB 分片，避免 4 路 TLS/拥塞互相拖慢。
+ * 多连接 Range 下载 + 断点续传。
+ * 按量计费机房：默认单连接，避免并发重试/整包回退造成双倍流量。
  * @param {string} url
  * @param {string} dest
  * @param {number} expectedSize
@@ -505,27 +505,58 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
     return
   }
 
-  // 5Mbps≈640KB/s：2 并发通常比 4 并发更稳、更快（少握手/少丢包重传）
+  // 单连接 + 2MB 分片：窄带更稳，也避免多连接失败后整包重下浪费流量
   const partSize = 2 * 1024 * 1024
-  const concurrency = total >= 16 * 1024 * 1024 ? 2 : 1
+  const concurrency = 1
+  const partsMetaPath = `${dest}.wxqk-parts`
   const parts = []
   for (let start = 0; start < total; start += partSize) {
     parts.push({ start, end: Math.min(total - 1, start + partSize - 1), done: false })
   }
-  // 已有完整文件
-  if (existsSync(dest) && statSync(dest).size === total) {
-    onProgress?.(total, total)
+  const { openSync, ftruncateSync, closeSync } = require('fs')
+  let downloaded = 0
+  let resumeOk = false
+  if (existsSync(dest) && existsSync(partsMetaPath) && statSync(dest).size === total) {
+    try {
+      const meta = JSON.parse(readFileSync(partsMetaPath, 'utf8'))
+      if (meta && Number(meta.total) === total && Number(meta.partSize) === partSize && Array.isArray(meta.done)) {
+        const doneSet = new Set(meta.done.map((n) => Number(n)).filter((n) => Number.isFinite(n)))
+        for (const part of parts) {
+          if (doneSet.has(part.start)) {
+            part.done = true
+            downloaded += part.end - part.start + 1
+          }
+        }
+        resumeOk = true
+      }
+    } catch {
+      resumeOk = false
+    }
+  }
+  if (!resumeOk) {
+    const fd = openSync(dest, 'w')
+    try { ftruncateSync(fd, total) } finally { closeSync(fd) }
+    downloaded = 0
+    for (const part of parts) part.done = false
+    try { writeFileSync(partsMetaPath, JSON.stringify({ total, partSize, done: [] })) } catch { /* ignore */ }
+  }
+  onProgress?.(Math.min(total, downloaded), total)
+  if (parts.every((part) => part.done)) {
+    try { unlinkSync(partsMetaPath) } catch { /* ignore */ }
     return
   }
-  // 预分配
-  const { openSync, ftruncateSync, closeSync } = require('fs')
-  const fd = openSync(dest, 'w')
-  try { ftruncateSync(fd, total) } finally { closeSync(fd) }
 
-  let downloaded = 0
-  onProgress?.(0, total)
   let cursor = 0
   let rangeUnsupported = false
+  function persistPartsProgress() {
+    try {
+      writeFileSync(partsMetaPath, JSON.stringify({
+        total,
+        partSize,
+        done: parts.filter((part) => part.done).map((part) => part.start),
+      }))
+    } catch { /* ignore */ }
+  }
   async function worker() {
     while (true) {
       if (rangeUnsupported) return
@@ -533,8 +564,9 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
       cursor += 1
       if (idx >= parts.length) return
       const part = parts[idx]
+      if (part.done) continue
       let attempt = 0
-      while (attempt < 4) {
+      while (attempt < 3) {
         if (rangeUnsupported) return
         attempt += 1
         let partGot = 0
@@ -545,6 +577,7 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
             onProgress?.(Math.min(total, downloaded), total)
           })
           part.done = true
+          persistPartsProgress()
           break
         } catch (error) {
           downloaded = Math.max(0, downloaded - partGot)
@@ -553,7 +586,7 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
             rangeUnsupported = true
             return
           }
-          if (attempt >= 4) throw error
+          if (attempt >= 3) throw error
           await new Promise((r) => setTimeout(r, 400 * attempt))
         }
       }
@@ -561,6 +594,11 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
   }
   await Promise.all(Array.from({ length: concurrency }, () => worker()))
   if (rangeUnsupported) {
+    // 已有分片成功时禁止整包重下：会双倍计费，且覆盖已写入内容无意义
+    if (parts.some((part) => part.done)) {
+      throw new Error('RANGE_UNSUPPORTED_AFTER_PARTIAL')
+    }
+    try { unlinkSync(partsMetaPath) } catch { /* ignore */ }
     // Fallback: single-connection full download (HTTP 200)
     const u = new URL(url)
     const lib = u.protocol === 'https:' ? https : http
@@ -594,6 +632,7 @@ async function downloadWithResume(url, dest, expectedSize, onProgress) {
     })
   }
   if (statSync(dest).size !== total) throw new Error('UPDATE_SIZE_MISMATCH')
+  try { unlinkSync(partsMetaPath) } catch { /* ignore */ }
 }
 
 /**
@@ -737,22 +776,51 @@ async function applyUpdate(options) {
     const workDir = path.join(require('os').tmpdir(), getUpdateWorkDirName())
     mkdirSync(workDir, { recursive: true })
     const downloadPath = path.join(workDir, destName)
+    const expectedSize = Number(man.fileSize || 0) || 0
 
     await reportUpdate(baseUrl, 'DOWNLOAD_STARTED', meta, { buildId: man.buildId, version: man.version })
     let downloadError = null
-    for (const candidate of candidates) {
+    let reusedLocal = false
+    // 本地已有完整临时包且校验通过：不再拉流量
+    if (expectedSize > 0 && existsSync(downloadPath) && statSync(downloadPath).size === expectedSize) {
       try {
-        await downloadWithResume(candidate, downloadPath, Number(man.fileSize || 0) || 0, options.onProgress)
-        url = candidate
+        await verifyPackageFile(downloadPath, man)
+        reusedLocal = true
         downloadError = null
-        break
-      } catch (error) {
-        downloadError = error
+      } catch {
+        try { unlinkSync(downloadPath) } catch { /* ignore */ }
+        try { unlinkSync(`${downloadPath}.wxqk-parts`) } catch { /* ignore */ }
+      }
+    }
+    if (!reusedLocal) {
+      for (let i = 0; i < candidates.length; i += 1) {
+        const candidate = candidates[i]
+        try {
+          await downloadWithResume(candidate, downloadPath, expectedSize, options.onProgress)
+          url = candidate
+          downloadError = null
+          break
+        } catch (error) {
+          downloadError = error
+          // 已拉过大段数据后再换源会整包重下，按量计费下禁止浪费
+          if (i + 1 < candidates.length) {
+            let partial = 0
+            try { if (existsSync(downloadPath)) partial = statSync(downloadPath).size } catch { partial = 0 }
+            if (partial > 1024 * 1024) break
+          }
+        }
       }
     }
     if (downloadError) throw downloadError
     await reportUpdate(baseUrl, 'DOWNLOAD_COMPLETED', meta, { buildId: man.buildId, downloadURL: url })
-    await verifyPackageFile(downloadPath, man)
+    try {
+      await verifyPackageFile(downloadPath, man)
+    } catch (error) {
+      // 校验失败删掉坏包，避免下次误跳过下载卡死，也避免反复传坏包浪费流量
+      try { unlinkSync(downloadPath) } catch { /* ignore */ }
+      try { unlinkSync(`${downloadPath}.wxqk-parts`) } catch { /* ignore */ }
+      throw error
+    }
 
     await reportUpdate(baseUrl, 'INSTALL_STARTED', meta, { buildId: man.buildId, version: man.version })
     if (path.resolve(finalPath) === path.resolve(currentExe)) {

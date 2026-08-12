@@ -487,10 +487,11 @@ def viewer_count(cid: str) -> int:
 # forceRestart still must reach the agent periodically — soft coalesce must not swallow it entirely
 # (1.62 agent ignores soft start_desktop while captureTimer is already running).
 # LiveKit 房间按设备固定：墙侧每 15~30s 新 sid 若都 force，会 DUPLICATE_IDENTITY / getDisplayMedia 风暴。
-_DESKTOP_FORCE_RESTART_MIN_SEC = 90.0
+_DESKTOP_FORCE_RESTART_MIN_SEC = 45.0
 _DESKTOP_SOFT_START_COALESCE_SEC = 12.0
 # 旧客户端(≤1.74)收到任何 start_desktop 都会 leave+重进 LiveKit；LiveKit 路径尽量少下发
-_DESKTOP_LIVEKIT_START_COALESCE_SEC = 120.0
+# 冻屏恢复需要能在约 1 分钟内再次 soft/force，120s 过长会导致「昨天冻到今天」
+_DESKTOP_LIVEKIT_START_COALESCE_SEC = 45.0
 # last forced sessionId per client — new WebRTC session must always hard-kick
 _desktop_start_meta: dict[str, dict[str, float | str]] = {}
 _desktop_start_lock = threading.Lock()
@@ -536,19 +537,21 @@ def start_desktop_for_agent(
             already = bool((_online.get(cid) or {}).get("desktopWatching"))
         since_soft = now - float(meta.get("last_soft") or 0.0)
         since_force = now - float(meta.get("last_force") or 0.0)
-        demoted = False
         if force_restart:
-            # 同房/已在看：90s 内禁止硬拉（旧客户端硬拉=拆采集）
-            if since_force < _DESKTOP_FORCE_RESTART_MIN_SEC and (same_room or already or has_livekit):
-                force_restart = False
-                demoted = True
-            else:
-                meta["last_force"] = now
+            # 短窗内丢弃重复硬拉。禁止「降级成 soft」：
+            # 1) soft 在代理 mediaConnected=true（假 connected 冻屏）时会被直接 reused 忽略
+            # 2) 旧逻辑 demote 后立刻 if not token_changed: return True，令都发不出去
+            #    → 墙侧烧完 lastForceKickAt，代理却永远收不到 forceRestart
+            # 只认 already（desktopWatching）：房间按设备固定，不必再卡 same_room
+            # （无 room_name 的调用否则永远合并不了）
+            if since_force < _DESKTOP_FORCE_RESTART_MIN_SEC and already:
+                return True
+            meta["last_force"] = now
         if session_id:
             meta["last_session_id"] = session_id
         if room_name:
             meta["last_room"] = room_name
-        # LiveKit：同房软续命长窗口吞掉；token 轮换限流软发（避免每秒新 sid 打穿 coalesce）
+        # LiveKit：同房软续命短窗吞掉；仅 token 轮换允许再发（仍限 15s）
         if (
             has_livekit
             and not force_restart
@@ -557,10 +560,7 @@ def start_desktop_for_agent(
         ):
             if not token_changed:
                 return True
-            # 被墙侧踢降级后至少再软发一次，否则冻屏代理永远收不到令
-            if demoted:
-                pass
-            elif since_soft < 25.0:
+            if since_soft < 15.0:
                 return True
         if not force_restart:
             if already and not session_id and since_soft < _DESKTOP_SOFT_START_COALESCE_SEC:
@@ -653,8 +653,8 @@ _stop_desktop_timers: dict[str, threading.Timer] = {}
 _stop_desktop_lock = threading.Lock()
 
 
-def schedule_stop_desktop_if_idle(cid: str, delay_sec: float = 2.0) -> None:
-    """Debounce stop so brief viewer reconnect does not kill the publisher."""
+def schedule_stop_desktop_if_idle(cid: str, delay_sec: float = 8.0) -> None:
+    """Debounce stop so page refresh / brief viewer reconnect does not kill the publisher."""
     cid = safe_id(cid)
     if not cid or cid == "unknown":
         return
@@ -679,6 +679,7 @@ def schedule_stop_desktop_if_idle(cid: str, delay_sec: float = 2.0) -> None:
                 old.cancel()
             except Exception:
                 pass
+        # 默认 8s：屏幕墙 F5 后观众重连通常 <3s；过短会把仍在推的代理掐死
         t = threading.Timer(max(0.5, float(delay_sec)), _fire)
         t.daemon = True
         _stop_desktop_timers[cid] = t
@@ -2520,35 +2521,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                # Prefer sendfile through plain TCP to nginx (TLS terminated upstream).
-                # Falls back to large buffered copies when sendfile is unavailable.
-                sent_ok = False
-                try:
-                    import os as _os
-                    sock = getattr(self, "connection", None)
-                    if sock is not None and length > 0 and hasattr(_os, "sendfile"):
-                        with pkg.open("rb") as f:
-                            offset = start
-                            left = length
-                            while left > 0:
-                                n = _os.sendfile(sock.fileno(), f.fileno(), offset, min(left, 1024 * 1024))
-                                if not n:
-                                    break
-                                offset += n
-                                left -= n
-                        sent_ok = left == 0
-                except Exception:
-                    sent_ok = False
-                if not sent_ok:
-                    with pkg.open("rb") as f:
-                        f.seek(start)
-                        left = length
-                        while left > 0:
-                            chunk = f.read(min(1024 * 1024, left))
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                            left -= len(chunk)
+                # 只用缓冲拷贝发盘：禁止 sendfile 半成功后再整段重发（会双倍流量且破坏响应）。
+                with pkg.open("rb") as f:
+                    f.seek(start)
+                    left = length
+                    while left > 0:
+                        chunk = f.read(min(1024 * 1024, left))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
                 try:
                     self.wfile.flush()
                 except Exception:
@@ -3342,7 +3324,7 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 elif typ == "unwatch":
                     # Match disconnect debounce — brief unwatch/reconnect must not STOP then START.
-                    schedule_stop_desktop_if_idle(cid, delay_sec=3.0)
+                    schedule_stop_desktop_if_idle(cid, delay_sec=8.0)
                 elif typ.startswith("webrtc_") or typ in ("control", "file"):
                     sid = str(msg.get("desktopSessionId") or "")
                     if sid and typ.startswith("webrtc_"):
@@ -3369,7 +3351,7 @@ class Handler(BaseHTTPRequestHandler):
             unregister_viewer(cid, sock)
             # Debounced: brief reconnect must not kill publisher while UI reconnects.
             if viewer_count(cid) == 0:
-                schedule_stop_desktop_if_idle(cid, delay_sec=2.0)
+                schedule_stop_desktop_if_idle(cid, delay_sec=8.0)
             try:
                 sock.close()
             except Exception:

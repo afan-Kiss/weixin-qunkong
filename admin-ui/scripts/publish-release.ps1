@@ -152,8 +152,14 @@ if (-not $SkipPackage) {
   if ($LASTEXITCODE -ne 0) { throw "npm run build failed: $LASTEXITCODE" }
   $meta = Get-PackageDisplayVersion
   $script:PackageOutputDir = Resolve-BuilderOutputDir -PreferredName (Get-DefaultOutputDirName -Pkg $meta.Pkg)
-  Write-Host ("== electron-builder portable (output={0}, mirror={1}) ==" -f $script:PackageOutputDir, $env:ELECTRON_MIRROR)
-  npx electron-builder --win portable --config.directories.output=$script:PackageOutputDir
+  $builderOut = [string]$script:PackageOutputDir
+  Write-Host ("== electron-builder portable (output={0}, mirror={1}) ==" -f $builderOut, $env:ELECTRON_MIRROR)
+  # 避免 npx.ps1 对含 $script: 的参数二次 Expand；直接调 electron-builder CLI
+  $ebCli = Join-Path $root 'node_modules\electron-builder\cli.js'
+  if (-not (Test-Path -LiteralPath $ebCli)) {
+    throw "electron-builder missing: $ebCli (run npm install)"
+  }
+  node $ebCli --win portable --config.directories.output=$builderOut
   if ($LASTEXITCODE -ne 0) { throw "electron-builder failed: $LASTEXITCODE" }
 }
 

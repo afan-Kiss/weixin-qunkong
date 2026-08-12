@@ -42,6 +42,7 @@
    */
   async function stopMedia(keepStream, onlyRoom, opts) {
     const skipUnpublish = !!(opts && opts.skipUnpublish);
+    clearPublishHealthWatch();
     const active = room;
     if (onlyRoom && active && onlyRoom !== active) {
       try { await onlyRoom.disconnect(); } catch (_) {}
@@ -94,13 +95,99 @@
     autoReconnectTimer = setTimeout(() => {
       autoReconnectTimer = null;
       if (intentionalStop) return;
+      // 必须 restart：op=start 在「房间仍 connected + track 假 live」时会 reused 直接 return，
+      // 健康检查 / 掉线自愈等于空转，屏幕墙会一直冻着。
       void startSession({
-        op: 'start',
+        op: 'restart',
         desktopSessionId: sessionId,
         livekitUrl: lastUrl,
         livekitToken: lastToken,
       });
     }, delay);
+  }
+
+  let publishHealthTimer = null;
+  let mutedStrike = 0;
+  let lastFramesSent = -1;
+  let framesStallStrike = 0;
+  function clearPublishHealthWatch() {
+    if (publishHealthTimer) {
+      clearInterval(publishHealthTimer);
+      publishHealthTimer = null;
+    }
+    mutedStrike = 0;
+    lastFramesSent = -1;
+    framesStallStrike = 0;
+  }
+  /** 读 outbound-rtp framesSent；编码器静默时 readyState 仍可能是 live。 */
+  async function readOutboundFramesSent() {
+    try {
+      const track = publishedTrack;
+      if (!track || !room || !room.localParticipant) return -1;
+      const pubs = room.localParticipant.videoTrackPublications
+        || room.localParticipant.trackPublications;
+      if (!pubs) return -1;
+      let publication = null;
+      pubs.forEach((pub) => {
+        if (publication) return;
+        try {
+          if (pub && (pub.track === track || (pub.track && pub.track.mediaStreamTrack === track))) {
+            publication = pub;
+          }
+        } catch (_) {}
+      });
+      const mediaTrack = publication && publication.track;
+      if (mediaTrack && typeof mediaTrack.getRTCStatsReport === 'function') {
+        const report = await mediaTrack.getRTCStatsReport();
+        let frames = -1;
+        report.forEach((r) => {
+          if (r && (r.type === 'outbound-rtp' || r.type === 'outboundrtp') && typeof r.framesSent === 'number') {
+            frames = Math.max(frames, r.framesSent);
+          }
+        });
+        return frames;
+      }
+    } catch (_) {}
+    return -1;
+  }
+  /** 轨假 live / muted 持续 / framesSent 停更时主动重进，避免屏幕墙「昨天冻到今天」。 */
+  function startPublishHealthWatch() {
+    clearPublishHealthWatch();
+    publishHealthTimer = setInterval(() => {
+      if (intentionalStop || starting) return;
+      const track = publishedTrack;
+      if (!track) return;
+      if (track.readyState && track.readyState !== 'live') {
+        clearPublishHealthWatch();
+        scheduleAutoReconnect('publish_track_' + String(track.readyState));
+        return;
+      }
+      // muted 可能短暂闪一下；连续两次（~30s）再重启，避免误伤
+      if (track.muted) {
+        mutedStrike += 1;
+        if (mutedStrike >= 2) {
+          clearPublishHealthWatch();
+          scheduleAutoReconnect('publish_track_muted');
+          return;
+        }
+      } else {
+        mutedStrike = 0;
+      }
+      void readOutboundFramesSent().then((frames) => {
+        if (intentionalStop || starting || publishedTrack !== track) return;
+        if (frames < 0) return;
+        if (lastFramesSent >= 0 && frames <= lastFramesSent) {
+          framesStallStrike += 1;
+          if (framesStallStrike >= 2) {
+            clearPublishHealthWatch();
+            scheduleAutoReconnect('publish_frames_stalled');
+          }
+        } else {
+          framesStallStrike = 0;
+        }
+        lastFramesSent = frames;
+      });
+    }, 15000);
   }
 
   function bindTrackEnded(stream) {
@@ -300,6 +387,7 @@
       });
       publishedTrack = videoTrack;
       reconnectAttempt = 0;
+      startPublishHealthWatch();
       post('signal', {
         type: 'webrtc_offer',
         desktopSessionId: sessionId,

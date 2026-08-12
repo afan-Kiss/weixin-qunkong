@@ -1125,6 +1125,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     if (!c) return;
     c.linkDownAt = 0;
     c.linkDownReason = '';
+    if (c.viewer) c.viewer.reconnectMarkAt = 0;
   }
 
   function isLivekitVideoFresh(c) {
@@ -1871,7 +1872,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       || !!(LK && LK.ConnectionState && lk.state === LK.ConnectionState.Connected);
   }
 
-  /** 房间还连着但解码停更：观众侧重进；代理 forceRestart 最多 90s 一次，避免拆房风暴。 */
+  /** 房间还连着但解码停更：观众侧重进；短卡死软恢复，长卡死必须硬拉代理。 */
   function recoverStalledLivekit(c) {
     if (!c || !isSelected(c.key) || state.leaving) return false;
     const src = srcOf(c.sourceId);
@@ -1880,12 +1881,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     if (ageMs < 25000) return false;
     const v = c.viewer || (c.viewer = makeViewerState());
     const last = Number(v.lastKickAt || 0);
-    if (last && (Date.now() - last) < 60000) return false;
+    // 短冷却 45s；画面已冻 >90s 仍保持 45s，避免坏机 getDisplayMedia 狂打
+    const kickGap = 45000;
+    if (last && (Date.now() - last) < kickGap) return false;
     v.lastKickAt = Date.now();
     v.webrtcTrying = false;
-    // 仅当长时间无帧才硬拉代理；否则只重进观众房
+    // 无帧 ≥45s：无视 90s force 冷却，必须硬拉（假 connected 冻屏唯一出路）
     const lastForce = Number(v.lastForceKickAt || 0);
-    const allowForce = !lastForce || (Date.now() - lastForce) > 90000;
+    const allowForce = ageMs >= 45000 || !lastForce || (Date.now() - lastForce) > 90000;
     if (allowForce) {
       v.lkAgentReady = false;
       v.lastForceKickAt = Date.now();
@@ -2019,7 +2022,17 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         } catch (_) {}
         room.on(LK.RoomEvent.Reconnecting, () => {
           setPathMode(c, 'livekit');
-          markLinkDown(c, 'disconnected');
+          // 短暂 Reconnecting 很常见（刷新/切网），延迟再标红，避免整墙刷「推流已断线」
+          const markAt = Date.now();
+          v.reconnectMarkAt = markAt;
+          setTimeout(() => {
+            if (v.reconnectMarkAt !== markAt) return;
+            if (!isSelected(c.key) || state.leaving) return;
+            if (isLivekitVideoFresh(c)) return;
+            if (!isLkRoomConnected(c) || (c.frameAt && (Date.now() - c.frameAt) > STALE_BANNER_LIVE_MS)) {
+              markLinkDown(c, 'disconnected');
+            }
+          }, 3500);
         });
         room.on(LK.RoomEvent.Disconnected, () => {
           if (v.lkRoom !== room) return;
@@ -2036,9 +2049,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           }, 1200);
         });
 
-        // 代理硬拉节流：lkAgentReady=false 且距上次 force≥90s 才 kick（旧客户端强制会拆采集）
+        // 代理硬拉：冻屏可缩短间隔；仍必须有冷却，避免 getDisplayMedia_timeout 机被打穿
         const lastForce = Number(v.lastForceKickAt || 0);
-        const needKick = !v.lkAgentReady && (!lastForce || (Date.now() - lastForce) > 90000);
+        const frameAge = c.frameAt ? (Date.now() - c.frameAt) : 999999;
+        const stalled = !c.hasVideoFrame || frameAge >= 45000 || !!c.linkDownAt;
+        const forceGap = stalled ? 45000 : 90000;
+        const needKick = (stalled || !v.lkAgentReady)
+          && (!lastForce || (Date.now() - lastForce) > forceGap);
         if (ws && ws.readyState === 1) {
           try {
             ws.send(JSON.stringify({
@@ -2051,7 +2068,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           } catch (_) {}
         }
         if (needKick) {
-          v.lkAgentReady = true;
+          // 勿提前标 lkAgentReady：硬拉后要等 TrackSubscribed / webrtc_offer
+          // （旧逻辑先标 true → 代理没起来时后续也不再 force）
+          v.lkAgentReady = false;
           v.lastForceKickAt = Date.now();
         } else if (!v.lkAgentReady) {
           // 冷却中 / 复用会话：标已请求，避免每个新 sid 都 force
@@ -2852,7 +2871,15 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
   }
 
-  /** Close viewer WS first so server can stop agents; HTTP stop is backup. */
+  /** 仅断开观众端（刷新用）：不 stop 代理，靠服务端 idle debounce 在无人观看时停采集。 */
+  function detachAllViewers() {
+    for (const c of state.clients.values()) {
+      disconnectViewer(c);
+      // 保留最后一帧像素，刷新后可先显示缓存再接流
+    }
+  }
+
+  /** 登出/真正离开：关观众 + HTTP stop 代理。刷新禁止走这条（否则整墙「推流已断线」）。 */
   function stopAllDesktops(opts) {
     opts = opts || {};
     const keepalive = !!opts.keepalive;
@@ -2980,13 +3007,15 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       void refreshTokens({ force: false }).then(() => refreshOverview()).then(() => refreshFrames());
     }
   });
+  // 刷新/关页：只拆观众连接，禁止 HTTP stop。
+  // 旧逻辑 stopAllDesktops 会把所有代理推流杀掉 → 刷新后整墙「推流已断线」。
   window.addEventListener('pagehide', () => {
     state.leaving = true;
-    stopAllDesktops({ keepalive: true });
+    detachAllViewers();
   });
   window.addEventListener('beforeunload', () => {
     state.leaving = true;
-    stopAllDesktops({ keepalive: true });
+    detachAllViewers();
   });
 
   if (SOURCES.some(s => state.tokens[s.id])) showWall();

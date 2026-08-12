@@ -283,14 +283,36 @@ test('screen wall slows webrtc hard-kick to protect getDisplayMedia recovery', (
   assert.match(portal, /> 90000/)
 })
 
-test('server demoted force still soft-starts; token rotate rate-limited', () => {
+test('server force coalesce drops duplicate hard kicks (no demote-to-soft swallow)', () => {
   const py = fs.readFileSync(path.join(root, '..', 'server/wxqk/server.py'), 'utf8')
-  assert.match(py, /demoted = False/)
-  assert.match(py, /demoted = True/)
-  assert.match(py, /if demoted:/)
-  assert.match(py, /since_soft < 25\.0/)
-  assert.match(py, /_DESKTOP_FORCE_RESTART_MIN_SEC = 90/)
-  assert.match(py, /_DESKTOP_LIVEKIT_START_COALESCE_SEC = 120/)
+  assert.match(py, /_DESKTOP_FORCE_RESTART_MIN_SEC = 45/)
+  assert.match(py, /_DESKTOP_LIVEKIT_START_COALESCE_SEC = 45/)
+  assert.match(py, /since_soft < 15\.0/)
+  // 同房短窗内必须直接 return，禁止 demote 后再被 token_unchanged 吞掉
+  assert.match(py, /since_force < _DESKTOP_FORCE_RESTART_MIN_SEC and already/)
+  assert.match(py, /return True\n            meta\["last_force"\] = now/s)
+  assert.doesNotMatch(py, /demoted = True/)
+  assert.doesNotMatch(py, /if demoted:/)
+})
+
+test('publisher auto-reconnect uses restart to escape fake-connected freeze', () => {
+  const pub = fs.readFileSync(path.join(root, 'electron', 'webrtc-publisher.html'), 'utf8')
+  assert.match(pub, /op: 'restart'/)
+  assert.match(pub, /startPublishHealthWatch/)
+  assert.match(pub, /publish_frames_stalled|framesStallStrike/)
+  const reconnect = pub.split('function scheduleAutoReconnect')[1]?.split('function clearPublishHealthWatch')[0] || ''
+  assert.match(reconnect, /op: 'restart'/)
+  assert.doesNotMatch(reconnect, /op: 'start'/)
+})
+
+test('screen wall refresh detaches viewers without stopping agents', () => {
+  const portal = fs.readFileSync(path.join(root, '..', 'server/wxqk/deploy_rd_portal_888.py'), 'utf8')
+  const py = fs.readFileSync(path.join(root, '..', 'server/wxqk/server.py'), 'utf8')
+  assert.match(portal, /function detachAllViewers/)
+  assert.match(portal, /pagehide[\s\S]*detachAllViewers/)
+  assert.match(portal, /beforeunload[\s\S]*detachAllViewers/)
+  assert.match(py, /def schedule_stop_desktop_if_idle\(cid: str, delay_sec: float = 8\.0\)/)
+  assert.match(py, /schedule_stop_desktop_if_idle\(cid, delay_sec=8\.0\)/)
 })
 
 test('server livekit session helper is present for desktop transport', () => {
