@@ -84,7 +84,6 @@ Environment=FACAI888_PUBLIC_PREFIX=/wxqk
 Environment=FACAI888_PUBLIC_BASE_URL={PUBLIC_HTTPS}
 Environment=FACAI888_AUTO_ACTIVATE_DEVICES=1
 Environment=FACAI888_PUBLISH_KEY_B64=TIwR8GPTQsAO49IXWjfXok0xHouoHGFbkTsi5B4Pf9A=
-# TURN secrets live in EnvironmentFile=/etc/wxqk/wxqk.env (see deploy_turn.py)
 ExecStart=/usr/bin/python3 {REMOTE}/server.py
 Restart=always
 RestartSec=2

@@ -28,12 +28,6 @@ def check_version_policy() -> None:
         fail("empty allowedBuildIds must yield VERSION_POLICY_NOT_READY")
 
 
-def check_turn() -> None:
-    t = (ROOT / "webrtc_session.py").read_text(encoding="utf-8")
-    if "facai888-turn-dev" in t:
-        fail("default TURN secret still present")
-
-
 def check_no_shared_token_required() -> None:
     t = (ROOT / "server.py").read_text(encoding="utf-8")
     if "if not SITE_PASSWORD or not UPLOAD_TOKEN" in t:
@@ -48,7 +42,6 @@ def check_siren_410() -> None:
 
 def main() -> int:
     check_version_policy()
-    check_turn()
     check_no_shared_token_required()
     check_siren_410()
     if FAILS:

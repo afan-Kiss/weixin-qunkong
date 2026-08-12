@@ -1,0 +1,4 @@
+# Pinned MeshCentral release for WXQK remote maintenance.
+# Keep docker-compose.yml image tag in sync with this file.
+# Upgrade: backup data/ → change tag → compose up → healthcheck → verify webRTC=false.
+MESHCENTRAL_VERSION=1.2.4

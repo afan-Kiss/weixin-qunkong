@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""微信群控远程管理后台（管理页 /wxqk）：设备注册、远程桌面、会话监控。"""
+"""微信群控远程管理后台（管理页 /wxqk）：设备注册、会话监控、策略与同步。"""
 from __future__ import annotations
 
 import base64
@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from wsutil import handshake_response, recv_json, send_frame, send_json
+from wsutil import handshake_response, recv_json, send_json
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -150,10 +150,6 @@ _normalize_calls = 0
 _online_persist_at: dict[str, float] = {}
 _online_persist_fp: dict[str, str] = {}
 _online_disk_writes = 0
-MAX_FRAME_B64_CHARS = 3_500_000
-MAX_DELTA_TILES = 800
-MAX_DELTA_TILE_B64_CHARS = 400_000
-SHOT_DISK_INTERVAL_SEC = 10.0
 ONLINE_PERSIST_INTERVAL_SEC = 60.0
 
 # --- runtime policy cache ---
@@ -204,32 +200,9 @@ _friend_diag_rotator = (
     else None
 )
 
-# --- realtime desktop WS hubs ---
+# --- agent WS hub (remote desktop / viewer retired) ---
 _agent_ws: dict[str, Any] = {}   # clientId -> socket
-_viewer_ws: dict[str, list] = {}  # clientId -> [sockets]
-# viewer socket -> desktopSessionId（WebRTC 信令按会话隔离，避免多路抢 answer）
-_viewer_desktop_session: dict[int, str] = {}
-# viewer socket -> bound LiveKit session：跳过 JPEG/delta 扇出
-_viewer_skip_jpeg: dict[int, float] = {}
 _ws_lock = threading.RLock()
-_viewer_tickets: dict[str, dict[str, Any]] = {}
-
-
-def make_viewer_ticket(client_id: str) -> str:
-    ticket = secrets.token_urlsafe(32)
-    now = now_ts()
-    with _ws_lock:
-        for key, row in list(_viewer_tickets.items()):
-            if float(row.get("expiresAt") or 0) < now:
-                _viewer_tickets.pop(key, None)
-        _viewer_tickets[ticket] = {"clientId": safe_id(client_id), "expiresAt": now + 30}
-    return ticket
-
-
-def consume_viewer_ticket(ticket: str, client_id: str) -> bool:
-    with _ws_lock:
-        row = _viewer_tickets.pop(str(ticket or ""), None)
-    return bool(row and float(row.get("expiresAt") or 0) >= now_ts() and row.get("clientId") == safe_id(client_id))
 
 
 def register_agent(cid: str, sock) -> None:
@@ -249,52 +222,6 @@ def unregister_agent(cid: str, sock) -> None:
     with _ws_lock:
         if _agent_ws.get(cid) is sock:
             _agent_ws.pop(cid, None)
-
-
-def register_viewer(cid: str, sock) -> None:
-    cid = safe_id(cid)
-    with _ws_lock:
-        _viewer_ws.setdefault(cid, []).append(sock)
-
-
-def unregister_viewer(cid: str, sock) -> None:
-    cid = safe_id(cid)
-    with _ws_lock:
-        arr = _viewer_ws.get(cid) or []
-        _viewer_ws[cid] = [s for s in arr if s is not sock]
-        if not _viewer_ws[cid]:
-            _viewer_ws.pop(cid, None)
-        _viewer_desktop_session.pop(id(sock), None)
-        _viewer_skip_jpeg.pop(id(sock), None)
-
-
-def bind_viewer_desktop_session(sock, session_id: str) -> None:
-    """Associate a viewer WS with a WebRTC desktopSessionId for signaling fan-out."""
-    sid = str(session_id or "").strip()
-    if not sock:
-        return
-    with _ws_lock:
-        if sid:
-            _viewer_desktop_session[id(sock)] = sid
-            # LiveKit 会话：观众走媒体面，勿再灌 JPEG/delta（省上行×观众数）
-            try:
-                import webrtc_session as wrs
-
-                sess = wrs.get_session(sid) or {}
-                if str(sess.get("transport") or "") == "livekit":
-                    _viewer_skip_jpeg[id(sock)] = time.time()
-                else:
-                    _viewer_skip_jpeg.pop(id(sock), None)
-            except Exception:
-                _viewer_skip_jpeg.pop(id(sock), None)
-        else:
-            _viewer_desktop_session.pop(id(sock), None)
-            _viewer_skip_jpeg.pop(id(sock), None)
-
-
-def viewer_desktop_session(sock) -> str:
-    with _ws_lock:
-        return str(_viewer_desktop_session.get(id(sock), "") or "")
 
 
 def save_wx_sync(client_id: str, payload: dict[str, Any]) -> None:
@@ -475,259 +402,6 @@ def load_friend_diagnostic(diagnostic_id: str) -> dict[str, Any] | None:
         return data if isinstance(data, dict) else None
     except Exception:
         return None
-
-
-def viewer_count(cid: str) -> int:
-    cid = safe_id(cid)
-    with _ws_lock:
-        return len(_viewer_ws.get(cid) or [])
-
-
-# Cap START/STOP thrash from multi-viewer reconnect + stale kicks (works without client upgrade).
-# forceRestart still must reach the agent periodically — soft coalesce must not swallow it entirely
-# (1.62 agent ignores soft start_desktop while captureTimer is already running).
-# LiveKit 房间按设备固定：墙侧每 15~30s 新 sid 若都 force，会 DUPLICATE_IDENTITY / getDisplayMedia 风暴。
-_DESKTOP_FORCE_RESTART_MIN_SEC = 45.0
-_DESKTOP_SOFT_START_COALESCE_SEC = 12.0
-# 旧客户端(≤1.74)收到任何 start_desktop 都会 leave+重进 LiveKit；LiveKit 路径尽量少下发
-# 冻屏恢复需要能在约 1 分钟内再次 soft/force，120s 过长会导致「昨天冻到今天」
-_DESKTOP_LIVEKIT_START_COALESCE_SEC = 45.0
-# last forced sessionId per client — new WebRTC session must always hard-kick
-_desktop_start_meta: dict[str, dict[str, float | str]] = {}
-_desktop_start_lock = threading.Lock()
-
-
-def start_desktop_for_agent(
-    cid: str,
-    *,
-    quality: str = "auto",
-    session_id: str = "",
-    force_restart: bool = False,
-    ice_servers: list | None = None,
-    protocol_version: str = "",
-    control_mouse: bool = True,
-    control_keyboard: bool = True,
-    livekit_url: str = "",
-    livekit_token: str = "",
-    room_name: str = "",
-) -> bool:
-    """Tell agent to start continuous desktop; always queue fallback for WS miss."""
-    cid = safe_id(cid)
-    if not cid or cid == "unknown":
-        return False
-    now = time.time()
-    with _desktop_start_lock:
-        meta = _desktop_start_meta.setdefault(
-            cid,
-            {
-                "last_soft": 0.0,
-                "last_force": 0.0,
-                "last_session_id": "",
-                "last_room": "",
-                "last_livekit_token": "",
-            },
-        )
-        prev_room = str(meta.get("last_room") or "")
-        same_room = bool(room_name and prev_room and room_name == prev_room)
-        has_livekit = bool(livekit_url and livekit_token)
-        token_changed = bool(
-            livekit_token and livekit_token != str(meta.get("last_livekit_token") or "")
-        )
-        with _online_lock:
-            already = bool((_online.get(cid) or {}).get("desktopWatching"))
-        since_soft = now - float(meta.get("last_soft") or 0.0)
-        since_force = now - float(meta.get("last_force") or 0.0)
-        if force_restart:
-            # 短窗内丢弃重复硬拉。禁止「降级成 soft」：
-            # 1) soft 在代理 mediaConnected=true（假 connected 冻屏）时会被直接 reused 忽略
-            # 2) 旧逻辑 demote 后立刻 if not token_changed: return True，令都发不出去
-            #    → 墙侧烧完 lastForceKickAt，代理却永远收不到 forceRestart
-            # 只认 already（desktopWatching）：房间按设备固定，不必再卡 same_room
-            # （无 room_name 的调用否则永远合并不了）
-            if since_force < _DESKTOP_FORCE_RESTART_MIN_SEC and already:
-                return True
-            meta["last_force"] = now
-        if session_id:
-            meta["last_session_id"] = session_id
-        if room_name:
-            meta["last_room"] = room_name
-        # LiveKit：同房软续命短窗吞掉；仅 token 轮换允许再发（仍限 15s）
-        if (
-            has_livekit
-            and not force_restart
-            and since_soft < _DESKTOP_LIVEKIT_START_COALESCE_SEC
-            and (already or same_room)
-        ):
-            if not token_changed:
-                return True
-            if since_soft < 15.0:
-                return True
-        if not force_restart:
-            if already and not session_id and since_soft < _DESKTOP_SOFT_START_COALESCE_SEC:
-                return True
-        meta["last_soft"] = now
-        if livekit_token:
-            meta["last_livekit_token"] = str(livekit_token)
-    payload: dict[str, Any] = {
-        "type": "start_desktop",
-        "continuous": True,
-        "quality": quality or "auto",
-        # Viewer watch / reconnect must not wipe remote input permissions.
-        "controlMouse": bool(control_mouse),
-        "controlKeyboard": bool(control_keyboard),
-    }
-    if session_id:
-        payload["desktopSessionId"] = session_id
-    if protocol_version:
-        payload["protocolVersion"] = protocol_version
-    if ice_servers:
-        payload["iceServers"] = ice_servers
-    if livekit_url and livekit_token:
-        payload["transport"] = "livekit"
-        payload["livekitUrl"] = livekit_url
-        payload["livekitToken"] = livekit_token
-        if room_name:
-            payload["roomName"] = room_name
-    if force_restart:
-        payload["forceRestart"] = True
-        payload["kick"] = True
-    ok = tell_agent(cid, payload)
-    try:
-        ice_n = len(ice_servers or [])
-        line = (
-            f"[webrtc] start_desktop cid={cid[:12]} sid={str(session_id or '')[:16]} "
-            f"force={int(bool(force_restart))} ice={ice_n} livekit={int(bool(livekit_url and livekit_token))} "
-            f"ws={int(bool(ok))}\n"
-        )
-        print(line, end="", flush=True)
-        (LOG_DIR / "webrtc.log").parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_DIR / "webrtc.log", "a", encoding="utf-8") as wf:
-            wf.write(line)
-    except Exception:
-        pass
-    # WS 已送达则不再入队：旧端 hello/重连再吃一遍 START_DESKTOP 会拆 LiveKit。
-    # 仅 WS 失败时排队，覆盖短暂断线。
-    if not ok:
-        queued = {
-            "type": "start_desktop",
-            "continuous": True,
-            "quality": quality or "auto",
-            "controlMouse": bool(control_mouse),
-            "controlKeyboard": bool(control_keyboard),
-        }
-        if session_id:
-            queued["desktopSessionId"] = session_id
-        if protocol_version:
-            queued["protocolVersion"] = protocol_version
-        if ice_servers:
-            queued["iceServers"] = ice_servers
-        if livekit_url and livekit_token:
-            queued["transport"] = "livekit"
-            queued["livekitUrl"] = livekit_url
-            queued["livekitToken"] = livekit_token
-            if room_name:
-                queued["roomName"] = room_name
-        if force_restart:
-            queued["forceRestart"] = True
-            queued["kick"] = True
-        set_command(cid, queued)
-    with _online_lock:
-        if cid in _online:
-            _online[cid]["desktopWatching"] = True
-    return ok
-
-
-def resume_desktop_if_viewers(cid: str) -> None:
-    """After agent hello/reconnect: if admin is still watching, restart capture."""
-    cid = safe_id(cid)
-    if not cid or cid == "unknown":
-        return
-    if viewer_count(cid) <= 0:
-        return
-    # 有观众时只等带 LiveKit 凭证的 watch；无 sid / 无 token 的软拉只会刷 JPEG 噪声。
-    # （旧逻辑空 sid start_desktop 会在日志里刷 livekit=0，并与真正会话打架。）
-    return
-
-
-_stop_desktop_timers: dict[str, threading.Timer] = {}
-_stop_desktop_lock = threading.Lock()
-
-
-def schedule_stop_desktop_if_idle(cid: str, delay_sec: float = 8.0) -> None:
-    """Debounce stop so page refresh / brief viewer reconnect does not kill the publisher."""
-    cid = safe_id(cid)
-    if not cid or cid == "unknown":
-        return
-
-    def _fire() -> None:
-        with _stop_desktop_lock:
-            _stop_desktop_timers.pop(cid, None)
-        if viewer_count(cid) > 0:
-            return
-        tell_agent(cid, {"type": "stop_desktop"})
-        set_command(cid, {"type": "stop_desktop"})
-        with _desktop_start_lock:
-            _desktop_start_meta.pop(cid, None)
-        with _online_lock:
-            if cid in _online:
-                _online[cid]["desktopWatching"] = False
-
-    with _stop_desktop_lock:
-        old = _stop_desktop_timers.pop(cid, None)
-        if old is not None:
-            try:
-                old.cancel()
-            except Exception:
-                pass
-        # 默认 8s：屏幕墙 F5 后观众重连通常 <3s；过短会把仍在推的代理掐死
-        t = threading.Timer(max(0.5, float(delay_sec)), _fire)
-        t.daemon = True
-        _stop_desktop_timers[cid] = t
-        t.start()
-
-
-def cancel_pending_stop_desktop(cid: str) -> None:
-    cid = safe_id(cid)
-    with _stop_desktop_lock:
-        old = _stop_desktop_timers.pop(cid, None)
-    if old is not None:
-        try:
-            old.cancel()
-        except Exception:
-            pass
-
-
-def push_to_viewers(cid: str, obj: dict) -> None:
-    cid = safe_id(cid)
-    with _ws_lock:
-        viewers = list(_viewer_ws.get(cid) or [])
-        session_map = dict(_viewer_desktop_session)
-        skip_jpeg = dict(_viewer_skip_jpeg)
-    typ = str((obj or {}).get("type") or "")
-    sid = str((obj or {}).get("desktopSessionId") or "").strip()
-    # WebRTC 信令按会话隔离：
-    # - 有 sid：发给「同 sid」或「尚未绑定」的 viewer（未绑定常见于 session 刚建、watch 尚未到达）
-    # - 无 sid：只给未绑定 viewer，避免串到其它会话
-    webrtc_signal = typ.startswith("webrtc_")
-    jpeg_like = typ in ("frame", "frame_delta")
-    dead = []
-    for s in viewers:
-        if jpeg_like and id(s) in skip_jpeg:
-            continue
-        if webrtc_signal:
-            viewer_sid = str(session_map.get(id(s), "") or "")
-            if sid:
-                if viewer_sid and viewer_sid != sid:
-                    continue
-            elif viewer_sid:
-                # 代理旧包无 sessionId：勿打给已绑定其它会话的 viewer
-                continue
-        try:
-            send_json(s, obj)
-        except Exception:
-            dead.append(s)
-    for s in dead:
-        unregister_viewer(cid, s)
 
 
 def notify_predictors(event_type: str, payload: dict[str, Any] | None = None, **extra: Any) -> None:
@@ -1500,7 +1174,7 @@ def build_client_detail(client_id: str) -> dict[str, Any]:
         "planSteps": meta.get("planSteps") if isinstance(meta.get("planSteps"), list) else [],
         "monitorFormulas": meta.get("monitorFormulas") if isinstance(meta.get("monitorFormulas"), list) else [],
         "lastSeenText": meta.get("lastSeenText") or "",
-        "desktopWatching": bool(meta.get("desktopWatching")),
+        "desktopWatching": False,
         "online": is_online,
         "allowed": bool(permit.get("allowed")),
         "allowMessage": permit.get("message") or "",
@@ -1571,7 +1245,7 @@ def list_online() -> list[dict[str, Any]]:
                 "monitorFormulas": r.get("monitorFormulas") if isinstance(r.get("monitorFormulas"), list) else [],
                 "lastSeenText": r.get("lastSeenText"),
                 "firstSeen": float(r.get("firstSeen") or 0) or None,
-                "desktopWatching": bool(r.get("desktopWatching")),
+                "desktopWatching": False,
                 "online": True,
                 "allowed": bool(permit.get("allowed")),
                 "allowMessage": permit.get("message") or "",
@@ -1839,159 +1513,6 @@ def dispatch_announce(ip: str, client_id: str, text: str, title: str = "公告")
             if targets
             else "当前该 IP 无在线软件，已登记：打开软件后会弹出"
         ),
-    }
-
-
-def normalize_frame_image(img: str, *, max_b64_chars: int | None = None) -> str:
-    """Return a usable data-URI JPEG, or empty string if invalid/truncated."""
-    global _normalize_calls
-    _normalize_calls += 1
-    limit = MAX_FRAME_B64_CHARS if max_b64_chars is None else int(max_b64_chars)
-    raw = (img or "").strip()
-    if not raw:
-        return ""
-    if raw.startswith("data:"):
-        try:
-            header, b64 = raw.split(",", 1)
-        except ValueError:
-            return ""
-        if "base64" not in header.lower():
-            return ""
-    else:
-        b64 = raw
-    # strip whitespace/newlines that break browser decode
-    b64 = "".join(b64.split())
-    if len(b64) < 32:
-        return ""
-    # Reject obviously oversized payloads before decode.
-    if len(b64) > limit:
-        return ""
-    try:
-        data = base64.b64decode(b64, validate=False)
-    except Exception:
-        return ""
-    # JPEG SOI marker
-    if len(data) < 4 or data[0:2] != b"\xff\xd8":
-        return ""
-    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
-
-
-def normalize_frame_delta(msg: dict) -> dict | None:
-    """Validate dirty-rect delta; return a sanitized copy or None."""
-    if not isinstance(msg, dict):
-        return None
-    try:
-        w = int(msg.get("w") or 0)
-        h = int(msg.get("h") or 0)
-        seq = int(msg.get("seq") or 0)
-        key_seq = int(msg.get("keySeq") or 0)
-    except (TypeError, ValueError):
-        return None
-    if w < 16 or h < 16 or w > 7680 or h > 4320 or seq < 1 or key_seq < 1:
-        return None
-    raw_tiles = msg.get("tiles")
-    if not isinstance(raw_tiles, list) or not raw_tiles or len(raw_tiles) > MAX_DELTA_TILES:
-        return None
-    tiles: list[dict] = []
-    for item in raw_tiles:
-        if not isinstance(item, dict):
-            return None
-        try:
-            x = int(item.get("x") or 0)
-            y = int(item.get("y") or 0)
-            tw = int(item.get("w") or 0)
-            th = int(item.get("h") or 0)
-        except (TypeError, ValueError):
-            return None
-        if tw < 1 or th < 1 or x < 0 or y < 0 or x + tw > w or y + th > h:
-            return None
-        img = normalize_frame_image(str(item.get("image") or ""), max_b64_chars=MAX_DELTA_TILE_B64_CHARS)
-        if not img:
-            return None
-        tiles.append({"x": x, "y": y, "w": tw, "h": th, "image": img})
-    out = {
-        "type": "frame_delta",
-        "clientId": str(msg.get("clientId") or ""),
-        "t": str(msg.get("t") or now_iso()),
-        "seq": seq,
-        "keySeq": key_seq,
-        "w": w,
-        "h": h,
-        "tiles": tiles,
-        "source": str(msg.get("source") or "desktop"),
-        "via": str(msg.get("via") or "webrtc_publisher"),
-    }
-    return out
-
-
-def save_shot(client_id: str, b64: str, *, already_normalized: bool = False) -> None:
-    """Store latest frame in memory; disk write at most every SHOT_DISK_INTERVAL_SEC."""
-    global _shot_disk_writes
-    cid = safe_id(client_id)
-    uri = b64 if already_normalized else normalize_frame_image(b64)
-    if not uri or not uri.startswith("data:"):
-        if not already_normalized:
-            return
-        uri = normalize_frame_image(b64)
-        if not uri:
-            return
-    raw = uri.split(",", 1)[-1]
-    now = now_ts()
-    with _shot_lock:
-        _latest_shot_image[cid] = uri
-        _latest_shot[cid] = {"ts": now, "t": now_iso()}
-        last = float(_shot_last_disk_at.get(cid) or 0)
-        if (now - last) < SHOT_DISK_INTERVAL_SEC:
-            return
-        _shot_last_disk_at[cid] = now
-    ensure_dirs()
-    path = SHOT_DIR / f"{cid}.jpg.b64"
-    path.write_text(raw[:2_500_000], encoding="ascii", errors="ignore")
-    _shot_disk_writes += 1
-
-
-def get_shot(client_id: str) -> dict[str, Any] | None:
-    cid = safe_id(client_id)
-    now = now_ts()
-    with _shot_lock:
-        uri = _latest_shot_image.get(cid) or ""
-        meta = dict(_latest_shot.get(cid) or {})
-    if uri:
-        ts = float(meta.get("ts") or 0) or now
-        return {
-            "clientId": cid,
-            "t": meta.get("t") or "",
-            "ts": ts,
-            "ageSec": max(0, int(now - ts)),
-            "image": uri,
-        }
-    path = SHOT_DIR / f"{cid}.jpg.b64"
-    if not path.exists():
-        return None
-    uri = normalize_frame_image(path.read_text(encoding="ascii", errors="ignore"))
-    if not uri:
-        return None
-    try:
-        mtime = float(path.stat().st_mtime)
-    except Exception:
-        mtime = now
-    # Disk reload must keep the file's capture time — never stamp "now" or
-    # admins treat a minutes-old freeze as a live frame.
-    t_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
-    with _shot_lock:
-        _latest_shot_image[cid] = uri
-        prev = _latest_shot.get(cid) or {}
-        prev_ts = float(prev.get("ts") or 0)
-        if cid not in _latest_shot or prev_ts <= 0 or abs(prev_ts - mtime) > 1.0:
-            _latest_shot[cid] = {"ts": mtime, "t": t_text}
-        meta = dict(_latest_shot.get(cid) or {})
-    ts = float(meta.get("ts") or mtime)
-    return {
-        "clientId": cid,
-        "t": meta.get("t") or t_text,
-        "ts": ts,
-        "ageSec": max(0, int(now - ts)),
-        "image": uri,
     }
 
 
@@ -2596,14 +2117,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        if path == "/api/desktop/webrtc/ice-config":
-            if not self._require_admin():
-                return
-            try:
-                import webrtc_session as wrs
-                self._send(200, wrs.ice_config())
-            except Exception as e:
-                self._send(500, {"ok": False, "message": str(e)})
+        if path.startswith("/api/desktop/"):
+            self._send(410, {
+                "ok": False,
+                "code": "REMOTE_DESKTOP_RETIRED",
+                "message": "旧远程桌面通道已停用，请使用 MeshCentral（/api/mesh/*）。",
+            })
             return
         if path in ("/", "/index.html"):
             # Bust CDN/browser cache — old admin JS left uploads stuck on "等待服务器确认".
@@ -2820,25 +2339,6 @@ class Handler(BaseHTTPRequestHandler):
                 "qualityFilter": quality_filter,
             })
             return
-        if path == "/api/desktop/latest":
-            if not self._require_admin():
-                return
-            cid = (self._qs().get("clientId") or [""])[0]
-            shot = get_shot(cid)
-            if not shot:
-                self._send(200, {"ok": True, "message": "还没有画面", "image": ""})
-                return
-            online_meta = get_online_meta(cid) if cid else {}
-            last_seen = float(online_meta.get("lastSeen") or 0)
-            client_online = bool(last_seen and (now_ts() - last_seen) < float(ONLINE_TTL))
-            self._send(200, {
-                "ok": True,
-                **shot,
-                "clientOnline": client_online,
-                "desktopWatching": bool(online_meta.get("desktopWatching")),
-                "lastSeenText": online_meta.get("lastSeenText") or "",
-            })
-            return
         if path == "/api/agent/poll":
             if not self._require_upload():
                 return
@@ -2851,7 +2351,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "command": cmd, "policyEpoch": _policy_epoch()})
             return
 
-        if path in ("/api/ws/agent", "/api/ws/viewer", "/api/ws/predictor"):
+        if path == "/api/ws/viewer":
+            self._send(410, {
+                "ok": False,
+                "code": "VIEWER_WS_RETIRED",
+                "message": "viewer WebSocket 已停用（远程桌面退役）。",
+            })
+            return
+        if path in ("/api/ws/agent", "/api/ws/predictor"):
             self._upgrade_ws(path)
             return
         if path == "/api/run-permit":
@@ -2866,6 +2373,24 @@ class Handler(BaseHTTPRequestHandler):
             permit = check_run_allowed(cid, ip)
             self._send(200, {"ok": True, "ip": ip, **permit})
             return
+        # MeshCentral remote (optional; soft-fail when disabled / missing)
+        try:
+            import mesh_api as _mesh_api
+            if _mesh_api.try_handle_get(
+                path,
+                self._qs(),
+                DATA_DIR,
+                self._require_admin,
+                self._send,
+                headers=self.headers,
+                check_admin_token=check_admin_token,
+                get_online_meta=get_online_meta,
+            ):
+                return
+        except Exception as e:
+            if path.startswith("/api/mesh/"):
+                self._send(200, {"ok": False, "code": "MESH_ERROR", "message": str(e)})
+                return
         self._send(404, {"ok": False, "message": "not found"})
 
     def _agent_upload_token(self) -> tuple[str, bool]:
@@ -2928,17 +2453,12 @@ class Handler(BaseHTTPRequestHandler):
             filter_cid = ""
             filter_uid = ""
         else:
-            cid, err = require_client_id((qs.get("clientId") or [""])[0])
-            if err:
-                self._send(400, err)
-                return
-            ticket = str((qs.get("ticket") or [""])[0] or "")
-            if not consume_viewer_ticket(ticket, cid or ""):
-                self._send(401, {"ok": False, "message": "查看凭证无效或已过期"})
-                return
-            role = "viewer"
-            filter_cid = ""
-            filter_uid = ""
+            self._send(410, {
+                "ok": False,
+                "code": "VIEWER_WS_RETIRED",
+                "message": "viewer WebSocket 已停用（远程桌面退役）。",
+            })
+            return
 
         try:
             self.connection.sendall(handshake_response(key))
@@ -3055,9 +2575,6 @@ class Handler(BaseHTTPRequestHandler):
                             **online_runtime_fields(msg),
                         })
                         register_agent(cid, sock)
-                        # Agent WS just (re)connected. If admin viewers are still open,
-                        # restart capture — otherwise UI freezes on the last cached JPEG.
-                        resume_desktop_if_viewers(cid)
                     elif typ == "heartbeat":
                         payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else msg
                         hb_cid, _ = require_client_id(payload.get("clientId") or cid)
@@ -3115,85 +2632,9 @@ class Handler(BaseHTTPRequestHandler):
                         payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
                         if cid:
                             save_wx_sync(cid, payload)
-                    elif typ == "frame":
-                        with _ws_lock:
-                            viewers = len(_viewer_ws.get(cid) or [])
-                        img = normalize_frame_image(str(msg.get("image") or ""))
-                        if not img:
-                            continue
-                        # Always refresh latest shot cache. Do NOT stop_desktop here:
-                        # admin may open viewer a moment after /api/desktop/start; an
-                        # immediate stop leaves the UI stuck on a stale cached frame.
-                        if cid:
-                            save_shot(cid, img, already_normalized=True)
-                            if viewers > 0:
-                                push_to_viewers(cid, {
-                                    "type": "frame",
-                                    "clientId": cid,
-                                    "t": str(msg.get("t") or now_iso()),
-                                    "image": img,
-                                    "seq": msg.get("seq"),
-                                    "keySeq": msg.get("keySeq"),
-                                    "w": msg.get("w"),
-                                    "h": msg.get("h"),
-                                })
-                        # Stopping continuous capture is handled when the last viewer leaves.
-                    elif typ == "frame_delta":
-                        # Dirty-rect tiles: relay only; never compose into shot cache.
-                        with _ws_lock:
-                            viewers = len(_viewer_ws.get(cid) or [])
-                        if not cid or viewers <= 0:
-                            continue
-                        delta = normalize_frame_delta(msg)
-                        if not delta:
-                            continue
-                        delta["clientId"] = cid
-                        push_to_viewers(cid, delta)
-                    elif typ in ("webrtc_offer", "webrtc_ice", "webrtc_answer", "webrtc_stop", "webrtc_error", "file_result"):
-                        if cid:
-                            if typ in ("webrtc_offer", "webrtc_answer", "webrtc_error"):
-                                try:
-                                    line = (
-                                        f"[webrtc] agent→viewers {typ} cid={cid[:12]} "
-                                        f"sid={str(msg.get('desktopSessionId') or '')[:16]} "
-                                        f"viewers={viewer_count(cid)} "
-                                        f"msg={str(msg.get('message') or '')[:120]}\n"
-                                    )
-                                    print(line, end="", flush=True)
-                                    (LOG_DIR / "webrtc.log").parent.mkdir(parents=True, exist_ok=True)
-                                    with open(LOG_DIR / "webrtc.log", "a", encoding="utf-8") as wf:
-                                        wf.write(line)
-                                except Exception:
-                                    pass
-                            if typ != "webrtc_error":
-                                push_to_viewers(cid, msg)
                     elif typ == "pong":
                         pass
-                    elif typ == "request_token_refresh":
-                        if cid:
-                            try:
-                                import webrtc_session as ws
-                                sess = ws._active_session_for_device(cid)
-                                if sess and sess.get("agentToken"):
-                                    now = time.time()
-                                    agent_issued = float(sess.get("agentTokenIssuedAt") or sess.get("issuedAt") or 0)
-                                    if (now - agent_issued) > 3000:
-                                        try:
-                                            import livekit_session as lks
-                                            if lks.livekit_enabled():
-                                                pair = lks.issue_pair(cid)
-                                                if pair.get("ok") and pair.get("agentToken"):
-                                                    sess["agentToken"] = pair["agentToken"]
-                                                    sess["agentTokenIssuedAt"] = now
-                                        except Exception:
-                                            pass
-                                    send_json(sock, {
-                                        "type": "token_refresh_ack",
-                                        "agentToken": str(sess.get("agentToken") or ""),
-                                        "expiresIn": 3600,
-                                    })
-                            except Exception:
-                                pass
+                    # Unknown / retired agent message types: ignore without crashing.
             except Exception:
                 pass
             finally:
@@ -3204,159 +2645,6 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return
-
-        # viewer — 进房只注册；带 LiveKit 凭证的 start 由 watch(desktopSessionId) 下发
-        # （空 start_desktop 会 livekit=0，与正式会话打架、引发推流端反复拆房）
-        cancel_pending_stop_desktop(cid)
-        register_viewer(cid, sock)
-        try:
-            send_json(sock, {"type": "ready", "clientId": cid})
-            # LiveKit 已启用时不预灌缓存全图：墙/桌面会走媒体面，重连时省一轮大包
-            send_cached = True
-            try:
-                import livekit_session as _lks
-
-                if _lks.livekit_enabled():
-                    send_cached = False
-            except Exception:
-                send_cached = True
-            if send_cached:
-                shot = get_shot(cid)
-                if shot and shot.get("image"):
-                    send_json(
-                        sock,
-                        {
-                            "type": "frame",
-                            "clientId": cid,
-                            "t": shot.get("t") or "",
-                            "image": shot["image"],
-                            "cached": True,
-                        },
-                    )
-            while True:
-                # LiveKit 出画不走本 WS，长时间无业务消息属正常；超时发 ping 续命，勿掐观众连接
-                try:
-                    msg = recv_json(sock, timeout=45)
-                except (TimeoutError, socket.timeout):
-                    try:
-                        send_frame(sock, 9, b"ping")
-                    except Exception:
-                        break
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                typ = str(msg.get("type") or "")
-                if typ == "watch":
-                    cancel_pending_stop_desktop(cid)
-                    quality = str(msg.get("quality") or "auto")
-                    sid = str(msg.get("desktopSessionId") or "")
-                    if sid:
-                        bind_viewer_desktop_session(sock, sid)
-                    force = bool(msg.get("kick") or msg.get("forceRestart"))
-                    # 无 sid 的硬拉只会启动空 WebRTC/堵 publisher；JPEG 软续命即可
-                    if force and not sid:
-                        force = False
-                    with _online_lock:
-                        caps = dict((_online.get(cid) or {}).get("capabilities") or {})
-                        already_watching = bool((_online.get(cid) or {}).get("desktopWatching"))
-                    livekit_on = False
-                    try:
-                        import livekit_session as _lks
-                        livekit_on = bool(_lks.livekit_enabled())
-                    except Exception:
-                        livekit_on = False
-                    # LiveKit 已启用时禁止空 sid start（agents 常不报 capabilities.webrtc，仍会 livekit=0 打架）
-                    if not sid and (livekit_on or caps.get("webrtc") or caps.get("livekit")):
-                        continue
-                    # 已在推流且无新 sid：忽略重复软 watch，避免 ~2min 重连风暴
-                    if not sid and already_watching and not force:
-                        continue
-                    ice_servers = None
-                    protocol_version = ""
-                    control_mouse = True
-                    control_keyboard = True
-                    livekit_url = ""
-                    livekit_token = ""
-                    room_name = ""
-                    if sid:
-                        try:
-                            import webrtc_session as wrs
-                            sess = wrs.get_session(sid) or {}
-                            # 服务重启后旧 sid 失效：勿用空凭证 start（日志 ice=0 livekit=0）
-                            if not sess:
-                                continue
-                            ice = sess.get("iceServers")
-                            if isinstance(ice, list) and ice:
-                                ice_servers = ice
-                            protocol_version = str(sess.get("protocolVersion") or "desktop-livekit-v1")
-                            perms = sess.get("permissions") or {}
-                            if "CONTROL_MOUSE" in perms:
-                                control_mouse = bool(perms.get("CONTROL_MOUSE"))
-                            if "CONTROL_KEYBOARD" in perms:
-                                control_keyboard = bool(perms.get("CONTROL_KEYBOARD"))
-                            if not quality or quality == "auto":
-                                quality = str(sess.get("quality") or quality or "auto")
-                            if str(sess.get("transport") or "") == "livekit":
-                                livekit_url = str(sess.get("livekitUrl") or "")
-                                livekit_token = str(sess.get("agentToken") or "")
-                                room_name = str(sess.get("roomName") or "")
-                                if not (livekit_url and livekit_token):
-                                    continue
-                        except Exception:
-                            continue
-                    start_desktop_for_agent(
-                        cid,
-                        quality=quality,
-                        session_id=sid,
-                        force_restart=force,
-                        ice_servers=ice_servers,
-                        protocol_version=protocol_version,
-                        control_mouse=control_mouse,
-                        control_keyboard=control_keyboard,
-                        livekit_url=livekit_url,
-                        livekit_token=livekit_token,
-                        room_name=room_name,
-                    )
-                elif typ == "ping":
-                    try:
-                        send_json(sock, {"type": "pong", "t": int(time.time())})
-                    except Exception:
-                        pass
-                elif typ == "unwatch":
-                    # Match disconnect debounce — brief unwatch/reconnect must not STOP then START.
-                    schedule_stop_desktop_if_idle(cid, delay_sec=8.0)
-                elif typ.startswith("webrtc_") or typ in ("control", "file"):
-                    sid = str(msg.get("desktopSessionId") or "")
-                    if sid and typ.startswith("webrtc_"):
-                        bind_viewer_desktop_session(sock, sid)
-                    if typ in ("webrtc_offer", "webrtc_answer"):
-                        try:
-                            line = (
-                                f"[webrtc] viewer→agent {typ} cid={cid[:12]} "
-                                f"sid={str(sid or '')[:16]}\n"
-                            )
-                            print(line, end="", flush=True)
-                            with open(
-                                os.path.join(DATA_DIR, "logs", "webrtc.log"),
-                                "a",
-                                encoding="utf-8",
-                            ) as wf:
-                                wf.write(line)
-                        except Exception:
-                            pass
-                    tell_agent(cid, msg)
-        except Exception:
-            pass
-        finally:
-            unregister_viewer(cid, sock)
-            # Debounced: brief reconnect must not kill publisher while UI reconnects.
-            if viewer_count(cid) == 0:
-                schedule_stop_desktop_if_idle(cid, delay_sec=8.0)
-            try:
-                sock.close()
-            except Exception:
-                pass
-
 
     def do_POST(self) -> None:  # noqa: N802
         if self._reject_legacy_siren():
@@ -3375,15 +2663,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = self._read_json()
 
-        if path == "/api/admin/ws-ticket":
-            if not self._require_admin():
+        # MeshCentral remote (optional; soft-fail when disabled / missing)
+        try:
+            import mesh_api as _mesh_api
+            if _mesh_api.try_handle_post(
+                path,
+                body,
+                DATA_DIR,
+                self._require_admin,
+                self._send,
+                headers=self.headers,
+                check_admin_token=check_admin_token,
+                get_online_meta=get_online_meta,
+            ):
                 return
-            cid, err = require_client_id(str(body.get("clientId") or ""))
-            if err:
-                self._send(400, err)
+        except Exception as e:
+            if path.startswith("/api/mesh/"):
+                self._send(200, {"ok": False, "code": "MESH_ERROR", "message": str(e)})
                 return
-            self._send(200, {"ok": True, "ticket": make_viewer_ticket(cid or ""), "expiresIn": 30})
-            return
 
         if path in ("/api/software-auth/register", "/api/software-auth/login"):
             try:
@@ -3475,66 +2772,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})
             return
-        if path == "/api/desktop/webrtc/session":
-            if not self._require_admin():
-                return
-            try:
-                cid = safe_id(str((body or {}).get("deviceId") or (body or {}).get("clientId") or ""))
-                with _online_lock:
-                    capabilities = dict((_online.get(cid) or {}).get("capabilities") or {})
-                source = str((body or {}).get("source") or "desktop").lower()
-                needed = "camera" if source == "camera" else "webrtc"
-                livekit_on = False
-                try:
-                    import livekit_session as _lks
-                    livekit_on = bool(_lks.livekit_enabled())
-                except Exception:
-                    livekit_on = False
-                # 旧客户端常不报 capabilities.webrtc；LiveKit 已配置时仍允许建会话
-                if needed == "webrtc" and not capabilities.get("webrtc") and not livekit_on:
-                    self._send(409, {"ok": False, "message": "当前客户端使用稳定画面模式，该加速功能未启用"})
-                    return
-                if needed == "camera" and not capabilities.get("camera"):
-                    self._send(409, {"ok": False, "message": "当前客户端使用稳定画面模式，该加速功能未启用"})
-                    return
-                import webrtc_session as wrs
-                sess = wrs.create_session(body if isinstance(body, dict) else {})
-                cid = str((body or {}).get("deviceId") or (body or {}).get("clientId") or "").strip()
-                # deferStart：只发 sid/ICE，等 viewer 绑好 PC 后再用 watch 拉起代理（屏幕墙默认）
-                defer_start = bool((body or {}).get("deferStart"))
-                if sess.get("ok") and cid and not defer_start:
-                    perms = sess.get("permissions") or {}
-                    src = str((body or {}).get("source") or "desktop").strip().lower() or "desktop"
-                    ice_servers = sess.get("iceServers") or []
-                    # HTTP 响应当场剥掉 agentToken；下发代理须从内存会话再取
-                    sid = str(sess.get("desktopSessionId") or "")
-                    stored = wrs.get_session(sid) or {}
-                    # 单次 coalesced 下发（含 iceServers / LiveKit），避免墙+后台连环 forceRestart
-                    start_desktop_for_agent(
-                        cid,
-                        quality=str(sess.get("quality") or "auto"),
-                        session_id=sid,
-                        force_restart=True,
-                        ice_servers=ice_servers if isinstance(ice_servers, list) else None,
-                        protocol_version=str(sess.get("protocolVersion") or "desktop-livekit-v1"),
-                        control_mouse=bool(perms.get("CONTROL_MOUSE")) and src != "camera",
-                        control_keyboard=bool(perms.get("CONTROL_KEYBOARD")) and src != "camera",
-                        livekit_url=str(stored.get("livekitUrl") or sess.get("livekitUrl") or ""),
-                        livekit_token=str(stored.get("agentToken") or ""),
-                        room_name=str(stored.get("roomName") or sess.get("roomName") or ""),
-                    )
-                self._send(200, sess)
-            except Exception as e:
-                self._send(500, {"ok": False, "message": str(e)})
-            return
-        if path == "/api/desktop/webrtc/stop":
-            if not self._require_admin():
-                return
-            try:
-                import webrtc_session as wrs
-                self._send(200, wrs.stop_session(body if isinstance(body, dict) else {}))
-            except Exception as e:
-                self._send(500, {"ok": False, "message": str(e)})
+        if path.startswith("/api/desktop/"):
+            self._send(410, {
+                "ok": False,
+                "code": "REMOTE_DESKTOP_RETIRED",
+                "message": "旧远程桌面通道已停用，请使用 MeshCentral（/api/mesh/*）。",
+            })
             return
         if path == "/api/device/register":
             self._send(410, {
@@ -4101,88 +3344,6 @@ class Handler(BaseHTTPRequestHandler):
                 str(body.get("title") or "公告"),
             )
             self._send(200 if result.get("ok") else 400, result)
-            return
-
-        if path == "/api/desktop/upload":
-            self._send(410, {
-                "ok": False,
-                "code": "JPEG_DESKTOP_RETIRED",
-                "message": "旧桌面协议已停用，请升级客户端。",
-            })
-            return
-
-        if path == "/api/desktop/start-camera":
-            self._send(410, {"ok": False, "code": "CAMERA_DISABLED", "message": "摄像头功能已关闭"})
-            return
-
-        if path == "/api/desktop/stop-camera":
-            self._send(410, {"ok": False, "code": "CAMERA_DISABLED", "message": "摄像头功能已关闭"})
-            return
-
-        if path == "/api/desktop/start":
-            if not self._require_admin():
-                return
-            cid, err = require_client_id(body.get("clientId"))
-            if err:
-                self._send(400, err)
-                return
-            cancel_pending_stop_desktop(cid)
-            quality = str(body.get("quality") or "auto")
-            sid = str(body.get("desktopSessionId") or "")
-            force = bool(body.get("kick") or body.get("forceRestart"))
-            if force and not sid:
-                force = False
-            ice_servers = None
-            protocol_version = ""
-            livekit_url = ""
-            livekit_token = ""
-            room_name = ""
-            if sid:
-                try:
-                    import webrtc_session as wrs
-                    sess = wrs.get_session(sid) or {}
-                    ice = sess.get("iceServers")
-                    if isinstance(ice, list) and ice:
-                        ice_servers = ice
-                    protocol_version = str(sess.get("protocolVersion") or "desktop-livekit-v1")
-                    if not quality or quality == "auto":
-                        quality = str(sess.get("quality") or quality or "auto")
-                    if str(sess.get("transport") or "") == "livekit":
-                        livekit_url = str(sess.get("livekitUrl") or "")
-                        livekit_token = str(sess.get("agentToken") or "")
-                        room_name = str(sess.get("roomName") or "")
-                except Exception:
-                    pass
-            ok = start_desktop_for_agent(
-                cid,
-                quality=quality,
-                session_id=sid,
-                force_restart=force,
-                ice_servers=ice_servers,
-                protocol_version=protocol_version,
-                livekit_url=livekit_url,
-                livekit_token=livekit_token,
-                room_name=room_name,
-            )
-            self._send(200, {"ok": True, "ws": ok})
-            return
-
-        if path == "/api/desktop/stop":
-            if not self._require_admin():
-                return
-            cid, err = require_client_id(body.get("clientId"))
-            if err:
-                self._send(400, err)
-                return
-            cancel_pending_stop_desktop(cid)
-            ok = tell_agent(cid, {"type": "stop_desktop"})
-            set_command(cid, {"type": "stop_desktop"})
-            with _desktop_start_lock:
-                _desktop_start_meta.pop(cid, None)
-            with _online_lock:
-                if cid in _online:
-                    _online[cid]["desktopWatching"] = False
-            self._send(200, {"ok": True, "ws": ok})
             return
 
         if path == "/api/run-control":

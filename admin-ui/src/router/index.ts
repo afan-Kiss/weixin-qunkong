@@ -67,6 +67,11 @@ const router = createRouter({
           name: 'monitor',
           component: () => import('../pages/SessionMonitorPage.vue'),
         },
+        {
+          path: 'remote-support',
+          name: 'remote-support',
+          component: () => import('../pages/RemoteSupport.vue'),
+        },
       ],
     },
   ],

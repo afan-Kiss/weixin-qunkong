@@ -20,6 +20,8 @@ DEFAULT = {
     "revokedBuildIds": [],
     "protocolVersion": "facai888-v1",
     "securityProtocolVersion": "security-v1",
+    # Legacy protocol identifier only. No WebRTC implementation remains.
+    # Clients still send desktop-webrtc-v1 for gate compatibility; meshcentral-v1 also accepted.
     "desktopProtocolVersion": "desktop-webrtc-v1",
     "updaterProtocolVersion": "updater-v1",
     "latestVersion": "0.0.0",
@@ -213,7 +215,7 @@ def evaluate_client(meta: dict[str, Any], pol: dict[str, Any] | None = None, dat
     protocol_compat = {
         "protocolVersion": frozenset({"facai888-v1", "app-v1"}),
         "securityProtocolVersion": frozenset({"security-v1", "sec-v1"}),
-        "desktopProtocolVersion": frozenset({"desktop-webrtc-v1", "desk-v1"}),
+        "desktopProtocolVersion": frozenset({"desktop-webrtc-v1", "desk-v1", "meshcentral-v1"}),
         "updaterProtocolVersion": frozenset({"updater-v1", "upd-v1"}),
     }
     expect = [

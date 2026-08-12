@@ -128,4 +128,8 @@ async function logout() {
   saveToken('')
 }
 
-module.exports = { initSoftwareAuth, login, register, session, logout, DEFAULT_AUTH_BASE }
+function getToken() {
+  return String(token || '')
+}
+
+module.exports = { initSoftwareAuth, login, register, session, logout, getToken, DEFAULT_AUTH_BASE }

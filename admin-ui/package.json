@@ -1,13 +1,16 @@
 {
   "name": "wx-group-admin-ui",
   "private": true,
-  "version": "1.87.0",
-  "releaseSequence": 83,
+  "version": "1.89.0",
+  "releaseSequence": 85,
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
     "extract:har": "node --experimental-strip-types scripts/extract-wechat-har.ts",
     "test": "node --test test/*.test.cjs",
+    "check:mesh": "node scripts/check-mesh.cjs",
+    "check:mesh:strict": "node scripts/check-mesh.cjs --strict",
+    "fetch:mesh-agent": "node scripts/fetch-mesh-agent.cjs",
     "test:ui": "node scripts/ui-audit.mjs",
     "test:injection": "node scripts/real-injection-smoke.mjs",
     "test:prelogin": "node scripts/prelogin-ui-smoke.mjs",
@@ -16,8 +19,8 @@
     "build": "vue-tsc -b && vite build",
     "bump:version": "node scripts/bump-version.cjs",
     "ensure:hooks": "node scripts/ensure-hooks.cjs",
-    "package:win": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && node scripts/package-portable.cjs",
-    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/bump-version.cjs && npm run build && node scripts/package-portable.cjs",
+    "package:win": "node scripts/ensure-hooks.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/package-portable.cjs",
+    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/package-portable.cjs",
     "publish:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory -InsecureTls",
     "publish:release:skip-bump": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory -SkipBump -InsecureTls",
     "preview": "vite preview",
@@ -73,6 +76,15 @@
           "inject.exe",
           "libGLESv1.dll"
         ]
+      },
+      {
+        "from": "resources/meshcentral",
+        "to": "meshcentral",
+        "filter": [
+          "**/*",
+          "!README.md",
+          "!.gitkeep"
+        ]
       }
     ],
     "win": {
@@ -80,7 +92,7 @@
       "target": [
         "portable"
       ],
-      "artifactName": "微信群控系统v1.87.${ext}",
+      "artifactName": "微信群控系统v1.89.${ext}",
       "signAndEditExecutable": false
     },
     "nsis": {

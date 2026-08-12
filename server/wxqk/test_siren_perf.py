@@ -373,135 +373,18 @@ class TouchOnlinePolicyShotTest(unittest.TestCase):
         r = self.srv.check_run_allowed("c0", "10.0.0.0")
         self.assertFalse(r["allowed"])
 
-    def test_frame_normalize_once_and_disk_throttle(self):
-        img = "data:image/jpeg;base64," + base64.b64encode(_JPEG_1X1).decode("ascii")
-        self.srv._normalize_calls = 0
-        self.srv._shot_disk_writes = 0
-        # Pretend a viewer exists so frame path would not drop — test save_shot directly
-        for _ in range(100):
-            uri = self.srv.normalize_frame_image(img)
-            self.srv.save_shot("desk1", uri, already_normalized=True)
-        self.assertEqual(self.srv._normalize_calls, 100)
-        self.assertLessEqual(self.srv._shot_disk_writes, 2)
+    def test_legacy_desktop_shot_helpers_removed(self):
+        self.assertFalse(hasattr(self.srv, "save_shot"))
+        self.assertFalse(hasattr(self.srv, "get_shot"))
+        self.assertFalse(hasattr(self.srv, "normalize_frame_image"))
+        self.assertFalse(hasattr(self.srv, "normalize_frame_delta"))
+        self.assertFalse(hasattr(self.srv, "start_desktop_for_agent"))
 
-    def test_frame_delta_normalize_and_no_shot_cache(self):
-        img = "data:image/jpeg;base64," + base64.b64encode(_JPEG_1X1).decode("ascii")
-        delta = self.srv.normalize_frame_delta({
-            "type": "frame_delta",
-            "clientId": "c1",
-            "t": "2026-07-25 12:00:00",
-            "seq": 2,
-            "keySeq": 1,
-            "w": 128,
-            "h": 64,
-            "tiles": [{"x": 0, "y": 0, "w": 64, "h": 64, "image": img}],
-        })
-        self.assertIsNotNone(delta)
-        self.assertEqual(delta["type"], "frame_delta")
-        self.assertEqual(len(delta["tiles"]), 1)
-        self.assertTrue(delta["tiles"][0]["image"].startswith("data:image/jpeg;base64,"))
-        # Bad seq / empty tiles rejected
-        self.assertIsNone(self.srv.normalize_frame_delta({
-            "seq": 0, "keySeq": 1, "w": 128, "h": 64, "tiles": [{"x": 0, "y": 0, "w": 64, "h": 64, "image": img}],
-        }))
-        self.assertIsNone(self.srv.normalize_frame_delta({
-            "seq": 1, "keySeq": 1, "w": 128, "h": 64, "tiles": [],
-        }))
-        # Delta must not be written into shot cache by normalize helper itself
-        before = self.srv.get_shot("delta_only")
-        self.assertTrue(before is None or not before.get("image") or True)
-
-    def test_start_desktop_queue_keeps_force_restart(self):
-        calls = []
-        tell_ok = True
-
-        def fake_tell(cid, payload):
-            calls.append(("tell", dict(payload)))
-            return tell_ok
-
-        queued = []
-
-        def fake_set(cid, cmd):
-            queued.append(dict(cmd))
-
-        orig_tell = self.srv.tell_agent
-        orig_set = self.srv.set_command
-        self.srv.tell_agent = fake_tell
-        self.srv.set_command = fake_set
-        # Reset rate-limit state between assertions.
-        with self.srv._desktop_start_lock:
-            self.srv._desktop_start_meta.clear()
-        try:
-            # WS 送达时不入队，避免重连再吃 START_DESKTOP
-            self.srv.start_desktop_for_agent("c-force", quality="auto", session_id="s1", force_restart=True)
-            self.assertTrue(calls)
-            self.assertTrue(calls[0][1].get("forceRestart"))
-            self.assertTrue(calls[0][1].get("kick"))
-            self.assertEqual(queued, [])
-
-            tell_ok = False
-            calls.clear()
-            queued.clear()
-            with self.srv._desktop_start_lock:
-                self.srv._desktop_start_meta.clear()
-            self.srv.start_desktop_for_agent("c-force", quality="auto", session_id="s1", force_restart=True)
-            self.assertTrue(queued)
-            self.assertTrue(queued[0].get("forceRestart"))
-            self.assertTrue(queued[0].get("kick"))
-            self.assertEqual(queued[0].get("desktopSessionId"), "s1")
-
-            tell_ok = True
-            calls.clear()
-            queued.clear()
-            with self.srv._desktop_start_lock:
-                self.srv._desktop_start_meta.clear()
-            self.srv.start_desktop_for_agent("c-soft", quality="smooth", force_restart=False)
-            self.assertNotIn("forceRestart", calls[0][1])
-            self.assertNotIn("kick", calls[0][1])
-            self.assertEqual(queued, [])
-
-            # Rapid forceRestart must coalesce / downgrade instead of flooding.
-            calls.clear()
-            queued.clear()
-            with self.srv._desktop_start_lock:
-                self.srv._desktop_start_meta.clear()
-            with self.srv._online_lock:
-                self.srv._online["c-rate"] = {"desktopWatching": False}
-            self.srv.start_desktop_for_agent("c-rate", force_restart=True)
-            self.assertEqual(len(calls), 1)
-            self.assertTrue(calls[0][1].get("forceRestart"))
-            calls.clear()
-            queued.clear()
-            self.srv.start_desktop_for_agent("c-rate", force_restart=True)
-            self.assertEqual(len(calls), 0)  # within force coalesce
-            self.srv.start_desktop_for_agent("c-rate", force_restart=False)
-            self.assertEqual(len(calls), 0)  # soft coalesce while watching
-        finally:
-            self.srv.tell_agent = orig_tell
-            self.srv.set_command = orig_set
-            with self.srv._desktop_start_lock:
-                self.srv._desktop_start_meta.clear()
-
-    def test_desktop_latest_api_shape_compat(self):
-        img = "data:image/jpeg;base64," + base64.b64encode(_JPEG_1X1).decode("ascii")
-        self.srv.save_shot("lat1", img, already_normalized=True)
-        shot = self.srv.get_shot("lat1")
-        self.assertTrue(shot and shot.get("image"))
-        self.assertIn("t", shot)
-
-    def test_no_viewer_still_saves_latest_shot(self):
-        # Frames with zero viewers must still refresh the latest-shot cache so the
-        # next viewer is not stuck on a multi-day-old image; stop_desktop is only
-        # sent when the last viewer disconnects.
-        cid = "desk2"
-        self.srv._viewer_ws.pop(cid, None)
-        img = "data:image/jpeg;base64," + base64.b64encode(_JPEG_1X1).decode("ascii")
-        with self.srv._ws_lock:
-            viewers = len(self.srv._viewer_ws.get(cid) or [])
-        self.assertEqual(viewers, 0)
-        self.srv.save_shot(cid, img, already_normalized=True)
-        shot = self.srv.get_shot(cid)
-        self.assertTrue(shot and shot.get("image"))
+    def test_list_online_forces_desktop_watching_false(self):
+        self.srv.touch_online({"clientId": "mesh1", "ip": "1.1.1.1", "desktopWatching": True})
+        rows = self.srv.list_online()
+        hit = next(x for x in rows if x["clientId"] == "mesh1")
+        self.assertFalse(hit.get("desktopWatching"))
 
 
 class RoadArchivePerfTest(unittest.TestCase):

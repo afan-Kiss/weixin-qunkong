@@ -101,6 +101,10 @@ function getTlsSpkiPins() {
  * 客户端对外协议头。
  * 故意继续走线上已放行的旧协议 ID（运行时解码，源码无明文）：
  * 若改成中性 ID，在服务端兼容策略未部署时会导致登录设备/远程通道全军覆没。
+ *
+ * Note: desktopProtocolVersion decodes to the legacy string "desktop-webrtc-v1".
+ * Legacy protocol identifier only — no WebRTC / LiveKit / desktop capture
+ * implementation remains in this codebase. Gate accepts meshcentral-v1 as well.
  */
 function getProtocol() {
   return {

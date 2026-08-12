@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Deploy wxqk remote board to new host 120.27 (port 4812 behind :8443).
+"""Deploy wxqk remote board (port 4812 behind :8443).
 
-域名机只做 /888 墙入口与 LiveKit TLS 反代，不再跑本地 wxqk。
+域名机只做入口反代；远控走独立 MeshCentral，不再部署旧自研远控栈。
 """
 from __future__ import annotations
 

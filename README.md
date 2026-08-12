@@ -92,6 +92,7 @@
 | 消息群发 | 好友/群聊发送文字与图片 |
 | 通讯录 | 好友与群；未保存群批量保存 |
 | 任务中心 | 勾选确认后执行；查看频繁状态 |
+| 远程维护 | MeshCentral 远程桌面 / 文件管理（Relay） |
 | 日志与设置 | 间隔、每日上限、路径与运行日志 |
 
 ## 开发与测试
@@ -154,9 +155,43 @@ npm run package:portable
 
 更新通道与控制台地址以运维环境变量 / 内网文档为准，勿把生产主机与口令写入公开仓库。
 
-## 远程支援（内部）
+## 远程维护
 
-桌面端主进程在登录后保持与控制面的加密链路，用于运维支援与策略下发；产品界面不提供入口。
+架构：
+
+```text
+控制端（Electron / 管理 API）
+  → wxqk Server（权限 + clientId↔nodeId 映射）
+  → MeshCentral Server 1.2.4（webRTC=false，强制 Relay）
+  → MeshAgent（Windows 客户端服务）
+```
+
+功能：远程桌面、文件管理、在线状态。全部流量经自建 MeshCentral；**禁止** WebRTC/P2P。
+
+上线（服务器）：
+
+```bash
+cd deploy/meshcentral
+python manage.py prepare   # 编辑 .env / config.json
+python manage.py validate
+python manage.py up
+```
+
+打包客户端 Agent：
+
+```bash
+cd admin-ui
+# 设置 WXQK_MESH_AGENT_URL / WXQK_MESH_MSH_URL 为「你的」MeshCentral 下载链接
+npm run fetch:mesh-agent
+npm run check:mesh
+npm run package:portable   # 缺 Agent 会失败（--strict）
+```
+
+安全：loginTokenKey 仅服务器环境变量；主进程临时 partition 打开会话；关闭即清理 Cookie。Relay 辅助检查：`deploy/meshcentral/check-mesh-relay.ps1`。
+
+详见：`docs/meshcentral-integration.md`、`deploy/meshcentral/`。
+
+旧自研 WebRTC / LiveKit / coturn / JPEG 图传实现已彻底删除，不再并存。
 
 ## 排查入口（运维）
 
@@ -168,7 +203,7 @@ npm run package:portable
 - 11 项需求对照（功能齐备性复查）：待用户确认
 - UI 可用性与绑定修复（流程引导、Tab 清理、任务中心引导等）：待用户确认
 - 换机可用性（去硬编码路径、hook 打包、便携包说明）：待用户确认
-- 远程桌面鼠标与清晰度：待用户确认
+- 远程维护（MeshCentral Relay）：代码/部署脚本已就绪；需填真实主机与 Agent 下载链接后联调
 - 群消息二维码监控（同图多码分类去重与准确命名）：待用户确认
 - 微信路径自动探测：待用户确认
 - 今日功能缺陷复查与修复：待用户确认

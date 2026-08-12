@@ -1,0 +1,45 @@
+# MeshCentral for WXQK remote maintenance (Relay-only).
+# Pin image tag via VERSION / MESHCENTRAL_VERSION — never use :latest in production.
+# Copy .env.example → .env locally. Never commit real secrets.
+services:
+  meshcentral:
+    image: ghcr.io/ylianst/meshcentral:${MESHCENTRAL_VERSION:-1.2.4}
+    container_name: wxqk-meshcentral
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      TZ: ${TZ:-Asia/Shanghai}
+      HOSTNAME: ${WXQK_MESH_HOSTNAME:-mesh.example.invalid}
+      REVERSE_PROXY: ${WXQK_MESH_REVERSE_PROXY:-false}
+      REVERSE_PROXY_TLS_PORT: ${WXQK_MESH_REVERSE_PROXY_TLS_PORT:-443}
+      IFRAME: "true"
+      ALLOW_NEW_ACCOUNTS: "false"
+      WEBRTC: "false"
+    volumes:
+      - ./data:/opt/meshcentral/meshcentral-data
+      - ./files:/opt/meshcentral/meshcentral-files
+      - ./backups:/opt/meshcentral/meshcentral-backups
+      # Mount example as template only until you copy to config.json locally
+      - ./config.json:/opt/meshcentral/meshcentral-data/config.json:ro
+    ports:
+      - "${WXQK_MESH_HTTPS_PORT:-443}:443"
+      - "${WXQK_MESH_HTTP_PORT:-80}:80"
+      - "${WXQK_MESH_AGENT_PORT:-4433}:4433"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"require('http').get('http://127.0.0.1:80',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    networks:
+      - meshnet
+
+networks:
+  meshnet:
+    driver: bridge

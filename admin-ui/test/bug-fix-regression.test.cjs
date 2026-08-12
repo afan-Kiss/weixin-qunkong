@@ -332,13 +332,12 @@ test('client-updater rejects 206 without Content-Range', () => {
   assert.match(rangeFn, /offset \+ chunk\.length > end \+ 1/)
 })
 
-test('token refresh disconnected path schedules retry timer', () => {
+test('business agent reconnect / stop guards remain after desktop strip', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'electron', 'remote-agent.cjs'), 'utf8')
-  assert.match(src, /function ensureTokenRefreshScheduled/)
   assert.match(src, /if \(stopping \|\| !state\.running \|\| reconnectTimer\) return/)
   assert.match(src, /if \(stopping \|\| !state\.running \|\| !state\.identity\) return/)
   assert.match(src, /if \(socket !== ws\) return/)
-  assert.match(src, /30000/)
+  assert.doesNotMatch(src, /desktopCapturer|webrtc-desktop|LiveKit|startWebRtc/)
   assert.doesNotMatch(src.split('function stopRemoteAgent')[1]?.split('function getStatus')[0] || '', /stopping = false/)
 })
 

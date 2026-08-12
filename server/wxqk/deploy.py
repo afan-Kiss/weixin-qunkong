@@ -43,8 +43,8 @@ EXTRA_PY = [
     # in the deployment list with admin_ui.py/server.py or the server falls
     # back to the previous tiny-part behavior.
     "chunk_upload.py",
-    "webrtc_session.py",
-    "livekit_session.py",
+    "meshcentral_client.py",
+    "mesh_api.py",
     "current_table_store.py",
     "predictor_ws.py",
 ]

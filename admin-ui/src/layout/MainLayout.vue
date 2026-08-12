@@ -15,6 +15,7 @@ import {
   Expand,
   ChatDotRound,
   ChatLineRound,
+  Connection,
 } from '@element-plus/icons-vue'
 import { refreshInstances, ensureBlockedDirectoryListener } from '../stores/wechatData'
 import { authState, ensureSession, logout } from '../stores/auth'
@@ -44,6 +45,7 @@ const menus = [
   { path: '/wxids', label: '微信 ID 查询', icon: Search },
   { path: '/tasks', label: '任务中心', icon: List },
   { path: '/monitor', label: '会话监控', icon: ChatDotRound },
+  { path: '/remote-support', label: '远程维护', icon: Connection },
   { path: '/settings', label: '日志与设置', icon: Setting },
 ]
 

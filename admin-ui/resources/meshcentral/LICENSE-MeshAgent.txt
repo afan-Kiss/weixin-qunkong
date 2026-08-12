@@ -1,0 +1,12 @@
+MeshAgent / MeshCentral agent components
+=======================================
+
+MeshCentral and its agent are typically distributed under the Apache License 2.0.
+
+This directory is a packaging placeholder for agent binaries obtained from your own
+MeshCentral deployment. Refer to the upstream project license:
+
+  https://github.com/Ylianst/MeshCentral
+  https://www.apache.org/licenses/LICENSE-2.0
+
+Do not redistribute third-party binaries without complying with their license terms.

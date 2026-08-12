@@ -1,0 +1,38 @@
+{
+  "settings": {
+    "Cert": "mesh.example.invalid",
+    "Port": 443,
+    "AliasPort": 443,
+    "RedirPort": 80,
+    "AgentPort": 4433,
+    "TlsOffload": false,
+    "SelfUpdate": false,
+    "sessionSameSite": "lax",
+    "webRTC": false,
+    "allowFraming": true,
+    "allowLoginToken": true,
+    "agentPing": 30,
+    "agentIdleTimeout": 150,
+    "WANonly": true,
+    "minify": true,
+    "NewAccounts": false,
+    "MaxInvalidLogin": {
+      "time": 10,
+      "count": 10,
+      "coolofftime": 10
+    }
+  },
+  "domains": {
+    "": {
+      "title": "WXQK Remote",
+      "title2": "Remote Maintenance",
+      "newAccounts": false,
+      "userSessionIdleTimeout": 60,
+      "allowedFramingOrigins": [
+        "http://localhost:5173",
+        "file://",
+        "app://."
+      ]
+    }
+  }
+}

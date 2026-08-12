@@ -94,6 +94,11 @@ declare global {
         percent?: number
         message?: string
       }) => void) => () => void
+      /** MeshCentral remote maintenance (main process holds embed URL / login token) */
+      remoteGetStatus?: (clientId: string) => Promise<import('../services/remote-service').RemoteStatus>
+      remoteOpenDesktop?: (clientId: string) => Promise<{ ok?: boolean; message?: string; code?: string }>
+      remoteOpenFiles?: (clientId: string) => Promise<{ ok?: boolean; message?: string; code?: string }>
+      remoteCloseSession?: () => Promise<{ ok?: boolean; message?: string }>
     }
   }
 }

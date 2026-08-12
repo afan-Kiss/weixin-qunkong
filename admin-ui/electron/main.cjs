@@ -29,6 +29,8 @@ const {
 const { resolveIpcApiTimeout } = require('./ipc-api-timeout.cjs')
 const { buildHistoryImagePageSql } = require('./qr-history-pagination.cjs')
 const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
+const meshRemote = require('./mesh-remote-bridge.cjs')
+meshRemote.setParentWindowGetter(() => mainWindow)
 const softwareAuth = require('./software-auth.cjs')
 const { safeFolderName, classifyQrText, qrTypeLabel, contentHash, messageTableName, rowsFromApi, valueOf, fieldString, existingImagePath, cdnDownloadRequest, downloadRequest, decodeNativeImages, accurateFileName, prepareHistoryMessageRow, yieldMain, normalizeQrText } = require('./qr-collector.cjs')
 const {
@@ -4754,6 +4756,8 @@ function registerIpc() {
         resumeQueuedTasks()
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
+      const selfId = String(getRemoteAgentStatus()?.clientId || '')
+      meshRemote.ensureLocalMeshAgent(selfId).catch(() => {})
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '登录失败，请稍后重试') } }
   })
@@ -4766,6 +4770,8 @@ function registerIpc() {
         resumeQueuedTasks()
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
+      const selfId = String(getRemoteAgentStatus()?.clientId || '')
+      meshRemote.ensureLocalMeshAgent(selfId).catch(() => {})
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '注册失败，请稍后重试') } }
   })
@@ -5312,6 +5318,28 @@ function registerIpc() {
   ipcMain.handle('remote:start', async (_event, options = {}) => startRemoteAgent(remoteAgentOptions(options.account || '微信群控本机', options.baseUrl || DEFAULT_BASE)))
   ipcMain.handle('remote:stop', () => { stopRemoteAgent(); return getRemoteAgentStatus() })
   ipcMain.handle('remote:open-console', (_event, token, baseUrl) => openAdminConsole(token || '', baseUrl || DEFAULT_BASE))
+  // MeshCentral remote maintenance (tokens stay in main; never expose embedUrl to renderer)
+  // Renderer may only pass clientId — nodeId is resolved server-side.
+  ipcMain.handle('mesh:status', async (_event, clientId) => meshRemote.getRemoteStatus(clientId))
+  ipcMain.handle('mesh:open-desktop', async (_event, clientId) => meshRemote.openDesktopSession(clientId))
+  ipcMain.handle('mesh:open-files', async (_event, clientId) => meshRemote.openFilesSession(clientId))
+  ipcMain.handle('mesh:close-session', async () => meshRemote.closeSessionWindow())
+  ipcMain.handle('mesh:agent-status', async () => {
+    try {
+      return await require('./mesh-agent-manager.cjs').getMeshAgentStatus()
+    } catch (err) {
+      return { ok: false, status: 'error', message: String(err?.message || err) }
+    }
+  })
+  ipcMain.handle('mesh:agent-ensure', async (_event, clientId) => meshRemote.ensureLocalMeshAgent(clientId))
+  // Internal ops cleanup — not exposed in Vue menus; IPC still validates.
+  ipcMain.handle('mesh:agent-uninstall', async () => {
+    try {
+      return await require('./mesh-agent-manager.cjs').uninstallMeshAgent()
+    } catch (err) {
+      return { ok: false, code: 'MESH_UNINSTALL_FAILED', message: String(err?.message || err) }
+    }
+  })
 }
 
 function resolveUiEntry() {
@@ -5607,11 +5635,15 @@ app.whenReady().then(async () => {
       },
     })
 
-    // 账号校验走网络，绝不 await 挡住启动后续；超时也只影响恢复实例/远程桌面
+    // 账号校验走网络，绝不 await 挡住启动后续；超时也只影响恢复实例 / MeshAgent
     void softwareAuth.session().then((account) => {
       if (!account) return
       // 远程 Agent 可并行；QUEUED 任务必须等 restoreInstances 完成后再恢复
       startRemoteAgent(remoteAgentOptions(account.username))
+        .then((st) => {
+          const selfId = String(st?.clientId || getRemoteAgentStatus()?.clientId || '')
+          return meshRemote.ensureLocalMeshAgent(selfId)
+        })
         .catch((error) => appLog('ERROR', '设备连接失败', { error: rawErrorMessage(error) }))
       restoreInstancesThenResumeQueuedTasks()
         .catch((error) => appLog('ERROR', '恢复微信实例失败', { error: rawErrorMessage(error) }))
