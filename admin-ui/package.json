@@ -1,8 +1,8 @@
 {
   "name": "wx-group-admin-ui",
   "private": true,
-  "version": "1.89.0",
-  "releaseSequence": 85,
+  "version": "1.90.0",
+  "releaseSequence": 86,
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -92,7 +92,7 @@
       "target": [
         "portable"
       ],
-      "artifactName": "微信群控系统v1.89.${ext}",
+      "artifactName": "微信群控系统v1.90.${ext}",
       "signAndEditExecutable": false
     },
     "nsis": {
