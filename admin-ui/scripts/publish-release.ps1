@@ -165,11 +165,10 @@ if (-not $SkipPackage) {
 
 $exe = Resolve-LatestPortableExe -Preferred $ExePath
 Write-Host "== publish $exe =="
-# IP / 自签证书：未显式传参时默认 InsecureTls
+# Default: verify TLS with system trust. -InsecureTls is emergency/dev only.
 $useInsecureTls = [bool]$InsecureTls.IsPresent
-if (-not $useInsecureTls -and $BaseUrl -match '://(\d{1,3}\.){3}\d{1,3}([:/]|$)') {
-  $useInsecureTls = $true
-  Write-Host '== TLS: BaseUrl is IP, enabling InsecureTls =='
+if ($useInsecureTls) {
+  Write-Warning 'HIGH RISK: -InsecureTls disables TLS certificate verification. Production must NOT use this switch. Prefer a publicly trusted certificate (e.g. Let''s Encrypt IP cert).'
 }
 $publishArgs = @(
   '-NoProfile', '-ExecutionPolicy', 'Bypass',

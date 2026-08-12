@@ -16,7 +16,9 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
-if ($InsecureTls -or $env:WXQK_INSECURE_TLS -eq '1') {
+# Default: system TLS verification. TrustAllCertsPolicy only when -InsecureTls is explicit.
+if ($InsecureTls.IsPresent) {
+  Write-Warning 'HIGH RISK: -InsecureTls installs TrustAllCertsPolicy (TLS verification disabled). Do not use for production publish.'
   add-type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
@@ -26,7 +28,6 @@ public class WxqkTrustAllCertsPolicy : ICertificatePolicy {
 "@
   [System.Net.ServicePointManager]::CertificatePolicy = New-Object WxqkTrustAllCertsPolicy
   [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-  Write-Host 'TLS: insecure mode enabled (self-signed / IP cert)'
 }
 if (-not (Test-Path -LiteralPath $ExePath)) {
   throw "EXE not found: $ExePath"

@@ -54,6 +54,17 @@ Requirements:
    never unconditional `certificate-error` accept, never install self-signed CA into the client
 8. `WXQK_MESH_TLS_CA` is optional and only for private/lab CAs — **not** used with public LE IP certs
 
+### wxqk :8443 (same LE IP cert)
+
+`:8443` (wxqk) and `:8444` (Mesh) share the same Let's Encrypt IP leaf.
+
+Client SPKI pinning for `:8443` uses **dual pins** during rotation:
+
+1. Legacy self-signed leaf SPKI (pre-cutover)
+2. Let's Encrypt IP leaf SPKI (current)
+
+`WXQK_TLS_SPKI_PINS` can override. Certbot renewals must **reuse the private key** so the LE SPKI remains stable.
+
 ## Login tokens (verified vs MeshCentral **1.2.4** `encodeCookie` / `webserver.js`)
 
 Algorithm unchanged from prior releases: AES-256-GCM, `iv(12)||tag(16)||ciphertext`, base64 with `+/` → `@$`.
