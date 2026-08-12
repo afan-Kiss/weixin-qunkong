@@ -168,11 +168,32 @@ server {{
 DEPLOY_HOOK = r"""#!/bin/bash
 set -euo pipefail
 LOG=/var/log/letsencrypt/wxqk-ip-renew.log
+EXPECTED=/etc/wxqk/le-ip-expected-spki.txt
 {
   echo "[$(date -Iseconds)] deploy-hook: reload nginx after renew"
   /usr/sbin/nginx -t
   /bin/systemctl reload nginx
   echo "[$(date -Iseconds)] nginx reloaded OK"
+  if [[ -n "${RENEWED_LINEAGE:-}" && -f "${RENEWED_LINEAGE}/cert.pem" ]]; then
+    cur=$(openssl x509 -in "${RENEWED_LINEAGE}/cert.pem" -pubkey -noout \
+      | openssl pkey -pubin -outform DER \
+      | openssl dgst -sha256 -binary \
+      | openssl base64 | tr -d '\r\n')
+    cur_pin="sha256/${cur}"
+    echo "[$(date -Iseconds)] renewed_leaf_spki=${cur_pin}"
+    if [[ -f "$EXPECTED" ]]; then
+      exp=$(tr -d ' \r\n' <"$EXPECTED")
+      [[ "$exp" == sha256/* ]] || exp="sha256/${exp}"
+      if [[ "$cur_pin" != "$exp" ]]; then
+        echo "[$(date -Iseconds)] CRITICAL SPKI_CHANGED expected=${exp} actual=${cur_pin}"
+        echo "[$(date -Iseconds)] CRITICAL: reuse-key may be off; published clients will TLS_CERT_PIN_MISMATCH — do NOT treat this renew as pin-safe"
+      else
+        echo "[$(date -Iseconds)] SPKI_OK matches expected pin"
+      fi
+    else
+      echo "[$(date -Iseconds)] WARN: missing ${EXPECTED}; cannot verify SPKI stability"
+    fi
+  fi
 } >>"$LOG" 2>&1
 """
 
@@ -186,7 +207,9 @@ def check_script(public_ip: str) -> str:
     return f"""#!/bin/bash
 set -euo pipefail
 LOG=/var/log/letsencrypt/wxqk-ip-cert-check.log
-CERT=/etc/letsencrypt/live/{public_ip}/fullchain.pem
+CERT=/etc/letsencrypt/live/{public_ip}/cert.pem
+EXPECTED=/etc/wxqk/le-ip-expected-spki.txt
+RENEWAL=/etc/letsencrypt/renewal/{public_ip}.conf
 {{
   echo "[$(date -Iseconds)] cert check"
   if [[ ! -f "$CERT" ]]; then
@@ -195,14 +218,54 @@ CERT=/etc/letsencrypt/live/{public_ip}/fullchain.pem
   fi
   openssl x509 -in "$CERT" -noout -subject -issuer -dates
   openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null || true
+  if [[ -f "$RENEWAL" ]]; then
+    if grep -Eq '^[[:space:]]*reuse_key[[:space:]]*=[[:space:]]*True' "$RENEWAL"; then
+      echo "reuse_key=True"
+    else
+      echo "CRITICAL reuse_key_missing_or_false in $RENEWAL — leaf SPKI may rotate on renew"
+    fi
+  fi
+  cur=$(openssl x509 -in "$CERT" -pubkey -noout \
+    | openssl pkey -pubin -outform DER \
+    | openssl dgst -sha256 -binary \
+    | openssl base64 | tr -d '\r\n')
+  cur_pin="sha256/${{cur}}"
+  echo "leaf_spki=${{cur_pin}}"
+  if [[ -f "$EXPECTED" ]]; then
+    exp=$(tr -d ' \\r\\n' <"$EXPECTED")
+    [[ "$exp" == sha256/* ]] || exp="sha256/${{exp}}"
+    if [[ "$cur_pin" != "$exp" ]]; then
+      echo "CRITICAL SPKI_CHANGED expected=${{exp}} actual=${{cur_pin}}"
+      echo "CRITICAL: published Electron clients pin this leaf; renew is NOT pin-safe until pins are rotated"
+      # do not auto-rollback to an expired cert
+    else
+      echo "SPKI_OK"
+    fi
+  else
+    echo "WARN: missing $EXPECTED (write pin at first issue / reconfigure)"
+  fi
   end=$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2)
   end_epoch=$(date -d "$end" +%s)
   now=$(date +%s)
   left=$(( (end_epoch-now)/3600 ))
   echo "hours_left=$left"
   if (( left < 48 )); then
-    echo "WARN: less than 48h left — forcing renew attempt"
+    echo "WARN: less than 48h left — forcing renew attempt (inherits reuse_key from renewal conf)"
     /usr/bin/certbot renew --cert-name {public_ip} --quiet || echo "RENEW_CMD_FAILED $?"
+    # re-check SPKI after renew nudge
+    cur2=$(openssl x509 -in "$CERT" -pubkey -noout \
+      | openssl pkey -pubin -outform DER \
+      | openssl dgst -sha256 -binary \
+      | openssl base64 | tr -d '\r\n')
+    cur2_pin="sha256/${{cur2}}"
+    echo "leaf_spki_after_renew_nudge=${{cur2_pin}}"
+    if [[ -f "$EXPECTED" ]]; then
+      exp=$(tr -d ' \\r\\n' <"$EXPECTED")
+      [[ "$exp" == sha256/* ]] || exp="sha256/${{exp}}"
+      if [[ "$cur2_pin" != "$exp" ]]; then
+        echo "CRITICAL SPKI_CHANGED_AFTER_RENEW expected=${{exp}} actual=${{cur2_pin}}"
+      fi
+    fi
   fi
 }} >>"$LOG" 2>&1
 """

@@ -64,9 +64,37 @@ npm run check:mesh
 
 Release packaging runs `check:mesh --strict` and fails if exe/msh are missing.
 
-## Nginx
+## TLS (Let's Encrypt IP + SPKI)
 
-See `nginx.example.conf` (HTTPS + WebSocket Upgrade + 3600s timeouts).
+Production uses a Let's Encrypt **IP Address Certificate** (`shortlived` profile) for
+`https://<PUBLIC_IP>:8443` (wxqk) and `:8444` (Mesh).
+
+Electron pins the **leaf SPKI** for `:8443`. Therefore the Certbot renewal config **must**
+contain:
+
+```ini
+reuse_key = True
+```
+
+Set on first issue:
+
+```bash
+# from a workstation with SSH env configured
+python deploy/meshcentral/_issue_ip_cert.py
+```
+
+Or persist onto an existing lineage (official API; runs staging validation):
+
+```bash
+python deploy/meshcentral/_enable_reuse_key.py
+# equivalent remote:
+# certbot reconfigure --cert-name <IP> --reuse-key --non-interactive
+```
+
+Do **not** rely on a one-off `certbot renew --reuse-key` flag; timers call plain `certbot renew`
+and must inherit reuse from the renewal conf.
+
+SPKI monitor: `/etc/wxqk/le-ip-expected-spki.txt` + `wxqk-ip-cert-check.timer`.
 
 ## Relay verification
 

@@ -63,7 +63,17 @@ Client SPKI pinning for `:8443` uses **dual pins** during rotation:
 1. Legacy self-signed leaf SPKI (pre-cutover)
 2. Let's Encrypt IP leaf SPKI (current)
 
-`WXQK_TLS_SPKI_PINS` can override. Certbot renewals must **reuse the private key** so the LE SPKI remains stable.
+`WXQK_TLS_SPKI_PINS` can override.
+
+**Critical:** because `:8443` clients pin the **public CA leaf SPKI**, the Certbot lineage
+must keep **`reuse_key = True`** forever (`certbot reconfigure --cert-name <IP> --reuse-key`
+or first issue via `_issue_ip_cert.py` with `--reuse-key`). Otherwise each renew may mint a
+new key → new SPKI → `TLS_CERT_PIN_MISMATCH` on already-shipped Electron builds.
+
+Monitor: `/usr/local/sbin/wxqk-ip-cert-check` compares the live leaf SPKI to
+`/etc/wxqk/le-ip-expected-spki.txt` and logs `CRITICAL SPKI_CHANGED` on drift (no auto-rollback).
+
+Certbot renewals must **reuse the private key** so the LE SPKI remains stable.
 
 ## Login tokens (verified vs MeshCentral **1.2.4** `encodeCookie` / `webserver.js`)
 
