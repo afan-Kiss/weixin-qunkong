@@ -100,6 +100,11 @@ async function closeSessionWindow() {
 /**
  * Open MeshCentral embed URL in a dedicated BrowserWindow (not system browser).
  * webSecurity stays enabled. Temporary partition — no persist: cookies.
+ *
+ * TLS: Mesh embed partition must use Chromium's default system trust only.
+ * Do NOT call installServiceCertificateTrust / setCertificateVerifyProc here.
+ * Do NOT attach certificate-error → callback(true).
+ * Production Mesh URL uses a publicly trusted Let's Encrypt IP certificate.
  */
 function openEmbedWindow(embedUrl, title) {
   const url = String(embedUrl || '').trim()

@@ -33,6 +33,27 @@ python manage.py status
 
 Image: `ghcr.io/ylianst/meshcentral:1.2.4` (never `:latest`). Volumes: `data/`, `files/`, `backups/`.
 
+## Production TLS (public IP, no domain)
+
+Production Mesh entry uses a **publicly trusted Let's Encrypt IP Address Certificate**
+with the **shortlived** ACME profile (~6 days / 160 hours):
+
+```text
+https://120.27.219.138:8444
+```
+
+Requirements:
+
+1. Certbot ≥ 5.4 with `--preferred-profile shortlived --ip-address <IP>`
+2. HTTP-01 via nginx `/.well-known/acme-challenge/` on port 80
+3. nginx loads `/etc/letsencrypt/live/<IP>/fullchain.pem` + `privkey.pem`
+4. Unattended renew: `snap.certbot.renew.timer` + deploy-hook `systemctl reload nginx`
+5. Extra nudge timer `wxqk-ip-cert-check.timer` (12h) logs validity and renews if &lt;48h left
+6. Failed renewals append to `/var/log/letsencrypt/wxqk-ip-renew.log`
+7. Electron Mesh BrowserWindow uses **system trust only** — never `rejectUnauthorized=false`,
+   never unconditional `certificate-error` accept, never install self-signed CA into the client
+8. `WXQK_MESH_TLS_CA` is optional and only for private/lab CAs — **not** used with public LE IP certs
+
 ## Login tokens (verified vs MeshCentral **1.2.4** `encodeCookie` / `webserver.js`)
 
 Algorithm unchanged from prior releases: AES-256-GCM, `iv(12)||tag(16)||ciphertext`, base64 with `+/` → `@$`.

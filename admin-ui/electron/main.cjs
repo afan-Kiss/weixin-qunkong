@@ -4745,7 +4745,12 @@ function enqueueWechatInstanceStart() {
   return enqueueStart(() => startWechatInstance())
 }
 
+let ipcRegistered = false
+
 function registerIpc() {
+  // 启动中途失败时 catch 仍会创建窗口；必须可重复调用，避免登录页出现 No handler registered
+  if (ipcRegistered) return
+  ipcRegistered = true
   ipcMain.handle('auth:session', () => softwareAuth.session())
   ipcMain.handle('auth:login', async (_event, username, password) => {
     try {
@@ -5568,6 +5573,8 @@ app.whenReady().then(async () => {
   try {
     initStorage(app.getPath('userData'))
     softwareAuth.initSoftwareAuth(app.getPath('userData'))
+    // 尽早注册 IPC：后续步骤失败时登录页仍能拿到 auth:login 等通道
+    registerIpc()
     // 新版首次启动：清旧缓存/诊断落盘，保留设置、任务、登录态与设备身份
     try {
       const scrub = scrubLegacyCachesOnStartup({
@@ -5604,7 +5611,6 @@ app.whenReady().then(async () => {
     // 轻量同步工作：先出界面；重活放到窗口之后
     recoverInterruptedTasks()
     loadApiContracts()
-    registerIpc()
     createWindow()
     createTray()
     showMainWindow()
@@ -5655,6 +5661,13 @@ app.whenReady().then(async () => {
     try {
       await dialog.showErrorBox('软件启动失败', toUserErrorMessage(error, '启动时发生错误，请重试或重新下载便携版'))
     } catch {}
+    // 存储/清理等失败时仍尽量挂上 IPC，避免登录直接报 No handler registered
+    try {
+      try { softwareAuth.initSoftwareAuth(app.getPath('userData')) } catch {}
+      registerIpc()
+    } catch (ipcError) {
+      appLog('ERROR', '启动失败后注册 IPC 仍失败', { error: rawErrorMessage(ipcError) })
+    }
     createWindow()
     showMainWindow()
   }
