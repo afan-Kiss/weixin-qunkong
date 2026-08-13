@@ -126,7 +126,7 @@ class RemoteSecurityTest(unittest.TestCase):
         self.assertIn("deskFrame", text)
         self.assertIn("embedUrl", text)
         self.assertIn("friendlyMeshError", text)
-        self.assertIn("远程服务已就绪", text)
+        self.assertIn("服务已就绪", text)
         self.assertIn("远程维护服务器未配置", text)
         self.assertIn("远程维护服务器不可达", text)
         self.assertIn("设备已就绪", text)

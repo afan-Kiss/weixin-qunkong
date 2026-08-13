@@ -55,14 +55,14 @@ if p.exists():
     head=p.read_bytes()[:2]
     print('auth head', head, 'size', p.stat().st_size)
     if head==b'MZ':
-        p.replace(out/'meshagent.exe')
+        p.replace(out/'WXQK.exe')
     elif b'MeshServer=' in p.read_bytes():
-        p.replace(out/'meshagent.msh')
+        p.replace(out/'WXQK.msh')
 
 # Ensure exe exists
-if not (out/'meshagent.exe').exists() or (out/'meshagent.exe').read_bytes()[:2]!=b'MZ':
-    subprocess.check_call(['curl','-s','http://127.0.0.1:9443/meshagents?id=3','-o',str(out/'meshagent.exe')])
-print('EXE', (out/'meshagent.exe').stat().st_size)
+if not (out/'WXQK.exe').exists() or (out/'WXQK.exe').read_bytes()[:2]!=b'MZ':
+    subprocess.check_call(['curl','-s','http://127.0.0.1:9443/meshagents?id=3','-o',str(out/'WXQK.exe')])
+print('EXE', (out/'WXQK.exe').stat().st_size)
 
 # Generate msh with robust hash extraction from MeshCentral
 gen = r'''
@@ -162,8 +162,8 @@ for mid in cands:
         except subprocess.CalledProcessError as e:
             print('GEN_FAIL', e.output); continue
         print('GEN', outp.strip())
-        subprocess.check_call(['docker','cp','wxqk-meshcentral:/tmp/out.msh', str(out/'meshagent.msh')])
-        text=(out/'meshagent.msh').read_text(errors='ignore')
+        subprocess.check_call(['docker','cp','wxqk-meshcentral:/tmp/out.msh', str(out/'WXQK.msh')])
+        text=(out/'WXQK.msh').read_text(errors='ignore')
         sid=''
         for ln in text.splitlines():
             if ln.startswith('ServerID='): sid=ln.split('=',1)[1].strip()
@@ -178,7 +178,7 @@ for mid in cands:
     if ok: break
 
 print('STAGING', sorted(f'{p.name}={p.stat().st_size}' for p in out.iterdir() if p.is_file()))
-if not ok or not (out/'meshagent.exe').exists():
+if not ok or not (out/'WXQK.exe').exists():
     raise SystemExit('incomplete')
 print('DONE')
 """

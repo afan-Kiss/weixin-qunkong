@@ -93,7 +93,7 @@ def main() -> int:
 
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
     sftp = c.open_sftp()
-    for name in ("meshagent.exe", "meshagent.msh"):
+    for name in ("WXQK.exe", "WXQK.msh"):
         remote = f"/opt/wxqk/meshcentral/agent-staging/{name}"
         local = LOCAL_DIR / name
         print(f"sftp {remote} -> {local}", flush=True)

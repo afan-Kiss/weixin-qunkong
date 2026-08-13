@@ -133,7 +133,7 @@ for aid in (6,4,3,5,7):
     print('DL', aid, size)
     if size > 100_000:
         picked=aid
-        dest.rename(out/'meshagent.exe')
+        dest.rename(out/'WXQK.exe')
         break
 if not picked:
     raise SystemExit('agent exe download failed')
@@ -159,13 +159,13 @@ for u in [
             ctype=resp.headers.get('content-type','')
             print('TRY', u.split('?')[0], 'ctype', ctype, 'len', len(data), 'head', data[:40])
             if b'MeshServer=' in data or b'MeshID=' in data:
-                (out/'meshagent.msh').write_bytes(data)
+                (out/'WXQK.msh').write_bytes(data)
                 print('MSH_OK')
                 break
     except Exception as e:
         print('MSH_TRY_FAIL', e)
 
-if not (out/'meshagent.msh').exists():
+if not (out/'WXQK.msh').exists():
     # Use websocket to request agentconfig / invitecode
     token = mc.mint_login_token('user//admin', style='control')
     url = 'ws://127.0.0.1:9443/control.ashx?auth=' + token
@@ -198,19 +198,19 @@ if not (out/'meshagent.msh').exists():
         for k in ('config','msh','data','url','link','result'):
             v=msg.get(k)
             if isinstance(v,str) and ('MeshServer=' in v or 'MeshID=' in v):
-                (out/'meshagent.msh').write_text(v)
+                (out/'WXQK.msh').write_text(v)
                 print('MSH_FROM', act)
                 break
             if isinstance(v,dict) and v.get('msh'):
-                (out/'meshagent.msh').write_text(str(v.get('msh')))
+                (out/'WXQK.msh').write_text(str(v.get('msh')))
                 print('MSH_FROM_DICT', act)
                 break
-        if (out/'meshagent.msh').exists():
+        if (out/'WXQK.msh').exists():
             break
     ws.close()
 
-if (out/'meshagent.msh').exists():
-    text=(out/'meshagent.msh').read_text(errors='ignore')
+if (out/'WXQK.msh').exists():
+    text=(out/'WXQK.msh').read_text(errors='ignore')
     for key in ('MeshServer','MeshID','ServerID'):
         for ln in text.splitlines():
             if ln.startswith(key+'='):

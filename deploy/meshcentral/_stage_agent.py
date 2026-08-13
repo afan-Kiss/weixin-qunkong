@@ -180,17 +180,17 @@ for aid in (6,4,3,5,7):
         print('DL', aid, size)
         head=dest.read_bytes()[:2]
         if size>100000 and head in (b'MZ', b'\x7fE'):
-            dest.replace(out/'meshagent.exe'); picked=aid; break
+            dest.replace(out/'WXQK.exe'); picked=aid; break
         # sometimes msh returned
         text=dest.read_text(errors='ignore')
         if 'MeshServer=' in text:
-            (out/'meshagent.msh').write_text(text); print('MSH_FROM_AGENT_URL', aid)
+            (out/'WXQK.msh').write_text(text); print('MSH_FROM_AGENT_URL', aid)
     if picked: break
 if not picked:
     raise SystemExit('exe missing')
 
 # msh via control invite / getagentconfig
-if not (out/'meshagent.msh').exists():
+if not (out/'WXQK.msh').exists():
     ws, base = open_ws('control')
     for payload in [
         {"action":"message","type":"invite","meshid":mesh_id,"responseid":"i1"},
@@ -212,10 +212,10 @@ if not (out/'meshagent.msh').exists():
             pass
         for k,v in msg.items():
             if isinstance(v,str) and 'MeshServer=' in v:
-                (out/'meshagent.msh').write_text(v); print('MSH_FROM', msg.get('action'), k)
+                (out/'WXQK.msh').write_text(v); print('MSH_FROM', msg.get('action'), k)
 
 # Last resort: craft msh from known MeshCentral fields using mesh id + server
-if not (out/'meshagent.msh').exists():
+if not (out/'WXQK.msh').exists():
     import urllib.parse
     serverstate=Path('/opt/wxqk/meshcentral/data/serverstate.txt').read_text(errors='ignore')
     print('SERVERSTATE_HEAD', serverstate[:200].replace('\\n',' | '))
@@ -228,12 +228,12 @@ if not (out/'meshagent.msh').exists():
             data=urllib.request.urlopen(u, timeout=30).read()
             print('ALT', u.split('meshagents')[1][:80], 'len', len(data), 'head', data[:16])
             if b'MeshServer=' in data:
-                (out/'meshagent.msh').write_bytes(data); print('MSH_OK_ALT'); break
+                (out/'WXQK.msh').write_bytes(data); print('MSH_OK_ALT'); break
         except Exception as e:
             print('ALT_FAIL', e)
 
-if (out/'meshagent.msh').exists():
-    text=(out/'meshagent.msh').read_text(errors='ignore')
+if (out/'WXQK.msh').exists():
+    text=(out/'WXQK.msh').read_text(errors='ignore')
     for key in ('MeshServer','MeshID','ServerID','MeshName'):
         for ln in text.splitlines():
             if ln.startswith(key+'='):

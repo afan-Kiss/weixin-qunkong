@@ -1,10 +1,12 @@
 'use strict'
 
 /**
- * MeshAgent lifecycle helpers for WXQK Electron client.
- * Does NOT implement remote desktop protocol — only install/start/stop of MeshAgent.
+ * WXQK MeshAgent lifecycle helpers for Electron client.
+ * Brands the Windows agent as WXQK (EXE / service / install dir).
+ * Does NOT implement remote desktop protocol — only install/start/stop/migrate.
  *
  * Log tag: [MESH]. Secrets (msh contents, tokens) must be redacted.
+ * User-facing UI messages stay generic ("正在准备服务…"); tech detail stays in logs.
  */
 
 const fs = require('fs')
@@ -16,14 +18,20 @@ const { promisify } = require('util')
 const execFileAsync = promisify(execFile)
 
 const LOG_TAG = '[MESH]'
-const SERVICE_NAME = 'Mesh Agent'
-const EXE_NAME = 'meshagent.exe'
-const MSH_NAME = 'meshagent.msh'
+/** Windows service name / display name after MeshCentral agentCustomization */
+const SERVICE_NAME = 'WXQK'
+const SERVICE_DISPLAY_NAME = 'WXQK'
+const EXE_NAME = 'WXQK.exe'
+const MSH_NAME = 'WXQK.msh'
+/** Pre-branding installs used MeshCentral defaults — migration only */
+const LEGACY_SERVICE_NAME = 'Mesh Agent'
+const LEGACY_EXE_NAMES = ['MeshAgent.exe', 'meshagent.exe']
+const LEGACY_MSH_NAMES = ['MeshAgent.msh', 'meshagent.msh']
 const AGENT_NAME_PREFIX = 'WXQK-'
 /** MeshServer / MeshID / ServerID / MeshName must never be rewritten from clientId. */
 const MSH_IDENTITY_KEYS = new Set(['MeshServer', 'MeshID', 'ServerID', 'MeshName'])
 
-/** @type {{ spawn?: typeof spawn, execFile?: typeof execFile, fs?: typeof fs, platform?: NodeJS.Platform, resourcesPath?: string, isPackaged?: boolean, now?: () => number }} */
+/** @type {{ spawn?: typeof spawn, execFile?: typeof execFile, fs?: typeof fs, platform?: NodeJS.Platform, resourcesPath?: string, isPackaged?: boolean, now?: () => number, installedAgentDir?: string, legacyInstalledAgentDir?: string }} */
 let deps = {
   spawn,
   execFile,
@@ -85,7 +93,6 @@ function log(level, message, extra) {
 function isPackaged() {
   if (typeof deps.isPackaged === 'boolean') return deps.isPackaged
   try {
-    // electron app may be unavailable in unit tests
     // eslint-disable-next-line global-require
     const { app } = require('electron')
     return Boolean(app && app.isPackaged)
@@ -95,7 +102,7 @@ function isPackaged() {
 }
 
 /**
- * Resolve MeshAgent binary + .msh directory.
+ * Resolve packaged WXQK agent binary + .msh directory.
  * Production: process.resourcesPath/meshcentral
  * Dev: admin-ui/resources/meshcentral
  */
@@ -114,37 +121,98 @@ function resolveMeshAgentPaths() {
 }
 
 /**
- * Windows service install directory (where MeshAgent actually runs from).
- * 64-bit agent installs to Program Files; older 32-bit builds use Program Files (x86).
- * @returns {{ dir: string, exePath: string, mshPath: string } | null}
+ * @param {string} dir
+ * @param {string[]} exeNames
+ * @param {string[]} mshNames
+ * @returns {{ dir: string, exePath: string, mshPath: string, branded: boolean } | null}
+ */
+function pickAgentDir(dir, exeNames, mshNames, branded) {
+  const fsApi = deps.fs || fs
+  for (const exeName of exeNames) {
+    const exePath = path.join(dir, exeName)
+    try {
+      if (!fsApi.existsSync(exePath)) continue
+      let mshPath = ''
+      for (const mshName of mshNames) {
+        const candidate = path.join(dir, mshName)
+        if (fsApi.existsSync(candidate)) {
+          mshPath = candidate
+          break
+        }
+      }
+      if (!mshPath) mshPath = path.join(dir, mshNames[0])
+      return { dir, exePath, mshPath, branded: Boolean(branded) }
+    } catch { /* continue */ }
+  }
+  return null
+}
+
+/**
+ * Branded install dirs (MeshCentral agentCustomization: companyName + serviceName).
+ * Typical: Program Files\WXQK\WXQK.exe or Program Files\WXQK\WXQK\WXQK.exe
+ */
+function brandedInstallDirCandidates() {
+  const pf = process.env.ProgramFiles || 'C:\\Program Files'
+  const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+  return [
+    path.join(pf, 'WXQK'),
+    path.join(pf, 'WXQK', 'WXQK'),
+    path.join(pf86, 'WXQK'),
+    path.join(pf86, 'WXQK', 'WXQK'),
+  ]
+}
+
+function legacyInstallDirCandidates() {
+  const pf = process.env.ProgramFiles || 'C:\\Program Files'
+  const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+  return [
+    path.join(pf, 'Mesh Agent'),
+    path.join(pf86, 'Mesh Agent'),
+  ]
+}
+
+/**
+ * Windows service install directory for branded WXQK agent.
+ * @returns {{ dir: string, exePath: string, mshPath: string, branded: boolean } | null}
  */
 function resolveInstalledMeshAgentPaths() {
   if (deps.installedAgentDir) {
     const dir = String(deps.installedAgentDir)
-    return {
-      dir,
-      exePath: path.join(dir, 'MeshAgent.exe'),
-      mshPath: path.join(dir, 'MeshAgent.msh'),
-    }
+    return pickAgentDir(dir, [EXE_NAME, 'WXQK.EXE', ...LEGACY_EXE_NAMES], [MSH_NAME, 'WXQK.MSH', ...LEGACY_MSH_NAMES], true)
+      || {
+        dir,
+        exePath: path.join(dir, EXE_NAME),
+        mshPath: path.join(dir, MSH_NAME),
+        branded: true,
+      }
   }
   if ((deps.platform || process.platform) !== 'win32') return null
-  const candidates = [
-    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Mesh Agent'),
-    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Mesh Agent'),
-  ]
-  const fsApi = deps.fs || fs
-  for (const dir of candidates) {
-    try {
-      if (fsApi.existsSync(path.join(dir, 'MeshAgent.exe'))) {
-        const mshCap = path.join(dir, 'MeshAgent.msh')
-        const mshLow = path.join(dir, MSH_NAME)
-        return {
-          dir,
-          exePath: path.join(dir, 'MeshAgent.exe'),
-          mshPath: fsApi.existsSync(mshCap) ? mshCap : mshLow,
-        }
+  for (const dir of brandedInstallDirCandidates()) {
+    const found = pickAgentDir(dir, [EXE_NAME, 'WXQK.EXE'], [MSH_NAME, 'WXQK.MSH', ...LEGACY_MSH_NAMES], true)
+    if (found) return found
+  }
+  return null
+}
+
+/**
+ * Legacy Mesh Agent install path (pre-branding). Used only for ownership check + migration.
+ * @returns {{ dir: string, exePath: string, mshPath: string, branded: boolean } | null}
+ */
+function resolveLegacyInstalledMeshAgentPaths() {
+  if (deps.legacyInstalledAgentDir) {
+    const dir = String(deps.legacyInstalledAgentDir)
+    return pickAgentDir(dir, LEGACY_EXE_NAMES, LEGACY_MSH_NAMES, false)
+      || {
+        dir,
+        exePath: path.join(dir, 'MeshAgent.exe'),
+        mshPath: path.join(dir, 'MeshAgent.msh'),
+        branded: false,
       }
-    } catch { /* continue */ }
+  }
+  if ((deps.platform || process.platform) !== 'win32') return null
+  for (const dir of legacyInstallDirCandidates()) {
+    const found = pickAgentDir(dir, LEGACY_EXE_NAMES, LEGACY_MSH_NAMES, false)
+    if (found) return found
   }
   return null
 }
@@ -156,7 +224,7 @@ function resolveInstalledMeshAgentPaths() {
 function installedAgentNeedsRepair(clientId) {
   const expected = buildAgentName(clientId)
   if (!expected) return false
-  const installed = resolveInstalledMeshAgentPaths()
+  const installed = resolveInstalledMeshAgentPaths() || resolveLegacyInstalledMeshAgentPaths()
   if (!installed) return true
   const fsApi = deps.fs || fs
   try {
@@ -165,14 +233,12 @@ function installedAgentNeedsRepair(clientId) {
     const parsed = parseMshText(raw)
     const current = String(parsed.get('agentName') || '').trim()
     if (current !== expected) return true
-    // Also repair when packaged template endpoint/cert changed (e.g. 8444→4433).
     const templatePath = resolveMeshAgentPaths().mshPath
     if (fileExists(templatePath)) {
       const tmpl = parseMshText(fsApi.readFileSync(templatePath, 'utf8'))
       for (const key of ['MeshServer', 'ServerID', 'MeshID']) {
         const want = String(tmpl.get(key) || '').trim()
         const got = String(parsed.get(key) || '').trim()
-        // Template requires the field: missing/empty got must repair (not only mismatch).
         if (want && want !== got) return true
       }
     }
@@ -257,7 +323,7 @@ function stageMshForClient(opts) {
   }
   const fsApi = deps.fs || fs
   if (!fileExists(templatePath)) {
-    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 meshagent.msh 模板' }
+    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 WXQK.msh 模板' }
   }
   try {
     fsApi.mkdirSync(stagingDir, { recursive: true })
@@ -276,7 +342,6 @@ function stageMshForClient(opts) {
       return { ok: false, code: 'MSH_IDENTITY_INCOMPLETE', message: `模板缺少 ${key}` }
     }
   }
-  // Guard: never overwrite Mesh identity with agentName accidentally
   const beforeIdentity = Object.fromEntries([...MSH_IDENTITY_KEYS].map((k) => [k, parsed.get(k)]))
   const stagedText = serializeMshWithAgentName(parsed, agentName)
   const staged = parseMshText(stagedText)
@@ -304,7 +369,7 @@ function stageMshForClient(opts) {
 function prepareInstallStaging(clientId) {
   const paths = resolveMeshAgentPaths()
   if (!fileExists(paths.exePath) || !fileExists(paths.mshPath)) {
-    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 meshagent.exe 或 meshagent.msh' }
+    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 WXQK.exe 或 WXQK.msh' }
   }
   const fsApi = deps.fs || fs
   const stagingDir = path.join(os.tmpdir(), `wxqk-mesh-stage-${safeClientIdForAgent(clientId) || 'x'}-${Date.now()}`)
@@ -395,7 +460,7 @@ async function runElevated(file, args, opts = {}) {
 }
 
 /**
- * Copy staged MeshAgent.msh into the Windows install directory (requires elevation).
+ * Copy staged WXQK.msh into the Windows install directory (requires elevation).
  * @param {string} stagedMshPath
  */
 async function syncInstalledMsh(stagedMshPath) {
@@ -403,15 +468,14 @@ async function syncInstalledMsh(stagedMshPath) {
   if (!installed || !fileExists(stagedMshPath)) {
     return { ok: false, code: 'MSH_SYNC_SKIP', message: 'install dir or staged msh missing' }
   }
-  const destCap = path.join(installed.dir, 'MeshAgent.msh')
-  const destLow = path.join(installed.dir, MSH_NAME)
-  const dest = destCap
+  const dest = path.join(installed.dir, MSH_NAME)
+  const destAlt = path.join(installed.dir, 'WXQK.MSH')
   const src = String(stagedMshPath).replace(/'/g, "''")
   const dst = dest.replace(/'/g, "''")
-  const dstLow = destLow.replace(/'/g, "''")
+  const dstAlt = destAlt.replace(/'/g, "''")
   const ps = [
     `Copy-Item -LiteralPath '${src}' -Destination '${dst}' -Force;`,
-    `if (Test-Path -LiteralPath '${dstLow}') { if ('${dstLow}' -ne '${dst}') { Remove-Item -LiteralPath '${dstLow}' -Force -ErrorAction SilentlyContinue } }`,
+    `if (('${dstAlt}' -ne '${dst}') -and (Test-Path -LiteralPath '${dstAlt}')) { Remove-Item -LiteralPath '${dstAlt}' -Force -ErrorAction SilentlyContinue }`,
   ].join(' ')
   const result = await runElevated('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps])
   return {
@@ -423,32 +487,191 @@ async function syncInstalledMsh(stagedMshPath) {
 }
 
 /**
- * Query Windows service state for Mesh Agent.
+ * @param {string} serviceName
  */
-async function queryServiceState() {
+async function queryNamedServiceState(serviceName) {
   if ((deps.platform || process.platform) !== 'win32') {
-    return { present: false, state: 'unsupported', raw: '' }
+    return { present: false, state: 'unsupported', raw: '', name: serviceName }
   }
-  const result = await runExecFile('sc.exe', ['query', SERVICE_NAME], { timeoutMs: 15000 })
+  const result = await runExecFile('sc.exe', ['query', serviceName], { timeoutMs: 15000 })
   const raw = `${result.stdout}\n${result.stderr}`
   if (/FAILED\s+1060/i.test(raw) || /does not exist/i.test(raw)) {
-    return { present: false, state: 'missing', raw }
+    return { present: false, state: 'missing', raw, name: serviceName }
   }
-  if (/RUNNING/i.test(raw)) return { present: true, state: 'running', raw }
-  if (/STOPPED/i.test(raw)) return { present: true, state: 'stopped', raw }
+  if (/RUNNING/i.test(raw)) return { present: true, state: 'running', raw, name: serviceName }
+  if (/STOPPED/i.test(raw)) return { present: true, state: 'stopped', raw, name: serviceName }
   if (/START_PENDING|STOP_PENDING|CONTINUE_PENDING|PAUSE_PENDING/i.test(raw)) {
-    return { present: true, state: 'pending', raw }
+    return { present: true, state: 'pending', raw, name: serviceName }
   }
-  if (result.ok) return { present: true, state: 'unknown', raw }
-  return { present: false, state: 'error', raw }
+  if (result.ok) return { present: true, state: 'unknown', raw, name: serviceName }
+  return { present: false, state: 'error', raw, name: serviceName }
+}
+
+/**
+ * Query Windows service state for branded WXQK service.
+ */
+async function queryServiceState() {
+  return queryNamedServiceState(SERVICE_NAME)
+}
+
+async function queryLegacyServiceState() {
+  return queryNamedServiceState(LEGACY_SERVICE_NAME)
+}
+
+/**
+ * Confirm a legacy Mesh Agent install belongs to this WXQK deployment.
+ * Never treat a third-party MeshCentral agent as ours.
+ * @param {{ clientId?: string }} [opts]
+ */
+function isLegacyAgentOwnedByWxqk(opts = {}) {
+  const legacy = resolveLegacyInstalledMeshAgentPaths()
+  if (!legacy) {
+    return { owned: false, reason: 'no_legacy_install' }
+  }
+  const fsApi = deps.fs || fs
+  let parsed = new Map()
+  try {
+    if (fsApi.existsSync(legacy.mshPath)) {
+      parsed = parseMshText(fsApi.readFileSync(legacy.mshPath, 'utf8'))
+    }
+  } catch {
+    return { owned: false, reason: 'msh_unreadable' }
+  }
+
+  const agentName = String(parsed.get('agentName') || '').trim()
+  if (agentName.startsWith(AGENT_NAME_PREFIX)) {
+    const clientId = safeClientIdForAgent(opts.clientId)
+    if (clientId) {
+      const expected = buildAgentName(clientId)
+      if (agentName === expected) {
+        return { owned: true, reason: 'agentName_match', agentName, legacy }
+      }
+      // Still WXQK-prefixed → this product's agent (maybe remapped client); safe to migrate.
+      return { owned: true, reason: 'agentName_prefix', agentName, legacy }
+    }
+    return { owned: true, reason: 'agentName_prefix', agentName, legacy }
+  }
+
+  const templatePath = resolveMeshAgentPaths().mshPath
+  if (!fileExists(templatePath)) {
+    return { owned: false, reason: 'no_template_to_compare', agentName, legacy }
+  }
+  try {
+    const tmpl = parseMshText(fsApi.readFileSync(templatePath, 'utf8'))
+    const keys = ['MeshServer', 'ServerID', 'MeshID']
+    let matched = 0
+    let required = 0
+    for (const key of keys) {
+      const want = String(tmpl.get(key) || '').trim()
+      if (!want) continue
+      required += 1
+      const got = String(parsed.get(key) || '').trim()
+      if (want === got) matched += 1
+    }
+    if (required >= 2 && matched === required) {
+      return { owned: true, reason: 'identity_match', agentName, legacy }
+    }
+  } catch {
+    return { owned: false, reason: 'template_compare_failed', agentName, legacy }
+  }
+
+  return { owned: false, reason: 'not_wxqk', agentName, legacy }
+}
+
+/**
+ * Stop legacy service and attempt uninstall only after branded WXQK is healthy.
+ * On failure to install/start branded agent, restart legacy (rollback).
+ * @param {{ clientId?: string }} [options]
+ */
+async function migrateLegacyMeshAgentToWxqk(options = {}) {
+  const clientId = safeClientIdForAgent(options.clientId)
+  const ownership = isLegacyAgentOwnedByWxqk({ clientId })
+  if (!ownership.owned) {
+    log('INFO', 'skip legacy migration — not WXQK owned', { reason: ownership.reason })
+    return {
+      ok: false,
+      code: 'LEGACY_NOT_OWNED',
+      action: 'skip_migrate',
+      message: '检测到第三方 Mesh Agent，已跳过',
+      ownership,
+    }
+  }
+
+  log('INFO', 'migrating legacy Mesh Agent → WXQK', { reason: ownership.reason, clientId: clientId || undefined })
+
+  const legacyState = await queryLegacyServiceState()
+  const legacyWasRunning = legacyState.state === 'running' || legacyState.state === 'pending'
+  if (legacyState.present) {
+    await runExecFile('sc.exe', ['stop', LEGACY_SERVICE_NAME], { timeoutMs: 60000 })
+  }
+
+  const installed = await installMeshAgent({ clientId })
+  if (!installed.ok) {
+    log('ERROR', 'migration install failed — rolling back legacy', { message: installed.message })
+    if (legacyWasRunning) {
+      await runExecFile('sc.exe', ['start', LEGACY_SERVICE_NAME], { timeoutMs: 60000 })
+    }
+    return {
+      ok: false,
+      code: 'MIGRATE_INSTALL_FAILED',
+      action: 'migrate_rollback',
+      message: installed.message || '服务升级失败，已恢复旧服务',
+      install: installed,
+      ownership,
+    }
+  }
+
+  const started = await startMeshAgent()
+  if (!started.ok) {
+    log('ERROR', 'migration start failed — rolling back legacy', { message: started.message })
+    try {
+      await uninstallMeshAgent()
+    } catch { /* best effort */ }
+    if (legacyWasRunning || legacyState.present) {
+      await runExecFile('sc.exe', ['start', LEGACY_SERVICE_NAME], { timeoutMs: 60000 })
+    }
+    return {
+      ok: false,
+      code: 'MIGRATE_START_FAILED',
+      action: 'migrate_rollback',
+      message: started.message || '服务启动失败，已恢复旧服务',
+      start: started,
+      ownership,
+    }
+  }
+
+  // Branded service healthy — remove legacy service (keep identity via agentName / server remap).
+  const legacyPaths = ownership.legacy || resolveLegacyInstalledMeshAgentPaths()
+  if (legacyPaths && fileExists(legacyPaths.exePath)) {
+    let un = await runElevated(legacyPaths.exePath, ['-fulluninstall'])
+    if (!un.ok) un = await runElevated(legacyPaths.exePath, ['-uninstall'])
+    if (!un.ok) {
+      await runElevated('sc.exe', ['stop', LEGACY_SERVICE_NAME])
+      await runElevated('sc.exe', ['delete', LEGACY_SERVICE_NAME])
+    }
+  } else if (legacyState.present) {
+    await runElevated('sc.exe', ['stop', LEGACY_SERVICE_NAME])
+    await runElevated('sc.exe', ['delete', LEGACY_SERVICE_NAME])
+  }
+
+  const after = await getMeshAgentStatus()
+  log('INFO', 'legacy migration complete', { status: after.status })
+  return {
+    ok: true,
+    code: 'OK',
+    action: 'migrate',
+    message: '服务已就绪',
+    status: after,
+    agentName: buildAgentName(clientId) || undefined,
+    ownership,
+  }
 }
 
 async function getMeshAgentVersion() {
   const { exePath } = resolveMeshAgentPaths()
   if (!fileExists(exePath)) {
-    return { ok: false, version: '', message: 'meshagent_missing' }
+    return { ok: false, version: '', message: 'wxqk_agent_missing' }
   }
-  // MeshAgent often prints version with -version / --version / help banners.
   for (const args of [['-version'], ['--version'], ['version']]) {
     const result = await runExecFile(exePath, args, { timeoutMs: 10000 })
     const text = `${result.stdout}\n${result.stderr}`.trim()
@@ -473,7 +696,7 @@ async function getMeshAgentStatus() {
   const exePresent = fileExists(paths.exePath)
   const mshPresent = fileExists(paths.mshPath)
   const service = await queryServiceState()
-  const versionInfo = exePresent ? await getMeshAgentVersion() : { ok: false, version: '', message: 'meshagent_missing' }
+  const versionInfo = exePresent ? await getMeshAgentVersion() : { ok: false, version: '', message: 'wxqk_agent_missing' }
 
   let status = 'missing'
   if (!exePresent || !mshPresent) status = 'missing'
@@ -490,6 +713,8 @@ async function getMeshAgentStatus() {
     mshPresent,
     servicePresent: service.present,
     serviceState: service.state,
+    serviceName: SERVICE_NAME,
+    serviceDisplayName: SERVICE_DISPLAY_NAME,
     version: versionInfo.version || '',
     paths: {
       root: paths.root,
@@ -503,7 +728,7 @@ async function getMeshAgentStatus() {
 }
 
 /**
- * Install MeshAgent as a Windows service when possible.
+ * Install branded WXQK agent as a Windows service when possible.
  * Elevates only for install.
  * When clientId is provided, installs from a staged msh with agentName=WXQK-<clientId>.
  * @param {{ clientId?: string }} [options]
@@ -513,10 +738,10 @@ async function installMeshAgent(options = {}) {
   const paths = resolveMeshAgentPaths()
   if (!fileExists(paths.exePath) || !fileExists(paths.mshPath)) {
     log('ERROR', 'install aborted: agent files missing', { exe: paths.exePath, msh: paths.mshPath })
-    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 meshagent.exe 或 meshagent.msh' }
+    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 WXQK.exe 或 WXQK.msh' }
   }
   if ((deps.platform || process.platform) !== 'win32') {
-    return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows 安装 MeshAgent 服务' }
+    return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows 安装服务' }
   }
 
   let installExe = paths.exePath
@@ -531,20 +756,17 @@ async function installMeshAgent(options = {}) {
     installExe = staged.exePath
     agentName = staged.agentName
     stagingDir = staged.stagingDir
-    log('INFO', 'installing MeshAgent from staging', { agentName })
+    log('INFO', 'installing WXQK agent from staging', { agentName })
   } else {
-    log('INFO', 'installing MeshAgent service')
+    log('INFO', 'installing WXQK agent service')
   }
 
   const elevateOpts = stagingDir ? { cwd: stagingDir } : {}
-  // Common MeshAgent flags: -fullinstall installs service + copies files.
-  // WorkingDirectory must be staging so MeshAgent.msh is picked up next to the exe.
   let result = await runElevated(installExe, ['-fullinstall'], elevateOpts)
   if (!result.ok) {
     result = await runElevated(installExe, ['-install'], elevateOpts)
   }
   if (!result.ok) {
-    // Fallback: some builds use "Mesh Service install"
     result = await runElevated(installExe, ['Mesh', 'Service', 'install'], elevateOpts)
   }
 
@@ -561,7 +783,7 @@ async function installMeshAgent(options = {}) {
   return {
     ok,
     code: ok ? 'OK' : 'MESH_INSTALL_FAILED',
-    message: ok ? 'MeshAgent 已安装' : redact(result.stderr || result.error || '安装失败'),
+    message: ok ? '服务已就绪' : redact(result.stderr || result.error || '安装失败'),
     status: after,
     agentName: agentName || undefined,
     stagingDir: stagingDir || undefined,
@@ -573,7 +795,7 @@ async function startMeshAgent() {
   if ((deps.platform || process.platform) !== 'win32') {
     return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows' }
   }
-  log('INFO', 'starting MeshAgent service')
+  log('INFO', 'starting WXQK service')
   let result = await runExecFile('sc.exe', ['start', SERVICE_NAME], { timeoutMs: 60000 })
   if (!result.ok) {
     const paths = resolveMeshAgentPaths()
@@ -586,7 +808,7 @@ async function startMeshAgent() {
   return {
     ok,
     code: ok ? 'OK' : 'MESH_START_FAILED',
-    message: ok ? 'MeshAgent 已启动' : redact(result.stderr || result.error || '启动失败'),
+    message: ok ? '服务已就绪' : redact(result.stderr || result.error || '启动失败'),
     status: after,
   }
 }
@@ -595,7 +817,7 @@ async function stopMeshAgent() {
   if ((deps.platform || process.platform) !== 'win32') {
     return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows' }
   }
-  log('INFO', 'stopping MeshAgent service')
+  log('INFO', 'stopping WXQK service')
   let result = await runExecFile('sc.exe', ['stop', SERVICE_NAME], { timeoutMs: 60000 })
   if (!result.ok) {
     const paths = resolveMeshAgentPaths()
@@ -608,25 +830,24 @@ async function stopMeshAgent() {
   return {
     ok: ok || result.ok,
     code: (ok || result.ok) ? 'OK' : 'MESH_STOP_FAILED',
-    message: (ok || result.ok) ? 'MeshAgent 已停止' : redact(result.stderr || result.error || '停止失败'),
+    message: (ok || result.ok) ? '服务已停止' : redact(result.stderr || result.error || '停止失败'),
     status: after,
   }
 }
 
 async function restartMeshAgent() {
-  log('INFO', 'restarting MeshAgent')
+  log('INFO', 'restarting WXQK service')
   await stopMeshAgent()
   return startMeshAgent()
 }
 
 async function repairMeshAgent(options = {}) {
-  log('INFO', 'repairing MeshAgent')
+  log('INFO', 'repairing WXQK service')
   const stopped = await stopMeshAgent()
   const paths = resolveMeshAgentPaths()
   if (!fileExists(paths.exePath) || !fileExists(paths.mshPath)) {
-    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 meshagent.exe 或 meshagent.msh', status: await getMeshAgentStatus() }
+    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 WXQK.exe 或 WXQK.msh', status: await getMeshAgentStatus() }
   }
-  // Re-run fullinstall elevated (with agentName when clientId known), then start.
   const installed = await installMeshAgent({ clientId: options.clientId })
   if (!installed.ok) {
     return { ok: false, code: 'MESH_REPAIR_FAILED', message: installed.message, stop: stopped, install: installed }
@@ -635,7 +856,7 @@ async function repairMeshAgent(options = {}) {
   return {
     ok: started.ok,
     code: started.ok ? 'OK' : 'MESH_REPAIR_FAILED',
-    message: started.ok ? 'MeshAgent 已修复并启动' : started.message,
+    message: started.ok ? '服务已就绪' : started.message,
     stop: stopped,
     install: installed,
     start: started,
@@ -647,7 +868,7 @@ async function uninstallMeshAgent() {
   if ((deps.platform || process.platform) !== 'win32') {
     return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows' }
   }
-  log('INFO', 'uninstalling MeshAgent')
+  log('INFO', 'uninstalling WXQK service')
   const paths = resolveMeshAgentPaths()
   let result = { ok: false, stdout: '', stderr: '', error: '', code: 1 }
   if (fileExists(paths.exePath)) {
@@ -655,7 +876,6 @@ async function uninstallMeshAgent() {
     if (!result.ok) result = await runElevated(paths.exePath, ['-uninstall'])
     if (!result.ok) result = await runElevated(paths.exePath, ['Mesh', 'Service', 'uninstall'])
   }
-  // Best-effort service delete if binary flags failed.
   if (!result.ok) {
     await runElevated('sc.exe', ['stop', SERVICE_NAME])
     result = await runElevated('sc.exe', ['delete', SERVICE_NAME])
@@ -665,13 +885,13 @@ async function uninstallMeshAgent() {
   return {
     ok,
     code: ok ? 'OK' : 'MESH_UNINSTALL_FAILED',
-    message: ok ? 'MeshAgent 已卸载' : redact(result.stderr || result.error || '卸载失败'),
+    message: ok ? '服务已卸载' : redact(result.stderr || result.error || '卸载失败'),
     status: after,
   }
 }
 
 /**
- * Lifecycle helper: missing→install, stopped→start, running→noop, broken→repair.
+ * Lifecycle helper: missing→install (or migrate legacy), stopped→start, running→noop, broken→repair.
  * New installs use staged msh with agentName=WXQK-<clientId>.
  * @param {{ clientId?: string }} [options]
  */
@@ -679,8 +899,30 @@ async function ensureMeshAgentRunning(options = {}) {
   const clientId = safeClientIdForAgent(options.clientId)
   log('INFO', 'ensureMeshAgentRunning', { clientId: clientId || undefined })
   const before = await getMeshAgentStatus()
+
+  // Brand migration: WXQK service absent but legacy Mesh Agent may be ours.
+  if (!before.servicePresent) {
+    const legacy = await queryLegacyServiceState()
+    if (legacy.present) {
+      const ownership = isLegacyAgentOwnedByWxqk({ clientId })
+      if (ownership.owned) {
+        const migrated = await migrateLegacyMeshAgentToWxqk({ clientId })
+        return {
+          ok: migrated.ok,
+          code: migrated.code,
+          action: migrated.action || 'migrate',
+          message: migrated.message,
+          status: migrated.status || (await getMeshAgentStatus()),
+          agentName: migrated.agentName || buildAgentName(clientId) || undefined,
+        }
+      }
+      log('WARN', 'legacy Mesh Agent present but not owned by WXQK — leave alone', {
+        reason: ownership.reason,
+      })
+    }
+  }
+
   if (before.status === 'running') {
-    // 旧安装常在“服务已运行”但无 agentName / 无 msh：MeshCentral 节点列表为空，无法绑定
     if (clientId && installedAgentNeedsRepair(clientId)) {
       log('WARN', 'running agent missing/stale agentName — repairing', {
         clientId,
@@ -696,7 +938,7 @@ async function ensureMeshAgentRunning(options = {}) {
         agentName: buildAgentName(clientId),
       }
     }
-    return { ok: true, code: 'OK', action: 'noop', message: 'MeshAgent 已在运行', status: before }
+    return { ok: true, code: 'OK', action: 'noop', message: '服务已就绪', status: before }
   }
   if (before.status === 'missing') {
     const installed = await installMeshAgent({ clientId })
@@ -714,7 +956,6 @@ async function ensureMeshAgentRunning(options = {}) {
     }
   }
   if (before.status === 'stopped' || before.status === 'installed_no_service') {
-    // Even when stopped: validate installed .msh before start (stale agentName / MeshServer / etc).
     if (clientId && installedAgentNeedsRepair(clientId)) {
       log('WARN', 'stopped agent needs repair before start', {
         clientId,
@@ -739,7 +980,6 @@ async function ensureMeshAgentRunning(options = {}) {
       status: started.status,
     }
   }
-  // broken / unknown / error — repair may reinstall with agentName when clientId known
   const repaired = await repairMeshAgent({ clientId })
   return {
     ok: repaired.ok,
@@ -753,6 +993,10 @@ async function ensureMeshAgentRunning(options = {}) {
 module.exports = {
   LOG_TAG,
   SERVICE_NAME,
+  SERVICE_DISPLAY_NAME,
+  EXE_NAME,
+  MSH_NAME,
+  LEGACY_SERVICE_NAME,
   AGENT_NAME_PREFIX,
   MSH_IDENTITY_KEYS,
   resolveMeshAgentPaths,
@@ -765,6 +1009,9 @@ module.exports = {
   repairMeshAgent,
   uninstallMeshAgent,
   ensureMeshAgentRunning,
+  migrateLegacyMeshAgentToWxqk,
+  isLegacyAgentOwnedByWxqk,
+  queryLegacyServiceState,
   safeClientIdForAgent,
   buildAgentName,
   parseMshText,
@@ -772,6 +1019,7 @@ module.exports = {
   stageMshForClient,
   prepareInstallStaging,
   resolveInstalledMeshAgentPaths,
+  resolveLegacyInstalledMeshAgentPaths,
   installedAgentNeedsRepair,
   setMeshAgentDepsForTest,
   resetMeshAgentDepsForTest,

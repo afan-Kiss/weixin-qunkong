@@ -1000,7 +1000,7 @@ def auto_bind_client(
                     ok=True,
                     code="OK",
                     message="already bound",
-                    user_message="远程服务已就绪",
+                    user_message="服务已就绪",
                     remote_state=REMOTE_STATE_READY,
                     mapping=mapping,
                     mesh_node_id=existing_nid,
@@ -1036,7 +1036,7 @@ def auto_bind_client(
                         ok=True,
                         code="OK",
                         message="remapped after agent reinstall",
-                        user_message="远程服务已就绪",
+                        user_message="服务已就绪",
                         remote_state=REMOTE_STATE_READY,
                         mapping=mapping,
                         mesh_node_id=new_nid,
@@ -1112,7 +1112,7 @@ def auto_bind_client(
             ok=True,
             code="OK",
             message="auto bound",
-            user_message="远程服务已就绪",
+            user_message="服务已就绪",
             remote_state=REMOTE_STATE_READY,
             mapping=mapping,
             mesh_node_id=nid,
@@ -1194,8 +1194,8 @@ def resolve_live_device_status(
         payload = {
             "ok": True,
             "code": str(bound.get("code") or "MESH_PREPARING"),
-            "message": str(bound.get("message") or "正在准备远程服务…"),
-            "userMessage": str(bound.get("userMessage") or bound.get("message") or "正在准备远程服务…"),
+            "message": str(bound.get("message") or "正在准备服务…"),
+            "userMessage": str(bound.get("userMessage") or bound.get("message") or "正在准备服务…"),
             "clientId": cid,
             "bound": bool(bound.get("bound")),
             "online": bool(bound.get("online")),
@@ -1208,12 +1208,12 @@ def resolve_live_device_status(
         }
         if payload["ready"]:
             payload["code"] = "OK"
-            payload["message"] = "远程服务已就绪"
-            payload["userMessage"] = "远程服务已就绪"
+            payload["message"] = "服务已就绪"
+            payload["userMessage"] = "服务已就绪"
         elif not payload["bound"]:
             payload["code"] = "MESH_PREPARING"
-            payload["message"] = "正在准备远程服务…"
-            payload["userMessage"] = "正在准备远程服务…"
+            payload["message"] = "正在准备服务…"
+            payload["userMessage"] = "正在准备服务…"
             payload["remoteState"] = REMOTE_STATE_PREPARING
         _live_cache_set(cache_key, payload)
         return payload
@@ -1252,8 +1252,8 @@ def resolve_live_device_status(
             payload = {
                 "ok": True,
                 "code": "OK",
-                "message": "远程服务已就绪",
-                "userMessage": "远程服务已就绪",
+                "message": "服务已就绪",
+                "userMessage": "服务已就绪",
                 "clientId": cid,
                 "bound": True,
                 "online": True,
@@ -1298,8 +1298,8 @@ def resolve_live_device_status(
         payload = {
             "ok": True,
             "code": "OK",
-            "message": "远程服务已就绪",
-            "userMessage": "远程服务已就绪",
+            "message": "服务已就绪",
+            "userMessage": "服务已就绪",
             "clientId": cid,
             "bound": True,
             "online": True,
@@ -1438,7 +1438,7 @@ def get_remote_session(
         "verified": True,
         "remoteState": REMOTE_STATE_READY,
         "message": "desktop session ready",
-        "userMessage": "远程服务已就绪",
+        "userMessage": "服务已就绪",
     }
 
 
@@ -1478,7 +1478,7 @@ def get_files_session(
         "verified": True,
         "remoteState": REMOTE_STATE_READY,
         "message": "files session ready",
-        "userMessage": "远程服务已就绪",
+        "userMessage": "服务已就绪",
     }
 
 

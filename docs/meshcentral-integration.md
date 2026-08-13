@@ -106,14 +106,24 @@ Embed URL:
 
 ## Agent packaging
 
+MeshCentral `domains."".agentCustomization` brands the agent as **WXQK** (`fileName` / `serviceName` / `companyName` / `displayName` / `description`). Packaged resources must be:
+
+```text
+admin-ui/resources/meshcentral/WXQK.exe
+admin-ui/resources/meshcentral/WXQK.msh
+```
+
 ```bash
 cd admin-ui
-# WXQK_MESH_AGENT_URL from MeshCentral 1.2.4 UI → Add Agent (typically /meshagents?id=…)
+# WXQK_MESH_AGENT_URL from MeshCentral 1.2.4 UI → Add Agent (after agentCustomization)
 export WXQK_MESH_AGENT_URL='https://your-mesh/meshagents?id=4'
 export WXQK_MESH_MSH_URL='…'   # matching .msh from same server
 npm run fetch:mesh-agent
-npm run check:mesh            # asserts VERSION/compose pin 1.2.4
+npm run check:mesh            # asserts VERSION/compose pin 1.2.4 + WXQK brand files
+npm run check:mesh:strict     # required before package:portable
 ```
+
+Do **not** commit production `WXQK.msh` / `WXQK.exe`. Keep `LICENSE-MeshAgent.txt`.
 
 ## Mapping / APIs / Relay
 
@@ -171,7 +181,7 @@ python server/wxqk/mesh_live_e2e_check.py --client-id <clientId>
 等待管理台设备状态变为：
 
 ```text
-远程服务已就绪
+服务已就绪
 ```
 
 ### 3. 管理台

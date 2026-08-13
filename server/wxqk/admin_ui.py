@@ -1203,7 +1203,7 @@ async function refreshDesktopMeshStatus() {
     } else if (st.ok === false || remoteState === 'error') {
       statusLabel = '<span class="badge badge-deny">远程服务准备失败</span>';
     } else {
-      statusLabel = '<span class="badge badge-neutral">' + escHtml(userMsg || '正在准备远程服务…') + '</span>';
+      statusLabel = '<span class="badge badge-neutral">' + escHtml(userMsg || '正在准备服务…') + '</span>';
     }
     info.innerHTML = serverBanner
       + '<div><b>设备</b><div>' + escHtml(label) + '</div>'
@@ -1310,7 +1310,7 @@ async function autoBindDesktopClient() {
         agentName: 'WXQK-' + cid,
       }),
     });
-    alert(data && (data.ready || (data.ok && data.online)) ? '远程服务已就绪' : friendlyMeshError(data));
+    alert(data && (data.ready || (data.ok && data.online)) ? '服务已就绪' : friendlyMeshError(data));
     await refreshDesktopMeshStatus();
   } catch (e) {
     alert(e.message || '远程服务准备失败');

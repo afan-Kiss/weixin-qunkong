@@ -49,8 +49,12 @@ deploy/meshcentral/data/
 deploy/meshcentral/files/
 deploy/meshcentral/backups/
 **/meshagent.msh
+**/WXQK.msh
 admin-ui/resources/meshcentral/meshagent.exe
 admin-ui/resources/meshcentral/meshagent.msh
+admin-ui/resources/meshcentral/WXQK.exe
+admin-ui/resources/meshcentral/WXQK.msh
+admin-ui/resources/meshcentral/meshagent.official.msh
 **/*.pem
 **/*.key
 !**/*.example.key

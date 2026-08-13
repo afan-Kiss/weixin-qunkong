@@ -380,6 +380,29 @@ def _read_login_token_key_from_container() -> tuple[str, str]:
     return key, ""
 
 
+def _ensure_agent_customization(domain0: dict) -> None:
+    """MeshCentral 1.2.4 domains.\"\".agentCustomization — brand agent as WXQK (no Remote)."""
+    want = {
+        "displayName": "WXQK",
+        "description": "WXQK",
+        "companyName": "WXQK",
+        "serviceName": "WXQK",
+        "fileName": "WXQK",
+    }
+    existing = domain0.get("agentCustomization")
+    if not isinstance(existing, dict):
+        domain0["agentCustomization"] = dict(want)
+        return
+    merged = dict(existing)
+    for key, val in want.items():
+        if not str(merged.get(key) or "").strip():
+            merged[key] = val
+    # Hard-normalize brand fields so production never ships Mesh Agent / Remote names.
+    for key, val in want.items():
+        merged[key] = val
+    domain0["agentCustomization"] = merged
+
+
 def _apply_config_defaults(public_host: str, framing_origins: list[str]) -> None:
     cfg_path = HERE / "config.json"
     if not cfg_path.exists():
@@ -406,6 +429,13 @@ def _apply_config_defaults(public_host: str, framing_origins: list[str]) -> None
         domain0["allowedFramingOrigins"] = merged
     if not domain0.get("certUrl"):
         domain0["certUrl"] = f"https://{public_host}/"
+    _ensure_agent_customization(domain0)
+    title = str(domain0.get("title") or "").strip()
+    if not title or title.lower() in ("meshcentral", "wxqk remote"):
+        domain0["title"] = "WXQK"
+    title2 = str(domain0.get("title2") or "").strip()
+    if not title2 or "remote" in title2.lower():
+        domain0["title2"] = "Maintenance"
     cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -617,6 +647,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             hint="Set domains.\"\".allowedFramingOrigins to explicit admin origins (no *)",
         )
         if not origins_ok:
+            failures += 1
+        custom = (domain0 or {}).get("agentCustomization") if isinstance(domain0, dict) else None
+        custom_ok = (
+            isinstance(custom, dict)
+            and str(custom.get("fileName") or "") == "WXQK"
+            and str(custom.get("serviceName") or "") == "WXQK"
+            and str(custom.get("companyName") or "") == "WXQK"
+            and "remote" not in json.dumps(custom).lower()
+        )
+        _print_check(
+            custom_ok,
+            "agentCustomization WXQK brand",
+            "fileName/serviceName/companyName=WXQK" if custom_ok else "missing or not branded",
+            hint='Set domains."".agentCustomization fileName/serviceName/companyName/displayName/description to WXQK',
+        )
+        if not custom_ok:
             failures += 1
     except Exception as exc:
         _print_check(False, "MeshCentral config", str(exc)[:120], hint="Run prepare/bootstrap")

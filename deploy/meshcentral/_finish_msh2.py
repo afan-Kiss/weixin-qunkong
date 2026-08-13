@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload gen_msh.js, produce meshagent.msh, confirm Windows exe."""
+"""Upload gen_msh.js, produce WXQK.msh, confirm Windows exe."""
 from __future__ import annotations
 
 import os
@@ -49,9 +49,9 @@ def main() -> int:
     # ensure exe
     run(
         "mkdir -p /opt/wxqk/meshcentral/agent-staging && "
-        "if [ ! -s /opt/wxqk/meshcentral/agent-staging/meshagent.exe ]; then "
-        "curl -s http://127.0.0.1:9443/meshagents?id=3 -o /opt/wxqk/meshcentral/agent-staging/meshagent.exe; fi && "
-        "python3 -c \"p=open('/opt/wxqk/meshcentral/agent-staging/meshagent.exe','rb').read(2); import os; print('EXE',os.path.getsize('/opt/wxqk/meshcentral/agent-staging/meshagent.exe'),p)\""
+        "if [ ! -s /opt/wxqk/meshcentral/agent-staging/WXQK.exe ]; then "
+        "curl -s http://127.0.0.1:9443/meshagents?id=3 -o /opt/wxqk/meshcentral/agent-staging/WXQK.exe; fi && "
+        "python3 -c \"p=open('/opt/wxqk/meshcentral/agent-staging/WXQK.exe','rb').read(2); import os; print('EXE',os.path.getsize('/opt/wxqk/meshcentral/agent-staging/WXQK.exe'),p)\""
     )
     # try mesh id forms
     code, out = run(
@@ -76,10 +76,10 @@ def main() -> int:
         "  for MS in 'wss://203.0.113.10:4433/agent.ashx' 'wss://203.0.113.10:8444/agent.ashx'; do "
         "    echo TRY \"$MID\" \"$MS\"; "
         "    if docker exec -e MID=\"$MID\" -e MS=\"$MS\" wxqk-meshcentral node /tmp/gen_msh.js; then "
-        "      docker cp wxqk-meshcentral:/tmp/out.msh /opt/wxqk/meshcentral/agent-staging/meshagent.msh; "
-        "      SID=$(grep '^ServerID=' /opt/wxqk/meshcentral/agent-staging/meshagent.msh | head -n1 | cut -d= -f2-); "
+        "      docker cp wxqk-meshcentral:/tmp/out.msh /opt/wxqk/meshcentral/agent-staging/WXQK.msh; "
+        "      SID=$(grep '^ServerID=' /opt/wxqk/meshcentral/agent-staging/WXQK.msh | head -n1 | cut -d= -f2-); "
         "      if [ -n \"$SID\" ]; then echo MSH_OK; ok=1; "
-        "        grep -E '^(MeshName|MeshServer|MeshID|ServerID)=' /opt/wxqk/meshcentral/agent-staging/meshagent.msh | sed -E 's/(ServerID=).*/\\1<redacted-len:'${\"#SID\"}'/; s/(MeshID=).{20}/\\1.../'; "
+        "        grep -E '^(MeshName|MeshServer|MeshID|ServerID)=' /opt/wxqk/meshcentral/agent-staging/WXQK.msh | sed -E 's/(ServerID=).*/\\1<redacted-len:'${\"#SID\"}'/; s/(MeshID=).{20}/\\1.../'; "
         "        break 2; fi; "
         "    fi; "
         "  done; "

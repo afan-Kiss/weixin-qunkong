@@ -261,8 +261,8 @@ function finishReady(clientId, agentName, bind) {
     meshNodeId,
     meshGroupId,
     code: 'OK',
-    message: '远程服务已就绪',
-    userMessage: '远程服务已就绪',
+    message: '服务已就绪',
+    userMessage: '服务已就绪',
     liveValidatedAt: now,
   })
 }
@@ -325,8 +325,8 @@ async function ensureMeshReady(clientId, opts = {}) {
       meshNodeId: '',
       meshGroupId: '',
       code: '',
-      message: '正在准备远程服务…',
-      userMessage: '正在准备远程服务…',
+      message: '正在准备服务…',
+      userMessage: '正在准备服务…',
       liveValidatedAt: 0,
     })
 
@@ -334,15 +334,15 @@ async function ensureMeshReady(clientId, opts = {}) {
       // Always confirm local MeshAgent before trusting any server-side mapping.
       setPrepareState({
         phase: PHASE.STARTING,
-        message: '正在启动远程服务…',
-        userMessage: '正在启动远程服务…',
+        message: '正在准备服务…',
+        userMessage: '正在准备服务…',
       })
       if (remainingMs(deadlineMs) < 1000) {
-        return finishFailed(cid, 'MESH_NODE_TIMEOUT', '等待远程服务就绪超时')
+        return finishFailed(cid, 'MESH_NODE_TIMEOUT', '等待服务就绪超时')
       }
       const ensured = await meshAgent.ensureMeshAgentRunning({ clientId: cid })
       if (!ensured?.ok) {
-        return finishFailed(cid, ensured?.code || 'MESH_START_FAILED', ensured?.message || 'MeshAgent 启动失败')
+        return finishFailed(cid, ensured?.code || 'MESH_START_FAILED', ensured?.message || '服务启动失败')
       }
       log('agent running', { action: ensured.action, clientId: redactClientId(cid) })
 

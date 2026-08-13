@@ -19,6 +19,10 @@ dist-ssr
 *.local
 test-output.txt
 resources/meshcentral/meshagent.official.msh
+resources/meshcentral/WXQK.exe
+resources/meshcentral/WXQK.msh
+resources/meshcentral/meshagent.exe
+resources/meshcentral/meshagent.msh
 scripts/_*.ps1
 scripts/_tmp*
 

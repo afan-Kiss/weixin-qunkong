@@ -171,8 +171,8 @@ p.write_text('\\n'.join(lines) + '\\n'); p.chmod(0o600)
 
 out = Path('/opt/wxqk/meshcentral/agent-staging'); out.mkdir(parents=True, exist_ok=True)
 q = urllib.parse.quote(mesh_id, safe='')
-urllib.request.urlretrieve('http://127.0.0.1:9443/meshagents?id=3&meshid=' + q, out / 'meshagent.exe')
-print('EXE', (out/'meshagent.exe').stat().st_size, (out/'meshagent.exe').read_bytes()[:2])
+urllib.request.urlretrieve('http://127.0.0.1:9443/meshagents?id=3&meshid=' + q, out / 'WXQK.exe')
+print('EXE', (out/'WXQK.exe').stat().st_size, (out/'WXQK.exe').read_bytes()[:2])
 
 # generate msh via node common.hash
 gen_js = (
@@ -205,8 +205,8 @@ for mid in cands:
             stderr=subprocess.STDOUT, text=True, errors='replace'
         )
         print('GEN', outp.strip(), mid[:20], ms)
-        subprocess.check_call(['docker', 'cp', 'wxqk-meshcentral:/tmp/out.msh', str(out / 'meshagent.msh')])
-        text = (out / 'meshagent.msh').read_text(errors='ignore')
+        subprocess.check_call(['docker', 'cp', 'wxqk-meshcentral:/tmp/out.msh', str(out / 'WXQK.msh')])
+        text = (out / 'WXQK.msh').read_text(errors='ignore')
         if 'ServerID=' in text and text.split('ServerID=')[1].splitlines()[0].strip():
             ok = True
             for key in ('MeshName', 'MeshServer', 'MeshID', 'ServerID'):

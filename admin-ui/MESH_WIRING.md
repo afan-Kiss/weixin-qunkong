@@ -6,7 +6,7 @@
 Windows client
   → login success (non-blocking)
   → ensureMeshReady(clientId)  [single-flight]
-       1. check resources / Mesh Agent service
+       1. check resources / WXQK service (migrate legacy Mesh Agent if WXQK-owned)
        2. missing→install (staged msh agentName=WXQK-<clientId>)
        3. stopped→start / broken→repair
        4. wait node + POST /api/mesh/auto-bind
@@ -30,5 +30,6 @@ Client prepare: if bind keeps returning `MESH_NO_MATCH`, repair MeshAgent once w
 ## UX
 
 - Never show users: `MESH_UNBOUND`, `meshNodeId`, `auto-bind`, Mesh node jargon
-- Preparing: 「正在准备远程服务…」 etc.
-- Failure only after prepare exhausted: 「远程服务准备失败」+ understandable reason
+- Preparing: 「正在准备服务…」 / ready: 「服务已就绪」
+- Failure only after prepare exhausted: 「服务准备失败」+ understandable reason
+- Branded agent: `WXQK.exe` / Windows service `WXQK` (never `Remote` / `MeshAgent` in user-visible brand)

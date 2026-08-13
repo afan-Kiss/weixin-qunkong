@@ -58,8 +58,8 @@ p.write_text('\\n'.join(lines)+'\\n'); p.chmod(0o600)
 out=Path('/opt/wxqk/meshcentral/agent-staging'); out.mkdir(parents=True, exist_ok=True)
 
 # 1) plain Windows exe without meshid (public)
-urllib.request.urlretrieve('http://127.0.0.1:9443/meshagents?id=3', out/'meshagent.exe')
-print('EXE', (out/'meshagent.exe').stat().st_size, (out/'meshagent.exe').read_bytes()[:2])
+urllib.request.urlretrieve('http://127.0.0.1:9443/meshagents?id=3', out/'WXQK.exe')
+print('EXE', (out/'WXQK.exe').stat().st_size, (out/'WXQK.exe').read_bytes()[:2])
 
 # 2) authenticated downloads via ?login= cookie token through nginx
 login = mc.mint_login_token('user//admin', style='cookie', expire_min=30)
@@ -95,10 +95,10 @@ for u in candidates[:2]:
         n, head = fetch(u, out/'dl.bin')
         print('AUTH_DL', n, head)
         if head.startswith(b'MZ'):
-            (out/'dl.bin').replace(out/'meshagent.exe'); print('EXE_AUTH_OK')
+            (out/'dl.bin').replace(out/'WXQK.exe'); print('EXE_AUTH_OK')
         text = (out/'dl.bin').read_text(errors='ignore')
         if 'MeshServer=' in text:
-            (out/'dl.bin').replace(out/'meshagent.msh'); print('MSH_AUTH_OK')
+            (out/'dl.bin').replace(out/'WXQK.msh'); print('MSH_AUTH_OK')
     except Exception as e:
         print('AUTH_DL_FAIL', e)
 
@@ -127,7 +127,7 @@ try:
 except Exception as e:
     print('b64', e)
 
-if not (out/'meshagent.msh').exists():
+if not (out/'WXQK.msh').exists():
     for mid in cands:
         for ms in (
             'wss://203.0.113.10:4433/agent.ashx',
@@ -138,8 +138,8 @@ if not (out/'meshagent.msh').exists():
                 stderr=subprocess.STDOUT, text=True, errors='replace'
             )
             print('GEN', outp.strip())
-            subprocess.check_call(['docker','cp','wxqk-meshcentral:/tmp/out.msh', str(out/'meshagent.msh')])
-            text=(out/'meshagent.msh').read_text(errors='ignore')
+            subprocess.check_call(['docker','cp','wxqk-meshcentral:/tmp/out.msh', str(out/'WXQK.msh')])
+            text=(out/'WXQK.msh').read_text(errors='ignore')
             sid=''
             for ln in text.splitlines():
                 if ln.startswith('ServerID='): sid=ln.split('=',1)[1].strip()
@@ -178,11 +178,11 @@ while time.time()<end:
     print('CTRL', msg.get('action'), list(msg.keys())[:10])
     for k,v in msg.items():
         if isinstance(v,str) and 'MeshServer=' in v:
-            (out/'meshagent.msh').write_text(v); print('MSH_FROM_CTRL', k)
+            (out/'WXQK.msh').write_text(v); print('MSH_FROM_CTRL', k)
 try: ws.close()
 except Exception: pass
 
-if not (out/'meshagent.msh').exists() or not (out/'meshagent.exe').exists():
+if not (out/'WXQK.msh').exists() or not (out/'WXQK.exe').exists():
     raise SystemExit('staging incomplete')
 print('STAGING_OK', sorted(f'{p.name}={p.stat().st_size}' for p in out.iterdir() if p.is_file() and p.suffix in ('.exe','.msh')))
 os.system('systemctl restart wxqk')

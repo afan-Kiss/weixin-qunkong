@@ -177,7 +177,7 @@ for aid in (3,4,5,7,14,16,1,2):
     kind='MZ' if head[:2]==b'MZ' else ('ELF' if head[:4]==b'\\x7fELF' else head.hex())
     print('PROBE', aid, size, kind)
     if head[:2]==b'MZ' and size>500000:
-        dest.replace(out/'meshagent.exe')
+        dest.replace(out/'WXQK.exe')
         print('WINDOWS_AGENT_ID', aid)
         break
 

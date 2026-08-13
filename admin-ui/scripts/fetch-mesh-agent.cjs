@@ -1,11 +1,9 @@
 #!/usr/bin/env node
 /**
- * Download MeshAgent binaries from YOUR MeshCentral server (pinned 1.2.4) into
- * admin-ui/resources/meshcentral/
+ * Download branded WXQK MeshAgent binaries from YOUR MeshCentral server (pinned 1.2.4)
+ * into admin-ui/resources/meshcentral/
  *
- * Typical MeshCentral 1.2.4 download paths (from server UI → Add Agent):
- *   /meshagents?id=<archId>     → meshagent.exe
- *   companion .msh from the same download dialog (contains MeshServer/ServerID/MeshID)
+ * With domains."".agentCustomization.fileName=WXQK the download is WXQK.exe (+ WXQK.msh).
  *
  * Env:
  *   WXQK_MESH_AGENT_URL  — HTTPS URL to Windows agent exe (required)
@@ -13,7 +11,7 @@
  *   WXQK_MESH_AGENT_SHA256 — optional expected sha256 of exe
  *   WXQK_MESH_MSH_SHA256   — optional expected sha256 of msh
  *
- * TLS verification is always ON. Never commit production .msh.
+ * TLS verification is always ON. Never commit production .msh / WXQK.exe.
  */
 'use strict'
 
@@ -25,12 +23,24 @@ const crypto = require('crypto')
 const { URL } = require('url')
 
 const OUT_DIR = path.join(__dirname, '..', 'resources', 'meshcentral')
-const EXE_NAME = 'meshagent.exe'
-const MSH_NAME = 'meshagent.msh'
+const EXE_NAME = 'WXQK.exe'
+const MSH_NAME = 'WXQK.msh'
 
 function fail(message, code = 1) {
   console.error(`[MESH] ERROR ${message}`)
   process.exit(code)
+}
+
+function cleanupPartial(destPath) {
+  try {
+    if (fs.existsSync(destPath) && fs.statSync(destPath).size === 0) {
+      fs.unlinkSync(destPath)
+    }
+  } catch { /* ignore */ }
+  try {
+    const part = `${destPath}.part`
+    if (fs.existsSync(part)) fs.unlinkSync(part)
+  } catch { /* ignore */ }
 }
 
 function download(urlString, destPath) {
@@ -52,7 +62,6 @@ function download(urlString, destPath) {
     const req = lib.get(u, {
       timeout: 120000,
       headers: { 'User-Agent': 'wxqk-fetch-mesh-agent/1.0' },
-      // TLS verify ON (default)
     }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         file.close()
@@ -69,8 +78,19 @@ function download(urlString, destPath) {
       res.pipe(file)
       file.on('finish', () => {
         file.close(() => {
-          fs.renameSync(tmp, destPath)
-          resolve({ bytes: fs.statSync(destPath).size })
+          try {
+            const size = fs.statSync(tmp).size
+            if (size <= 0) {
+              fs.unlink(tmp, () => {})
+              reject(new Error(`downloaded 0-byte file for ${u.hostname}${u.pathname}`))
+              return
+            }
+            fs.renameSync(tmp, destPath)
+            resolve({ bytes: size })
+          } catch (err) {
+            fs.unlink(tmp, () => {})
+            reject(err)
+          }
         })
       })
     })
@@ -98,7 +118,6 @@ async function main() {
     fail('WXQK_MESH_AGENT_URL is required (download link from your MeshCentral → Add Agent)')
   }
   if (!mshUrl) {
-    // Common pattern: same URL with .msh suffix or meshagents?id=… + companion .msh from UI
     if (agentUrl.toLowerCase().endsWith('.exe')) {
       mshUrl = `${agentUrl.slice(0, -4)}.msh`
     }
@@ -111,35 +130,45 @@ async function main() {
   const exePath = path.join(OUT_DIR, EXE_NAME)
   const mshPath = path.join(OUT_DIR, MSH_NAME)
 
-  console.log(`[MESH] downloading agent → ${exePath}`)
-  const exeInfo = await download(agentUrl, exePath)
-  console.log(`[MESH] downloading msh → ${mshPath}`)
-  const mshInfo = await download(mshUrl, mshPath)
+  try {
+    console.log(`[MESH] downloading agent → ${exePath}`)
+    const exeInfo = await download(agentUrl, exePath)
+    console.log(`[MESH] downloading msh → ${mshPath}`)
+    const mshInfo = await download(mshUrl, mshPath)
 
-  if (!fs.existsSync(exePath) || !fs.existsSync(mshPath)) {
-    fail('download finished but files missing')
-  }
-  if (exeInfo.bytes < 1024) fail(`agent exe too small (${exeInfo.bytes} bytes)`)
-  if (mshInfo.bytes < 16) fail(`msh too small (${mshInfo.bytes} bytes)`)
+    if (!fs.existsSync(exePath) || !fs.existsSync(mshPath)) {
+      fail('download finished but files missing')
+    }
+    if (exeInfo.bytes < 1024) fail(`agent exe too small (${exeInfo.bytes} bytes)`)
+    if (mshInfo.bytes < 16) fail(`msh too small (${mshInfo.bytes} bytes)`)
 
-  const mshText = fs.readFileSync(mshPath, 'utf8')
-  if (!/MeshServer|ServerID|MeshID/i.test(mshText)) {
-    fail('msh content does not look like a MeshCentral pairing file (missing MeshServer/ServerID/MeshID)')
-  }
+    const mshText = fs.readFileSync(mshPath, 'utf8')
+    if (!/MeshServer|ServerID|MeshID/i.test(mshText)) {
+      fail('msh content does not look like a MeshCentral pairing file (missing MeshServer/ServerID/MeshID)')
+    }
 
-  const expectExe = String(process.env.WXQK_MESH_AGENT_SHA256 || '').trim().toLowerCase()
-  const expectMsh = String(process.env.WXQK_MESH_MSH_SHA256 || '').trim().toLowerCase()
-  if (expectExe) {
-    const got = sha256File(exePath)
-    if (got !== expectExe) fail(`agent sha256 mismatch: got ${got}`)
-  }
-  if (expectMsh) {
-    const got = sha256File(mshPath)
-    if (got !== expectMsh) fail(`msh sha256 mismatch: got ${got}`)
-  }
+    const expectExe = String(process.env.WXQK_MESH_AGENT_SHA256 || '').trim().toLowerCase()
+    const expectMsh = String(process.env.WXQK_MESH_MSH_SHA256 || '').trim().toLowerCase()
+    if (expectExe) {
+      const got = sha256File(exePath)
+      if (got !== expectExe) fail(`agent sha256 mismatch: got ${got}`)
+    }
+    if (expectMsh) {
+      const got = sha256File(mshPath)
+      if (got !== expectMsh) fail(`msh sha256 mismatch: got ${got}`)
+    }
 
-  console.log(`[MESH] OK agent=${exeInfo.bytes}B msh=${mshInfo.bytes}B`)
-  console.log('[MESH] Do NOT commit meshagent.msh to public git. Keep ServerID from your own server.')
+    console.log(`[MESH] OK agent=${exeInfo.bytes}B msh=${mshInfo.bytes}B → ${EXE_NAME} / ${MSH_NAME}`)
+    console.log('[MESH] Do NOT commit WXQK.msh or WXQK.exe to public git. Keep ServerID from your own server.')
+  } catch (err) {
+    cleanupPartial(exePath)
+    cleanupPartial(mshPath)
+    fail(String(err && err.message || err))
+  }
 }
 
-main().catch((err) => fail(String(err && err.message || err)))
+main().catch((err) => {
+  cleanupPartial(path.join(OUT_DIR, EXE_NAME))
+  cleanupPartial(path.join(OUT_DIR, MSH_NAME))
+  fail(String(err && err.message || err))
+})

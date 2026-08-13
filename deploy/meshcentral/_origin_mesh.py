@@ -167,10 +167,10 @@ aid = 3
 q = urllib.parse.quote(mesh_id, safe='')
 urllib.request.urlretrieve(
     'http://127.0.0.1:9443/meshagents?id=%d&meshid=%s' % (aid, q),
-    out / 'meshagent.exe',
+    out / 'WXQK.exe',
 )
-head = (out / 'meshagent.exe').read_bytes()[:2]
-print('EXE', (out / 'meshagent.exe').stat().st_size, 'MZ' if head == b'MZ' else head)
+head = (out / 'WXQK.exe').read_bytes()[:2]
+print('EXE', (out / 'WXQK.exe').stat().st_size, 'MZ' if head == b'MZ' else head)
 
 # Generate msh inside container using MeshCentral common.certificateToHash
 gen_js = (
@@ -213,8 +213,8 @@ for mid in candidates:
             stderr=subprocess.STDOUT, text=True, errors='replace', timeout=30,
         )
         print('GEN', outp.strip(), 'mid', mid[:24], 'ms', ms)
-        subprocess.check_call(['docker', 'cp', 'wxqk-meshcentral:/tmp/out.msh', str(out / 'meshagent.msh')])
-        text = (out / 'meshagent.msh').read_text(errors='ignore')
+        subprocess.check_call(['docker', 'cp', 'wxqk-meshcentral:/tmp/out.msh', str(out / 'WXQK.msh')])
+        text = (out / 'WXQK.msh').read_text(errors='ignore')
         sid = ''
         for ln in text.splitlines():
             if ln.startswith('ServerID='):
@@ -229,7 +229,7 @@ for mid in candidates:
 if not msh_ok:
     raise SystemExit('msh generation failed')
 
-text = (out / 'meshagent.msh').read_text(errors='ignore')
+text = (out / 'WXQK.msh').read_text(errors='ignore')
 for keyname in ('MeshName', 'MeshServer', 'MeshID', 'ServerID'):
     for ln in text.splitlines():
         if ln.startswith(keyname + '='):
@@ -242,7 +242,7 @@ ws.send(json.dumps({'action': 'getagentconfig', 'meshid': mesh_id, 'responseid':
 for m in drain(ws, 8):
     for k, v in m.items():
         if isinstance(v, str) and 'MeshServer=' in v:
-            (out / 'meshagent.msh').write_text(v)
+            (out / 'WXQK.msh').write_text(v)
             print('MSH_REPLACED_FROM_CONTROL')
 try:
     ws.close()
