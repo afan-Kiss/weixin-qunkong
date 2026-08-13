@@ -2,7 +2,7 @@
 
 /**
  * Portable handoff: helper waits NEW_VERSION_READY ACK, then COMMIT / ROLLBACK.
- * HANDOFF_TERMINAL_STATE_GATE: after old PID exits, only COMMITTED or ROLLED_BACK.
+ * After old PID is confirmed exited: converge to COMMITTED or ROLLED_BACK*.
  */
 
 const fs = require('fs')
@@ -16,7 +16,8 @@ const {
   writeReadyAck,
   readReady,
   validateReadyAck,
-  writeCommitted,
+  writeCommittedMarker,
+  setCommittedPhase,
   recordHighestCommittedReleaseSequence,
   loadHighestCommittedReleaseSequence,
   writeFailedUpdate,
@@ -31,6 +32,9 @@ const {
   readRollbackMeta,
   writeHandoffResult,
   writeApplyingLock,
+  clearApplyingLock,
+  clearGhostCommittedMarker,
+  abortHandoffOldStillRunning,
   hashFileSync,
   STABLE_LAUNCHER_NAME,
 } = require('./update-state.cjs')
@@ -52,16 +56,25 @@ function parseUpdateCliArgs(argv = process.argv) {
   return { updateId, afterUpdate, updateRollback }
 }
 
+function spawnDetached(spawnImpl, exePath, args, updateId) {
+  const child = spawnImpl(exePath, args, {
+    cwd: path.dirname(exePath),
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env: {
+      ...process.env,
+      PORTABLE_EXECUTABLE_FILE: exePath,
+      PORTABLE_EXECUTABLE_DIR: path.dirname(exePath),
+    },
+  })
+  child.unref()
+  return child
+}
+
 /**
- * Schedule detached helper that:
- * 1) waits old PID exit
- * 2) starts new with --after-update --update-id
- * 3) waits READY marker, validates via Node handoff-validate
- * 4) COMMIT + cleanup OR ROLLBACK old
- *
+ * Schedule detached helper.
  * ROLLBACK_ARTIFACT_GATE: artifact prepared before helper starts (old still running).
- *
- * @returns {{ helperPid: number, updateId: string, prepared: object, rollbackArtifact: object }}
  */
 function schedulePortableHandoff(options) {
   const {
@@ -78,7 +91,6 @@ function schedulePortableHandoff(options) {
   const stateDir = resolveUpdateStateDir(userDataPath)
   fs.mkdirSync(stateDir, { recursive: true })
 
-  // Must succeed while old process is still alive
   const rollbackArtifact = prepareRollbackArtifact(userDataPath, {
     updateId,
     oldExePath: currentExe,
@@ -134,6 +146,7 @@ function schedulePortableHandoff(options) {
 
   const commitJs = path.join(workDir, `handoff-commit-${process.pid}.cjs`)
   const rollbackJs = path.join(workDir, `handoff-rollback-${process.pid}.cjs`)
+  const abortJs = path.join(workDir, `handoff-abort-${process.pid}.cjs`)
 
   fs.writeFileSync(commitJs, `
 'use strict';
@@ -155,6 +168,15 @@ handoff.finalizeRollback(opts).then((r) => {
 }).catch((e) => { console.error(String(e && e.message || e)); process.exit(1); });
 `.trim(), 'utf8')
 
+  fs.writeFileSync(abortJs, `
+'use strict';
+const handoff = require(${JSON.stringify(handoffModulePath)});
+const opts = JSON.parse(process.argv[2] || '{}');
+const r = handoff.finalizeAbortOldStillRunning(opts);
+console.log(JSON.stringify(r));
+process.exit(r && r.ok ? 0 : 1);
+`.trim(), 'utf8')
+
   const commitPayloadBase = {
     userDataPath,
     updateId,
@@ -171,37 +193,80 @@ handoff.finalizeRollback(opts).then((r) => {
     ...commitPayloadBase,
     reason: 'NEW_READY_TIMEOUT',
   }
+  const abortPayloadBase = {
+    userDataPath,
+    updateId,
+    installDir,
+    reason: 'OLD_EXIT_TIMEOUT',
+  }
 
-  // PowerShell: after $oldExited=$true every failure goes through Invoke-Rollback (never bare exit 1).
   const script = [
-    'param([int]$ParentPid,[string]$CurrentExe,[string]$FinalPath,[string]$DownloadPath,[string]$ExpectedSha256,[string]$LogPath,[string]$ReadyPath,[string]$PreparedPath,[string]$UpdateId,[int]$ReadyTimeoutSec,[string]$CommitJs,[string]$RollbackJs,[string]$CommitJson,[string]$RollbackJson,[string]$ElectronExe,[string]$ValidateJs,[string]$UserDataPath)',
+    'param([int]$ParentPid,[string]$CurrentExe,[string]$FinalPath,[string]$DownloadPath,[string]$ExpectedSha256,[string]$LogPath,[string]$ReadyPath,[string]$PreparedPath,[string]$UpdateId,[int]$ReadyTimeoutSec,[string]$CommitJs,[string]$RollbackJs,[string]$AbortJs,[string]$CommitJson,[string]$RollbackJson,[string]$AbortJson,[string]$ElectronExe,[string]$ValidateJs,[string]$UserDataPath)',
     "$ErrorActionPreference = 'Stop'",
     '$oldExited = $false',
     '$newPid = 0',
     'function Log([string]$Message) { Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value ((Get-Date -Format o) + " " + $Message) }',
+    'function Test-ProcessAlive([int]$ProcId) {',
+    '  if ($ProcId -le 0) { return $false }',
+    '  try { $p = Get-Process -Id $ProcId -ErrorAction SilentlyContinue; return ($null -ne $p) } catch { return $false }',
+    '}',
+    'function Confirm-OldProcessExited([int]$ProcId, [int]$ExtraPolls) {',
+    '  for ($i = 0; $i -lt $ExtraPolls; $i++) {',
+    '    if (-not (Test-ProcessAlive $ProcId)) { return $true }',
+    '    Start-Sleep -Milliseconds 500',
+    '  }',
+    '  return -not (Test-ProcessAlive $ProcId)',
+    '}',
     'function RunNode([string]$Script,[string]$Json) {',
     '  $env:ELECTRON_RUN_AS_NODE = "1"',
     '  & $ElectronExe $Script $Json',
     '  return $LASTEXITCODE',
     '}',
+    'function Invoke-AbortOldStillRunning([string]$Reason) {',
+    '  Log ("OLD still running — abort handoff reason=" + $Reason)',
+    '  try {',
+    '    $ab = $AbortJson | ConvertFrom-Json',
+    '    $ab.reason = $Reason',
+    '    $abJson = ($ab | ConvertTo-Json -Compress -Depth 8)',
+    '    $null = RunNode $AbortJs $abJson',
+    '  } catch { Log ("abort invoke error: " + $_.Exception.Message) }',
+    '  exit 2',
+    '}',
     'function Invoke-Rollback([string]$Reason) {',
     '  Log ("Invoke-Rollback reason=" + $Reason + " oldExited=" + $oldExited + " newPid=" + $newPid)',
+    '  if (-not $oldExited) {',
+    '    Log "refuse rollback before old exit confirmation"',
+    '    Invoke-AbortOldStillRunning "ROLLBACK_BEFORE_OLD_EXIT"',
+    '  }',
     '  try { if ($newPid -gt 0) { $np = Get-Process -Id $newPid -ErrorAction SilentlyContinue; if ($np -and -not $np.HasExited) { Stop-Process -Id $newPid -Force -ErrorAction SilentlyContinue } } } catch {}',
+    '  $rbCode = 1',
     '  try {',
     '    $rb = $RollbackJson | ConvertFrom-Json',
     '    $rb.reason = $Reason',
     '    if ($newPid -gt 0) { $rb.newPid = $newPid }',
     '    $rbJson = ($rb | ConvertTo-Json -Compress -Depth 8)',
-    '    $null = RunNode $RollbackJs $rbJson',
+    '    $rbCode = RunNode $RollbackJs $rbJson',
     '  } catch {',
     '    Log ("rollback invoke error: " + $_.Exception.Message)',
+    '    $rbCode = 1',
     '  }',
-    '  exit 1',
+    '  if ($rbCode -eq 0) { Log "rollback complete"; exit 1 }',
+    '  Log ("ROLLBACK_FALLBACK: node rollback failed code=" + $rbCode)',
+    '  try {',
+    '    $rb2 = $RollbackJson | ConvertFrom-Json',
+    '    $rb2.reason = $Reason',
+    '    $rb2.forceFallback = $true',
+    '    $rb2Json = ($rb2 | ConvertTo-Json -Compress -Depth 8)',
+    '    $rbCode2 = RunNode $RollbackJs $rb2Json',
+    '    if ($rbCode2 -eq 0) { Log "rollback fallback complete"; exit 1 }',
+    '  } catch { Log ("rollback fallback error: " + $_.Exception.Message) }',
+    '  Log "FAILED_UNRECOVERABLE after rollback fallbacks"',
+    '  exit 3',
     '}',
     'Log "handoff wait old exit parent=$ParentPid updateId=$UpdateId"',
     'try { Wait-Process -Id $ParentPid -Timeout 120 -ErrorAction SilentlyContinue } catch {}',
-    'for ($i = 0; $i -lt 120; $i++) {',
-    '  try { if (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500; continue }; break } catch { break }',
+    'if (-not (Confirm-OldProcessExited -ProcId $ParentPid -ExtraPolls 120)) {',
+    '  Invoke-AbortOldStillRunning "OLD_EXIT_TIMEOUT"',
     '}',
     '$oldExited = $true',
     'Log "old exited confirmed"',
@@ -266,8 +331,10 @@ handoff.finalizeRollback(opts).then((r) => {
     String(Math.ceil(readyTimeoutMs / 1000)),
     commitJs,
     rollbackJs,
+    abortJs,
     JSON.stringify(commitPayloadBase),
     JSON.stringify(rollbackPayloadBase),
+    JSON.stringify(abortPayloadBase),
     electronExe,
     validateJs,
     String(userDataPath || ''),
@@ -282,9 +349,16 @@ handoff.finalizeRollback(opts).then((r) => {
   return { helperPid: child.pid, updateId, prepared, rollbackArtifact }
 }
 
+function finalizeAbortOldStillRunning(opts) {
+  return abortHandoffOldStillRunning(String(opts.userDataPath || ''), {
+    updateId: opts.updateId,
+    reason: opts.reason || 'OLD_EXIT_TIMEOUT',
+    installDir: opts.installDir || path.dirname(String(opts.finalPath || opts.currentExe || '')),
+  })
+}
+
 /**
- * Called by helper after READY ACK fully validated.
- * Order: validate → verify SHA → launch entries → pointer → committed → highest seq.
+ * Order: validate → SHA → launch entries → highest committed → committed marker → phase.
  */
 async function finalizeCommit(opts) {
   const userDataPath = String(opts.userDataPath || '')
@@ -340,26 +414,39 @@ async function finalizeCommit(opts) {
     return { ok: false, reason: entries.reason || 'LAUNCH_ENTRY_COMMIT_FAILED', entries }
   }
 
-  // COMMITTED marker last among commit-critical writes (after launch entries + pointer)
-  const committed = writeCommitted(userDataPath, committedDraft)
-  recordHighestCommittedReleaseSequence(committed.releaseSequence, userDataPath)
-  clearFailedUpdate(userDataPath)
+  if (opts.injectHighestWriteFail) {
+    return { ok: false, reason: 'HIGHEST_COMMITTED_WRITE_FAILED' }
+  }
 
-  // CLEANUP_BEST_EFFORT
+  try {
+    recordHighestCommittedReleaseSequence(committedDraft.releaseSequence, userDataPath)
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'HIGHEST_COMMITTED_WRITE_FAILED',
+      error: String(error && error.message || error),
+    }
+  }
+
+  // COMMITTED marker only after highest seq persisted
+  const committed = writeCommittedMarker(userDataPath, committedDraft)
+  clearFailedUpdate(userDataPath)
+  clearApplyingLock(userDataPath)
+  setCommittedPhase(userDataPath, updateId)
+
   try {
     cleanupOldVersionedExes(installDir, {
       keepPaths: [committed.exePath, committed.oldExePath, entries.stableLauncher.path],
       maxExtras: 0,
     })
-  } catch { /* ignore */ }
+  } catch { /* CLEANUP_BEST_EFFORT */ }
 
   writeHandoffResult(userDataPath, { updateId, result: 'COMMITTED' })
-  setPhase(userDataPath, PHASE.COMMITTED, { updateId })
   return { ok: true, committed, entries, stableLauncher: entries.stableLauncher.path }
 }
 
 /**
- * Rollback to old EXE using rollback artifact (never rely solely on possibly overwritten old entry).
+ * Multi-level rollback: original entry → artifact direct → stable launcher.
  */
 async function finalizeRollback(opts) {
   const userDataPath = String(opts.userDataPath || '')
@@ -367,6 +454,9 @@ async function finalizeRollback(opts) {
   const updateId = String(opts.updateId || prepared?.updateId || '')
   const reason = String(opts.reason || 'NEW_READY_TIMEOUT')
   const highestBefore = loadHighestCommittedReleaseSequence(userDataPath)
+  const spawnImpl = typeof opts.spawnImpl === 'function' ? opts.spawnImpl : spawn
+
+  const ghost = clearGhostCommittedMarker(userDataPath, { updateId })
 
   writeFailedUpdate(userDataPath, {
     updateId,
@@ -380,67 +470,181 @@ async function finalizeRollback(opts) {
 
   const oldExe = String(opts.currentExe || prepared?.oldExePath || '')
   const installDir = path.dirname(String(opts.finalPath || prepared?.exePath || oldExe))
+  const meta = readRollbackMeta(userDataPath, updateId)
+  const rawArtifact = String(
+    opts.rollbackArtifactPath
+    || prepared?.rollbackArtifactPath
+    || meta?.artifactPath
+    || '',
+  ).trim()
+  const artifact = rawArtifact ? path.resolve(rawArtifact) : ''
+  const expectedRollbackSha = String(meta?.sha256 || prepared?.rollbackSha256 || '').toLowerCase()
 
-  const restored = restoreOriginalEntryFromArtifact(userDataPath, {
-    updateId,
-    oldExePath: oldExe,
-  })
-  if (!restored.ok) {
-    writeHandoffResult(userDataPath, { updateId, result: 'FAILED', reason: restored.reason || 'rollback_restore_failed' })
-    setPhase(userDataPath, PHASE.FAILED, { updateId, reason: restored.reason })
-    return { ok: false, reason: restored.reason || 'rollback_restore_failed', highestCommitted: highestBefore }
+  const recovery = {
+    artifact,
+    oldExe,
+    stableLauncher: path.join(installDir, STABLE_LAUNCHER_NAME),
+    ghostCleared: Boolean(ghost.removed),
   }
 
-  // Prefer restarting restored original entry; fall back to artifact path
-  const launchPath = (oldExe && fs.existsSync(oldExe)) ? oldExe : restored.artifact
-  writeInstallCurrentPointers(installDir, {
-    pending: null,
-    current: {
-      currentPortableExePath: path.resolve(launchPath),
-      rolledBackAt: new Date().toISOString(),
+  function verifyArtifact() {
+    if (!artifact || !fs.existsSync(artifact)) {
+      return { ok: false, reason: 'rollback_artifact_missing' }
+    }
+    try {
+      if (!fs.statSync(artifact).isFile()) {
+        return { ok: false, reason: 'rollback_artifact_not_file' }
+      }
+    } catch {
+      return { ok: false, reason: 'rollback_artifact_missing' }
+    }
+    const actual = hashFileSync(artifact).toLowerCase()
+    if (expectedRollbackSha && actual !== expectedRollbackSha) {
+      return { ok: false, reason: 'rollback_artifact_sha_mismatch', actual, expected: expectedRollbackSha }
+    }
+    return { ok: true, sha256: actual }
+  }
+
+  // Level 1: restore original entry + restart
+  if (!opts.skipLevel1) {
+    const restored = restoreOriginalEntryFromArtifact(userDataPath, {
       updateId,
-      sha256: restored.sha256,
-    },
-  })
-
-  if (launchPath && fs.existsSync(launchPath)) {
-    const spawnImpl = typeof opts.spawnImpl === 'function' ? opts.spawnImpl : spawn
-    const child = spawnImpl(launchPath, ['--update-rollback', `--update-id=${updateId}`], {
-      cwd: path.dirname(launchPath),
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-      env: {
-        ...process.env,
-        PORTABLE_EXECUTABLE_FILE: launchPath,
-        PORTABLE_EXECUTABLE_DIR: path.dirname(launchPath),
-      },
+      oldExePath: oldExe,
     })
-    child.unref()
-    if (!child.pid) {
-      writeHandoffResult(userDataPath, { updateId, result: 'FAILED', reason: 'rollback_spawn_failed' })
-      setPhase(userDataPath, PHASE.FAILED, { updateId, reason: 'rollback_spawn_failed' })
-      return { ok: false, reason: 'rollback_spawn_failed', highestCommitted: highestBefore }
-    }
-    writeHandoffResult(userDataPath, { updateId, result: 'ROLLED_BACK', reason })
-    setPhase(userDataPath, PHASE.ROLLED_BACK, { updateId, oldPid: child.pid })
-    return {
-      ok: true,
-      oldPid: child.pid,
-      reason,
-      launchPath,
-      restored,
-      highestCommitted: loadHighestCommittedReleaseSequence(userDataPath),
+    if (restored.ok) {
+      writeInstallCurrentPointers(installDir, {
+        pending: null,
+        current: {
+          currentPortableExePath: path.resolve(oldExe),
+          rolledBackAt: new Date().toISOString(),
+          updateId,
+          sha256: restored.sha256,
+        },
+      })
+      try {
+        const child = spawnDetached(spawnImpl, oldExe, ['--update-rollback', `--update-id=${updateId}`], updateId)
+        if (child.pid) {
+          writeHandoffResult(userDataPath, { updateId, result: 'ROLLED_BACK', reason })
+          setPhase(userDataPath, PHASE.ROLLED_BACK, { updateId, oldPid: child.pid, level: 1 })
+          return {
+            ok: true,
+            result: 'ROLLED_BACK',
+            oldPid: child.pid,
+            reason,
+            launchPath: oldExe,
+            level: 1,
+            recovery,
+            highestCommitted: loadHighestCommittedReleaseSequence(userDataPath),
+          }
+        }
+      } catch (error) {
+        recovery.level1Error = String(error && error.message || error)
+      }
+    } else {
+      recovery.level1 = restored
     }
   }
-  writeHandoffResult(userDataPath, { updateId, result: 'FAILED', reason: 'old_missing' })
-  setPhase(userDataPath, PHASE.FAILED, { updateId, reason: 'old_missing' })
-  return { ok: false, reason: 'old_missing', highestCommitted: highestBefore }
+
+  // Level 2: direct verified rollback artifact
+  const artCheck = verifyArtifact()
+  if (artCheck.ok) {
+    try {
+      const child = spawnDetached(spawnImpl, artifact, ['--update-rollback', `--update-id=${updateId}`], updateId)
+      if (child.pid) {
+        writeInstallCurrentPointers(installDir, {
+          pending: null,
+          current: {
+            currentPortableExePath: path.resolve(artifact),
+            rolledBackAt: new Date().toISOString(),
+            updateId,
+            sha256: artCheck.sha256,
+            note: 'ROLLED_BACK_ARTIFACT_DIRECT',
+          },
+        })
+        writeHandoffResult(userDataPath, {
+          updateId,
+          result: 'ROLLED_BACK_ARTIFACT_DIRECT',
+          reason,
+        })
+        setPhase(userDataPath, PHASE.ROLLED_BACK, { updateId, oldPid: child.pid, level: 2 })
+        return {
+          ok: true,
+          result: 'ROLLED_BACK_ARTIFACT_DIRECT',
+          oldPid: child.pid,
+          reason,
+          launchPath: artifact,
+          level: 2,
+          recovery,
+          highestCommitted: highestBefore,
+        }
+      }
+    } catch (error) {
+      recovery.level2Error = String(error && error.message || error)
+    }
+  } else {
+    recovery.level2 = artCheck
+  }
+
+  // Level 3: restore stable launcher from artifact + restart
+  if (artCheck.ok) {
+    const stable = path.join(installDir, STABLE_LAUNCHER_NAME)
+    try {
+      fs.copyFileSync(artifact, stable)
+      const stableSha = hashFileSync(stable).toLowerCase()
+      if (stableSha !== artCheck.sha256) {
+        recovery.level3 = { ok: false, reason: 'stable_sha_mismatch' }
+      } else {
+        const child = spawnDetached(spawnImpl, stable, ['--update-rollback', `--update-id=${updateId}`], updateId)
+        if (child.pid) {
+          writeInstallCurrentPointers(installDir, {
+            pending: null,
+            current: {
+              currentPortableExePath: path.resolve(stable),
+              rolledBackAt: new Date().toISOString(),
+              updateId,
+              sha256: stableSha,
+              note: 'ROLLED_BACK_STABLE_LAUNCHER',
+            },
+          })
+          writeHandoffResult(userDataPath, {
+            updateId,
+            result: 'ROLLED_BACK_STABLE_LAUNCHER',
+            reason,
+          })
+          setPhase(userDataPath, PHASE.ROLLED_BACK, { updateId, oldPid: child.pid, level: 3 })
+          return {
+            ok: true,
+            result: 'ROLLED_BACK_STABLE_LAUNCHER',
+            oldPid: child.pid,
+            reason,
+            launchPath: stable,
+            level: 3,
+            recovery,
+            highestCommitted: highestBefore,
+          }
+        }
+      }
+    } catch (error) {
+      recovery.level3Error = String(error && error.message || error)
+    }
+  }
+
+  writeHandoffResult(userDataPath, {
+    updateId,
+    result: 'FAILED_UNRECOVERABLE',
+    reason: 'ALL_ROLLBACK_FALLBACKS_FAILED',
+  })
+  setPhase(userDataPath, PHASE.FAILED, { updateId, reason: 'FAILED_UNRECOVERABLE' })
+  // Keep rollback artifact; do not delete recovery paths
+  return {
+    ok: false,
+    result: 'FAILED_UNRECOVERABLE',
+    reason: 'ALL_ROLLBACK_FALLBACKS_FAILED',
+    recovery,
+    highestCommitted: highestBefore,
+  }
 }
 
-/**
- * New process: after critical startup, write READY ACK.
- */
 function emitNewVersionReadyAck(options = {}) {
   const cli = parseUpdateCliArgs(options.argv || process.argv)
   if (!cli.afterUpdate && !options.force) return { ok: false, reason: 'not_after_update' }
@@ -471,6 +675,7 @@ module.exports = {
   schedulePortableHandoff,
   finalizeCommit,
   finalizeRollback,
+  finalizeAbortOldStillRunning,
   emitNewVersionReadyAck,
   validateReadyAck,
   prepareRollbackArtifact,

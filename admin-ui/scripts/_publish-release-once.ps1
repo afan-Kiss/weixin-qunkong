@@ -4,7 +4,8 @@
 param(
   [Parameter(Mandatory = $true)][string]$BaseUrl,
   [Parameter(Mandatory = $true)][string]$ExePath,
-  [Parameter(Mandatory = $true)][string]$Password,
+  # Deprecated: do not pass secrets on the command line. Prefer WXQK_PUBLISH_PASSWORD env.
+  [string]$Password = '',
   [switch]$Mandatory,
   [string[]]$TargetClientIds = @(),
   [int]$Concurrency = 4,
@@ -15,6 +16,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+
+if (-not $Password) { $Password = [string]$env:WXQK_PUBLISH_PASSWORD }
+if (-not $Password) { throw 'Missing publish credential' }
 
 # Default: system TLS verification. TrustAllCertsPolicy only when -InsecureTls is explicit.
 if ($InsecureTls.IsPresent) {
@@ -52,10 +56,15 @@ $preferredChunk = [int64]$PreferredChunkMB * 1MB
 Write-Host "Publish: $fileName -> $base (buildId=$buildId version=$version size=$fileSize)"
 
 $loginBody = (@{ password = $Password } | ConvertTo-Json -Compress)
-$login = Invoke-RestMethod -Method Post -Uri "$base/api/login" -ContentType 'application/json; charset=utf-8' -Body $loginBody -TimeoutSec 30
+try {
+  $login = Invoke-RestMethod -Method Post -Uri "$base/api/login" -ContentType 'application/json; charset=utf-8' -Body $loginBody -TimeoutSec 30
+} catch {
+  throw 'publish login failed'
+}
 $token = [string]($login.token)
-if (-not $token) { throw "login failed: $($login | ConvertTo-Json -Compress)" }
+if (-not $token) { throw 'publish login failed' }
 $headers = @{ 'X-Admin-Token' = $token }
+# Never log password / request body / token
 
 $initObj = @{
   buildId = $buildId

@@ -1,12 +1,14 @@
 #Requires -Version 5.1
 # One-command release: bump (optional) → package portable → publish to update channel.
 param(
-  [string]$BaseUrl = 'https://mesh.example.invalid/wxqk',
-  [string]$Password = $env:WXQK_PUBLISH_PASSWORD,
+  [string]$BaseUrl = '',
+  # Deprecated CLI secret: prefer WXQK_PUBLISH_PASSWORD env inherited by child process.
+  [string]$Password = '',
   [switch]$Mandatory,
   [switch]$SkipBump,
   [switch]$SkipPackage,
   [string]$ExePath = '',
+  [string[]]$TargetClientIds = @(),
   [int]$Concurrency = 4,
   [int]$PreferredChunkMB = 4,
   [switch]$InsecureTls
@@ -21,8 +23,25 @@ if (-not $env:ELECTRON_MIRROR -or -not $env:ELECTRON_MIRROR.Trim()) {
   $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
 }
 
-if (-not $Password) {
-  throw 'Missing password. Pass -Password or set env WXQK_PUBLISH_PASSWORD.'
+if ($Password) {
+  Write-Warning 'Do not pass -Password on the command line; use WXQK_PUBLISH_PASSWORD env only.'
+  if (-not $env:WXQK_PUBLISH_PASSWORD) { $env:WXQK_PUBLISH_PASSWORD = $Password }
+}
+if (-not $env:WXQK_PUBLISH_PASSWORD) {
+  throw 'Missing publish credential (set WXQK_PUBLISH_PASSWORD in the environment).'
+}
+
+if (-not $BaseUrl) {
+  $resolved = & node (Join-Path $PSScriptRoot 'resolve-production-base.cjs')
+  if ($LASTEXITCODE -ne 0 -or -not $resolved) {
+    throw 'Failed to resolve canonical production BaseUrl from secure-config'
+  }
+  $BaseUrl = ([string]$resolved).Trim()
+}
+Write-Host ("== publish BaseUrl host: {0} ==" -f ([uri]$BaseUrl).Host)
+Write-Host ("== TLS verification: {0} ==" -f (-not $InsecureTls.IsPresent))
+if ($TargetClientIds -and $TargetClientIds.Count -gt 0) {
+  Write-Host ("== targetClientIds: {0} ==" -f ($TargetClientIds -join ','))
 }
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -173,17 +192,27 @@ $useInsecureTls = [bool]$InsecureTls.IsPresent
 if ($useInsecureTls) {
   Write-Warning 'HIGH RISK: -InsecureTls disables TLS certificate verification. Production must NOT use this switch. Prefer a publicly trusted certificate (e.g. Let''s Encrypt IP cert).'
 }
+# Password travels only via inherited env WXQK_PUBLISH_PASSWORD — never argv.
 $publishArgs = @(
   '-NoProfile', '-ExecutionPolicy', 'Bypass',
   '-File', (Join-Path $PSScriptRoot '_publish-release-once.ps1'),
   '-BaseUrl', $BaseUrl,
   '-ExePath', $exe,
-  '-Password', $Password,
   '-Concurrency', "$Concurrency",
   '-PreferredChunkMB', "$PreferredChunkMB"
 )
 if ($Mandatory) { $publishArgs += '-Mandatory' }
 if ($useInsecureTls) { $publishArgs += '-InsecureTls' }
+if ($TargetClientIds -and $TargetClientIds.Count -gt 0) {
+  $publishArgs += '-TargetClientIds'
+  foreach ($cid in $TargetClientIds) { $publishArgs += [string]$cid }
+}
+# Guard: never allow secret or -Password in child argv
+$joinedArgs = ($publishArgs -join ' ')
+if ($joinedArgs -match '(?i)-Password\b') { throw 'Refusing to launch publisher with -Password in argv' }
+if ($env:WXQK_PUBLISH_PASSWORD -and $joinedArgs.Contains([string]$env:WXQK_PUBLISH_PASSWORD)) {
+  throw 'Refusing to launch publisher with secret embedded in argv'
+}
 & powershell @publishArgs
 if ($LASTEXITCODE -ne 0) { throw "publish failed: $LASTEXITCODE" }
 

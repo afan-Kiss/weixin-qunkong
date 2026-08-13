@@ -5961,6 +5961,22 @@ app.whenReady().then(async () => {
     initStorage(app.getPath('userData'))
     afterUpdateStorageReady = true
     markStartup('storage initialized')
+
+    // TEST ONLY: controlled bad-build exits after storage, before READY ACK
+    {
+      const cliAfter = parseUpdateCliArgs(process.argv)
+      let testFailBeforeReady = process.env.WXQK_TEST_FAIL_BEFORE_READY === '1'
+      try {
+        const flags = require('./wxqk-test-flags.cjs')
+        if (flags && flags.failBeforeReady) testFailBeforeReady = true
+      } catch { /* ignore */ }
+      if (cliAfter.afterUpdate && testFailBeforeReady) {
+        appLog('ERROR', '[UPDATE] TEST_FAIL_BEFORE_READY — exiting before READY ACK', { code: 23 })
+        try { app.exit(23) } catch { process.exit(23) }
+        return
+      }
+    }
+
     softwareAuth.initSoftwareAuth(app.getPath('userData'))
     markStartup('auth initialized')
     // 尽早注册 IPC：后续步骤失败时登录页仍能拿到 auth:login 等通道
@@ -5971,6 +5987,15 @@ app.whenReady().then(async () => {
     try {
       const updateState = require('./update-state.cjs')
       const updateHandoff = require('./update-handoff.cjs')
+      try {
+        const cleaned = updateState.reconcileConflictingMarkers(app.getPath('userData'))
+        if (cleaned.cleaned) {
+          appLog('WARN', '[UPDATE] STALE_COMMITTED_MARKER_REMOVED', {
+            updateId: cleaned.updateId || '',
+            reason: cleaned.reason || '',
+          })
+        }
+      } catch { /* ignore */ }
       const stale = updateState.inspectStaleApplying(app.getPath('userData'))
       if (stale.stale && stale.action === 'rollback') {
         const prepared = updateState.readPrepared(app.getPath('userData'))

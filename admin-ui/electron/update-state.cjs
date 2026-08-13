@@ -34,6 +34,7 @@ const PHASE = Object.freeze({
   COMMITTED: 'COMMITTED',
   ROLLING_BACK: 'ROLLING_BACK',
   ROLLED_BACK: 'ROLLED_BACK',
+  ABORTED: 'ABORTED',
   FAILED: 'FAILED',
 })
 
@@ -356,7 +357,11 @@ async function waitForReadyAck(userDataDir, prepared, options = {}) {
   return { ok: false, reason: 'NEW_READY_TIMEOUT', waitedMs: Date.now() - started, ready: readReady(userDataDir) }
 }
 
-function writeCommitted(userDataDir, payload) {
+/**
+ * Write committed.json only — do NOT clear lock or set phase here.
+ * COMMITTED marker must be after highest-committed persistence.
+ */
+function writeCommittedMarker(userDataDir, payload) {
   const dir = ensureStateDir(userDataDir)
   const row = {
     schema: 1,
@@ -368,12 +373,81 @@ function writeCommitted(userDataDir, payload) {
     buildId: String(payload.buildId || ''),
     releaseSequence: Number(payload.releaseSequence || 0) || 0,
     sha256: String(payload.sha256 || '').toLowerCase(),
-    committedAt: new Date().toISOString(),
+    committedAt: String(payload.committedAt || new Date().toISOString()),
   }
   writeJson(path.join(dir, COMMITTED_FILE), row)
-  try { fs.unlinkSync(path.join(dir, APPLYING_LOCK)) } catch { /* ignore */ }
-  setPhase(userDataDir, PHASE.COMMITTED, { updateId: row.updateId })
   return row
+}
+
+function setCommittedPhase(userDataDir, updateId) {
+  setPhase(userDataDir, PHASE.COMMITTED, { updateId: String(updateId || '') })
+}
+
+/** @deprecated Prefer writeCommittedMarker + setCommittedPhase + clearApplyingLock */
+function writeCommitted(userDataDir, payload) {
+  const row = writeCommittedMarker(userDataDir, payload)
+  clearApplyingLock(userDataDir)
+  setCommittedPhase(userDataDir, row.updateId)
+  return row
+}
+
+/**
+ * Remove ghost committed.json for a failed/rolled-back updateId.
+ */
+function clearGhostCommittedMarker(userDataDir, { updateId } = {}) {
+  const uid = String(updateId || '')
+  const committed = readCommitted(userDataDir)
+  if (!committed) return { removed: false }
+  if (uid && String(committed.updateId || '') !== uid) return { removed: false }
+  const hr = readHandoffResult(userDataDir)
+  if (hr && hr.result === 'COMMITTED' && String(hr.updateId || '') === String(committed.updateId || '')) {
+    return { removed: false }
+  }
+  try {
+    fs.unlinkSync(path.join(resolveUpdateStateDir(userDataDir), COMMITTED_FILE))
+  } catch {
+    return { removed: false, reason: 'unlink_failed' }
+  }
+  return { removed: true, reason: 'STALE_COMMITTED_MARKER_REMOVED', updateId: committed.updateId }
+}
+
+/**
+ * Startup: phase/handoff say rolled back but committed.json still points at same updateId.
+ */
+function reconcileConflictingMarkers(userDataDir) {
+  const phase = String(getPhase(userDataDir).phase || '')
+  const hr = readHandoffResult(userDataDir)
+  const hrResult = String(hr?.result || '')
+  const rolled = phase === PHASE.ROLLED_BACK
+    || phase === PHASE.ABORTED
+    || hrResult.startsWith('ROLLED_BACK')
+    || hrResult === 'ABORTED_OLD_STILL_RUNNING'
+    || hrResult === 'FAILED_UNRECOVERABLE'
+  if (!rolled) return { cleaned: false }
+  const ghost = clearGhostCommittedMarker(userDataDir, { updateId: hr?.updateId })
+  return { cleaned: Boolean(ghost.removed), ...ghost }
+}
+
+function abortHandoffOldStillRunning(userDataDir, {
+  updateId,
+  reason = 'OLD_EXIT_TIMEOUT',
+  installDir = '',
+} = {}) {
+  const uid = String(updateId || '')
+  writeHandoffResult(userDataDir, {
+    updateId: uid,
+    result: 'ABORTED_OLD_STILL_RUNNING',
+    reason: String(reason || 'OLD_EXIT_TIMEOUT'),
+  })
+  clearApplyingLock(userDataDir)
+  setPhase(userDataDir, PHASE.ABORTED, { updateId: uid, reason: String(reason || 'OLD_EXIT_TIMEOUT') })
+  if (installDir) {
+    try {
+      const current = readInstallCurrent(installDir)
+      writeInstallCurrentPointers(installDir, { pending: null, current: current || undefined })
+    } catch { /* ignore */ }
+  }
+  return { ok: true, result: 'ABORTED_OLD_STILL_RUNNING', reason }
 }
 
 function readCommitted(userDataDir) {
@@ -395,7 +469,13 @@ function recordHighestCommittedReleaseSequence(seq, userDataDir) {
     highestCommittedReleaseSequence: value,
     updatedAt: new Date().toISOString(),
   })
-  return value
+  const readBack = loadHighestCommittedReleaseSequence(userDataDir)
+  if (readBack < value) {
+    const err = new Error('HIGHEST_COMMITTED_WRITE_FAILED')
+    err.code = 'HIGHEST_COMMITTED_WRITE_FAILED'
+    throw err
+  }
+  return readBack
 }
 
 function writeFailedUpdate(userDataDir, payload) {
@@ -682,6 +762,11 @@ module.exports = {
   validateReadyAck,
   waitForReadyAck,
   writeCommitted,
+  writeCommittedMarker,
+  setCommittedPhase,
+  clearGhostCommittedMarker,
+  reconcileConflictingMarkers,
+  abortHandoffOldStillRunning,
   readCommitted,
   loadHighestCommittedReleaseSequence,
   recordHighestCommittedReleaseSequence,
