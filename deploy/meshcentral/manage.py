@@ -691,7 +691,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     synced: dict = {}
     if key_ok and public:
         try:
-            sys.path.insert(0, str((HERE.parents[1] / "server" / "wxqk").resolve()))
+            candidates = [
+                HERE.parent,  # flat deploy: /opt/wxqk/meshcentral -> /opt/wxqk
+                HERE.parents[1] / "server" / "wxqk",  # repo layout
+                Path("/opt/wxqk"),
+            ]
+            for cand in candidates:
+                if (cand / "meshcentral_client.py").is_file():
+                    sys.path.insert(0, str(cand.resolve()))
+                    break
             os.environ["WXQK_MESH_ENABLED"] = "1"
             os.environ["WXQK_MESH_URL"] = public
             os.environ["WXQK_MESH_INTERNAL_URL"] = internal
