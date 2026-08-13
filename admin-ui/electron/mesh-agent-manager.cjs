@@ -17,6 +17,7 @@ const { spawn, execFile } = require('child_process')
 const { promisify } = require('util')
 const serviceHealth = require('./mesh-service-health.cjs')
 const agentArtifact = require('./mesh-agent-artifact.cjs')
+const { withAgentLifecycleLock } = require('./agent-lifecycle-lock.cjs')
 
 const execFileAsync = promisify(execFile)
 
@@ -1023,6 +1024,37 @@ async function getMeshAgentStatus() {
     status = 'broken'
   }
 
+  // When CIM reports a PID, verify ExecutablePath matches branded WXQK.exe
+  let executablePath = ''
+  let processGate = { gate: 'WAIT', code: 'UNCHECKED' }
+  if (
+    healthSvc.state === 'running'
+    && Number(healthSvc.processId || 0) > 0
+    && !deps.serviceHealth
+    && !deps.forceScServiceQuery
+    && healthSvc.source === 'cim'
+  ) {
+    try {
+      const proc = await serviceHealth.queryProcessExecutablePath(healthSvc.processId, {
+        platform: deps.platform || process.platform,
+        execFile: deps.execFile || execFile,
+      })
+      executablePath = proc.path || ''
+    } catch { /* ignore */ }
+  }
+  processGate = serviceHealth.evaluateProcessGate({
+    state: healthSvc.state,
+    processId: healthSvc.processId,
+    processIdKnown: healthSvc.processIdKnown === true || healthSvc.source === 'cim',
+    pathName: imagePath,
+    executablePath,
+    expectedExePath: expected.exePath,
+    source: healthSvc.source,
+  })
+  if (processGate.code === 'PROCESS_MISMATCH' && status === 'running') {
+    status = 'process_mismatch'
+  }
+
   const versionInfo = installedExePresent || packagedExePresent
     ? await getMeshAgentVersion()
     : { ok: false, version: '', message: 'wxqk_agent_missing' }
@@ -1040,12 +1072,17 @@ async function getMeshAgentStatus() {
     serviceState: service.state,
     startMode: healthSvc.startMode || '',
     processId: healthSvc.processId || 0,
+    processIdKnown: healthSvc.processIdKnown !== false && healthSvc.source !== 'sc',
+    executablePath,
+    processGate,
     imagePath,
     imagePathOk,
     outdatedAgent: outdated,
     packagedSha256: packagedFp.sha256 || '',
     installedSha256: installedFp.sha256 || '',
+    packagedMetaMismatch: Boolean(packagedFp.metaMismatch),
     serviceHealth: healthSvc,
+    serviceHealthSource: healthSvc.source || '',
     serviceName: SERVICE_NAME,
     serviceDisplayName: SERVICE_DISPLAY_NAME,
     version: versionInfo.version || '',
@@ -1477,13 +1514,95 @@ async function upgradeMeshAgent(options = {}) {
 }
 
 /**
+ * Prefer MSH-only identity repair when EXE is current (avoid full binary reinstall).
+ * Restarts service so Agent reloads agentName.
+ * @param {{ clientId: string }} options
+ */
+async function repairMshIdentityOnly(options = {}) {
+  const clientId = safeClientIdForAgent(options.clientId)
+  if (!clientId) {
+    return { ok: false, code: 'BAD_CLIENT_ID', message: 'clientId 无效' }
+  }
+  const expected = buildAgentName(clientId)
+  log('WARN', 'IDENTITY_AGENT_MISMATCH — msh-only repair', { expected })
+  const stagingDir = path.join(os.tmpdir(), `wxqk-msh-fix-${Date.now()}`)
+  const staged = stageMshForClient({
+    clientId,
+    stagingDir,
+    templateMshPath: resolveMeshAgentPaths().mshPath,
+  })
+  if (!staged.ok) {
+    return { ok: false, code: staged.code, message: staged.message, action: 'msh_repair' }
+  }
+  // Prefer rewriting from installed msh when present (preserve live MeshServer/ServerID/MeshID)
+  const installed = resolveInstalledMeshAgentPaths()
+  if (installed && fileExists(installed.mshPath)) {
+    try {
+      const fsApi = deps.fs || fs
+      const raw = fsApi.readFileSync(installed.mshPath, 'utf8')
+      const parsed = parseMshText(raw)
+      const rewritten = serializeMshWithAgentName(parsed, expected)
+      fsApi.writeFileSync(staged.mshPath, rewritten, 'utf8')
+    } catch { /* keep template-staged msh */ }
+  }
+  const synced = await syncInstalledMsh(staged.mshPath)
+  if (!synced.ok) {
+    return {
+      ok: false,
+      code: synced.code || 'MSH_SYNC_FAILED',
+      message: synced.message || 'msh sync failed',
+      action: 'msh_repair',
+    }
+  }
+  await stopMeshAgent()
+  const started = await startMeshAgent()
+  const stillBroken = installedAgentNeedsRepair(clientId)
+  const status = await getMeshAgentStatus()
+  return {
+    ok: Boolean(started.ok && !stillBroken && status.status === 'running'),
+    code: stillBroken ? 'IDENTITY_AGENT_MISMATCH' : (started.ok ? 'OK' : started.code),
+    action: 'msh_repair',
+    message: stillBroken ? 'agentName still mismatched after msh repair' : 'msh identity repaired',
+    status,
+    agentName: expected,
+  }
+}
+
+/**
  * Lifecycle: healthy → noop; stale/outdated/config → repair/upgrade; missing+owned legacy → migrate.
  * @param {{ clientId?: string }} [options]
  */
 async function ensureMeshAgentRunning(options = {}) {
+  // Lock uses real fs (not test doubles) so agent lifecycle stays exclusive across users.
+  return withAgentLifecycleLock(async () => ensureMeshAgentRunningUnlocked(options), {
+    timeoutMs: 180000,
+  })
+}
+
+/**
+ * @param {{ clientId?: string }} [options]
+ */
+async function ensureMeshAgentRunningUnlocked(options = {}) {
   const clientId = safeClientIdForAgent(options.clientId)
   log('INFO', 'ensureMeshAgentRunning', { clientId: clientId || undefined })
   let before = await getMeshAgentStatus()
+
+  if (before.status === 'process_mismatch') {
+    log('WARN', 'PROCESS_MISMATCH — repairing', {
+      processId: before.processId,
+      executablePath: before.executablePath,
+    })
+    const repaired = await repairMeshAgent({ clientId })
+    if (repaired.ok) await hardenServiceConfig()
+    return {
+      ok: repaired.ok,
+      code: repaired.ok ? 'OK' : repaired.code,
+      action: 'repair_process_mismatch',
+      message: repaired.message,
+      status: repaired.status || (await getMeshAgentStatus()),
+      agentName: buildAgentName(clientId) || undefined,
+    }
+  }
 
   if (before.status === 'stale_service') {
     log('WARN', 'detected STALE_SERVICE — auto repair', {
@@ -1576,19 +1695,42 @@ async function ensureMeshAgentRunning(options = {}) {
 
   if (before.status === 'running') {
     if (clientId && installedAgentNeedsRepair(clientId)) {
-      log('WARN', 'running agent missing/stale agentName — repairing', {
+      log('WARN', 'IDENTITY_AGENT_MISMATCH — reconciling now', {
         clientId,
         expected: buildAgentName(clientId),
       })
+      // Prefer msh-only when artifact is current (avoid unnecessary EXE reinstall)
+      if (!before.outdatedAgent && before.installedExePresent && before.imagePathOk) {
+        const mshOnly = await repairMshIdentityOnly({ clientId })
+        if (mshOnly.ok) {
+          await hardenServiceConfig()
+          return {
+            ok: true,
+            code: 'OK',
+            action: 'msh_repair',
+            message: mshOnly.message,
+            status: mshOnly.status || (await getMeshAgentStatus()),
+            agentName: buildAgentName(clientId),
+            identityAgentMismatch: false,
+          }
+        }
+        log('WARN', 'msh-only repair failed — falling back to full repair', {
+          code: mshOnly.code,
+          message: mshOnly.message,
+        })
+      }
       const repaired = await repairMeshAgent({ clientId })
       if (repaired.ok) await hardenServiceConfig()
+      const after = repaired.status || (await getMeshAgentStatus())
+      const stillMismatch = Boolean(clientId && installedAgentNeedsRepair(clientId))
       return {
-        ok: repaired.ok,
-        code: repaired.ok ? 'OK' : repaired.code,
+        ok: repaired.ok && !stillMismatch,
+        code: stillMismatch ? 'IDENTITY_AGENT_MISMATCH' : (repaired.ok ? 'OK' : repaired.code),
         action: 'repair',
         message: repaired.message,
-        status: repaired.status || (await getMeshAgentStatus()),
+        status: after,
         agentName: buildAgentName(clientId),
+        identityAgentMismatch: stillMismatch,
       }
     }
     // Healthy running — do not elevate on every ensure (UAC spam).
@@ -1757,6 +1899,7 @@ module.exports = {
   repairMeshAgent,
   uninstallMeshAgent,
   ensureMeshAgentRunning,
+  repairMshIdentityOnly,
   migrateLegacyMeshAgentToWxqk,
   isLegacyAgentOwnedByWxqk,
   queryLegacyServiceState,

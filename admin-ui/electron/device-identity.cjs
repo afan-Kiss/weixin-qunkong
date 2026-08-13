@@ -166,102 +166,88 @@ function writeIdentityFile(file, row, privateKeyPem) {
 }
 
 /**
- * @param {string} userDataDir
+ * @param {string} userDataDir user-level dir (candidates only); canonical store is ProgramData
  */
 function loadOrCreate(userDataDir) {
+  const machine = require('./machine-identity.cjs')
+  const paths = machine.resolveMachineIdentityPaths()
+  const api = identityDeps.fs || { existsSync, readFileSync }
+
+  // Canonical machine identity — never auto-reset when present but unreadable
+  if (api.existsSync(paths.identityFile) || api.existsSync(paths.secretFile)) {
+    return machine.loadOrCreateMachineIdentity({})
+  }
+
+  const candidates = []
+  let userLevelUnreadable = false
   const dir = path.join(userDataDir, 'security')
-  mkdirSync(dir, { recursive: true })
   const file = path.join(dir, 'device-identity.json')
-  const store = activeSafeStorage()
-  if (existsSync(file)) {
-    let raw = null
+
+  if (api.existsSync(file)) {
     try {
-      raw = JSON.parse(readFileSync(file, 'utf8'))
-    } catch {
-      raw = null
-    }
-    if (raw && typeof raw === 'object') {
+      const raw = JSON.parse(api.readFileSync(file, 'utf8'))
       let privateKeyPem = ''
       let decryptedViaDpapi = false
+      const store = activeSafeStorage()
       if (raw.privateKeyEnc) {
         privateKeyPem = decryptPem(store, raw.privateKeyEnc)
         decryptedViaDpapi = Boolean(privateKeyPem)
       }
-
       if (!privateKeyPem && raw.privateKeyPem) {
         if (raw.privateKeyEnc && encryptionAvailable(store) && !decryptedViaDpapi) {
-          // Enc present but undecryptable — never fall back to plaintext
-          const err = new Error('设备身份暂时无法读取，请稍后重试或联系客服（不会自动重置）')
-          err.code = 'DEVICE_IDENTITY_UNREADABLE'
-          throw err
+          userLevelUnreadable = true
+        } else {
+          privateKeyPem = String(raw.privateKeyPem)
         }
-        // Local stable plaintext (legacy format): allow once, then rewrite encrypted without plaintext
-        privateKeyPem = String(raw.privateKeyPem)
       }
-
+      if (!privateKeyPem && raw.privateKeyEnc && !decryptedViaDpapi) {
+        userLevelUnreadable = true
+      }
       if (privateKeyPem && raw.publicKeyB64 && raw.deviceId) {
-        try {
-          writeIdentityFile(file, {
-            publicKeyB64: raw.publicKeyB64,
-            deviceId: raw.deviceId,
-            clientId: raw.clientId || raw.deviceId,
-            createdAt: raw.createdAt || new Date().toISOString(),
-            migratedAt: new Date().toISOString(),
-          }, privateKeyPem)
-        } catch { /* ignore rewrite failures; still return usable identity */ }
-        return {
+        candidates.push({
           privateKeyPem,
           publicKeyB64: raw.publicKeyB64,
           deviceId: raw.deviceId,
           clientId: raw.clientId || raw.deviceId,
           createdAt: raw.createdAt,
-          schemaVersion: IDENTITY_SCHEMA_VERSION,
-        }
+          source: 'user-level',
+        })
+      } else if (raw && raw.publicKeyB64) {
+        userLevelUnreadable = true
       }
+    } catch {
+      userLevelUnreadable = true
     }
+  }
+
+  if (userLevelUnreadable && candidates.length === 0) {
     const err = new Error('设备身份暂时无法读取，请稍后重试或联系客服（不会自动重置）')
     err.code = 'DEVICE_IDENTITY_UNREADABLE'
     throw err
   }
 
-  // Fresh identity
-  const { privateKey, publicKey } = generateKeyPairSync('ed25519')
-  const pubDer = publicKey.export({ type: 'spki', format: 'der' })
-  const pubRaw = pubDer.subarray(pubDer.length - 32)
-  const publicKeyB64 = b64(pubRaw)
-  const deviceId = createHash('sha256').update(pubRaw).digest('hex')
-  const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' })
-  writeIdentityFile(file, {
-    publicKeyB64,
-    deviceId,
-    clientId: deviceId,
-    createdAt: new Date().toISOString(),
-  }, privateKeyPem)
-  return {
-    privateKeyPem,
-    publicKeyB64,
-    deviceId,
-    clientId: deviceId,
-    createdAt: new Date().toISOString(),
-    schemaVersion: IDENTITY_SCHEMA_VERSION,
-  }
+  return machine.loadOrCreateMachineIdentity({ candidateIdentities: candidates })
 }
 
 /**
- * Try importing a staged legacy identity file into stable security dir with clone checks.
- * @param {string} userDataDir stable userData
+ * Try importing a staged legacy identity file into machine store with clone checks.
+ * @param {string} userDataDir unused for dest (kept for API compat); machine store is ProgramData
  * @param {string} legacyIdentityPath
  */
 function tryImportLegacyIdentityFile(userDataDir, legacyIdentityPath) {
+  const machine = require('./machine-identity.cjs')
   const fsApi = identityDeps.fs || { existsSync, readFileSync, mkdirSync, writeFileSync }
   if (!legacyIdentityPath || !fsApi.existsSync(legacyIdentityPath)) {
     return { ok: false, code: 'NO_LEGACY', message: 'no legacy identity' }
   }
-  const destDir = path.join(userDataDir, 'security')
-  const dest = path.join(destDir, 'device-identity.json')
-  if (fsApi.existsSync(dest)) {
-    return { ok: false, code: 'STABLE_EXISTS', message: 'stable identity already present' }
-  }
+  // If machine identity already exists, do not overwrite
+  try {
+    const paths = machine.resolveMachineIdentityPaths()
+    if (fsApi.existsSync(paths.identityFile)) {
+      return { ok: false, code: 'STABLE_EXISTS', message: 'machine identity already present' }
+    }
+  } catch { /* continue import attempt */ }
+
   let raw
   try {
     raw = JSON.parse(fsApi.readFileSync(legacyIdentityPath, 'utf8'))
@@ -275,7 +261,6 @@ function tryImportLegacyIdentityFile(userDataDir, legacyIdentityPath) {
     viaDpapi = Boolean(privateKeyPem)
   }
   if (!privateKeyPem && raw.privateKeyEnc && encryptionAvailable(activeSafeStorage())) {
-    // Encrypted identity from another machine / corrupted DPAPI — never fall back to plaintext clone
     if (raw.privateKeyPem) {
       return {
         ok: false,
@@ -296,14 +281,16 @@ function tryImportLegacyIdentityFile(userDataDir, legacyIdentityPath) {
   if (!adopt.ok) {
     return { ok: false, code: 'DEVICE_IDENTITY_CLONE_REJECTED', reason: adopt.reason, message: '拒绝导入可能克隆的设备身份' }
   }
-  fsApi.mkdirSync(destDir, { recursive: true })
-  writeIdentityFile(dest, {
+  const imported = machine.adoptIdentityIntoMachineStore({
     publicKeyB64: raw.publicKeyB64,
     deviceId: raw.deviceId,
     clientId: raw.clientId || raw.deviceId,
     createdAt: raw.createdAt || new Date().toISOString(),
-    migratedAt: new Date().toISOString(),
-  }, privateKeyPem)
+    privateKeyPem,
+  })
+  if (!imported.ok) {
+    return { ok: false, code: imported.code || 'ADOPT_FAILED', message: '机器身份导入失败' }
+  }
   return {
     ok: true,
     code: 'OK',

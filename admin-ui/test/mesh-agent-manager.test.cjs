@@ -251,8 +251,8 @@ test('ensureMeshAgentRunning repairs running agent without agentName msh', async
   })
 
   const ensured = await ensureMeshAgentRunning({ clientId: 'c1' })
-  assert.equal(ensured.action, 'repair')
-  assert.equal(ensured.ok, true)
+  assert.ok(['repair', 'msh_repair'].includes(ensured.action), `action=${ensured.action}`)
+  assert.equal(ensured.ok, true, ensured.message || ensured.code)
   assert.ok(powershellRuns >= 1)
 })
 

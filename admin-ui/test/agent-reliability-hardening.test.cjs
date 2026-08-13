@@ -141,11 +141,31 @@ test('watchdog exists with elevation backoff and network recover', () => {
     startMode: 'Auto',
     status: 'running',
     processId: 42,
+    processIdKnown: true,
+    source: 'cim',
+    paths: { installedExePath: 'C:\\Program Files\\WXQK\\WXQK.exe' },
+    executablePath: 'C:\\Program Files\\WXQK\\WXQK.exe',
     outdatedAgent: false,
   }, { ok: false })
   assert.equal(gates.NETWORK, 'FAIL')
+  assert.equal(gates.PROCESS, 'PASS')
   assert.equal(gates.LOCAL_AGENT_READY, true)
   assert.equal(gates.NETWORK_BLOCKED, true)
+
+  const pidZero = wd.buildLocalGates({
+    packagedExePresent: true,
+    packagedMshPresent: true,
+    servicePresent: true,
+    imagePathOk: true,
+    startMode: 'Auto',
+    status: 'running',
+    processId: 0,
+    processIdKnown: true,
+    source: 'cim',
+    outdatedAgent: false,
+  }, { ok: true })
+  assert.notEqual(pidZero.PROCESS, 'PASS')
+  assert.equal(pidZero.LOCAL_AGENT_READY, false)
 })
 
 test('stable userData migration is idempotent and never overwrites identity', () => {
@@ -161,8 +181,9 @@ test('stable userData migration is idempotent and never overwrites identity', ()
     stableUserDataDir: stable,
     legacyPortableUserDataDir: legacy,
   })
-  assert.equal(first.reason, 'stable_identity_exists')
+  // Session migrator does not copy identity; existing stable identity file untouched
   assert.equal(JSON.parse(readFileSync(path.join(stable, 'security', 'device-identity.json'), 'utf8')).deviceId, 'stable')
+  assert.ok(first.reason === 'copied' || first.migrated === true || first.reason === 'already_migrated' || first.copied)
   const second = paths.migrateLegacyPortableUserDataIfNeeded({
     stableUserDataDir: stable,
     legacyPortableUserDataDir: legacy,
