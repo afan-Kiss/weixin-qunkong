@@ -1107,7 +1107,7 @@ function deskFilteredClients(data) {
   const q = String((document.getElementById('deskSearch') || {}).value || '').trim().toLowerCase();
   if (!q) return rows;
   return rows.filter(r => {
-    const blob = [r.clientId, r.account, r.ip, r.version].map(x => String(x || '').toLowerCase()).join(' ');
+    const blob = [r.clientId, r.account, r.hostname, r.host, r.ip, r.version].map(x => String(x || '').toLowerCase()).join(' ');
     return blob.includes(q);
   });
 }

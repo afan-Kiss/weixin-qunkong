@@ -174,6 +174,64 @@ class RemoteSecurityTest(unittest.TestCase):
         finally:
             server.WX_SYNC_DIR = old
 
+    def test_list_online_preserves_chinese_hostname_utf8(self):
+        """Overview must expose hostname so admin UI can label 中文 Windows devices."""
+        cid = "host-utf8-client"
+        try:
+            server.touch_online(
+                {
+                    "clientId": cid,
+                    "ip": "10.0.0.8",
+                    "account": "账号未上报",
+                    "hostname": "测试电脑-微信01",
+                }
+            )
+            rows = server.list_online()
+            hit = next((r for r in rows if r.get("clientId") == cid), None)
+            self.assertIsNotNone(hit)
+            assert hit is not None
+            self.assertEqual(hit.get("hostname"), "测试电脑-微信01")
+            self.assertEqual(hit.get("host"), "测试电脑-微信01")
+            # JSON wire encoding must stay UTF-8 (ensure_ascii=False)
+            body = __import__("json").dumps({"online": [hit]}, ensure_ascii=False)
+            self.assertIn("测试电脑-微信01", body)
+            self.assertNotIn("\\u6d4b\\u8bd5", body)
+        finally:
+            with server._online_lock:
+                server._online.pop(cid, None)
+
+    def test_admin_ui_display_label_prefers_chinese_hostname(self):
+        text = (Path(__file__).resolve().parent / "admin_ui.py").read_text(encoding="utf-8")
+        self.assertIn("r.hostname || r.host", text)
+        # Extract displayClientLabel and evaluate with Node for regression.
+        start = text.find("function displayClientLabel(r)")
+        end = text.find("function findOnlineByClientId", start)
+        self.assertGreater(start, 0)
+        self.assertGreater(end, start)
+        snippet = text[start:end]
+        # Minimal helpers used by displayClientLabel
+        js = (
+            "function displayAccount(r){const a=String((r&&r.account)||'').trim();"
+            "if(!a||a==='未登录')return '账号未上报';return a;}\n"
+            "function looksLikeInternalId(s){const t=String(s||'').trim();"
+            "return t.length>=32&&/^[a-f0-9]+$/i.test(t);}\n"
+            + snippet
+            + "\nconst label=displayClientLabel({account:'账号未上报',hostname:'测试电脑-微信01'});\n"
+            + "if(label!=='测试电脑-微信01'){console.error('bad',label);process.exit(1)}\n"
+            + "console.log('ok')\n"
+        )
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
+            fh.write(js)
+            path = fh.name
+        try:
+            out = subprocess.check_output(["node", path], text=True, encoding="utf-8")
+            self.assertIn("ok", out)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()
