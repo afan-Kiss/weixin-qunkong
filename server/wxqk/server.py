@@ -19,6 +19,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+# Server-only MeshCentral credentials (/etc/wxqk/mesh.env). Never ship to Electron.
+try:
+    from mesh_env_loader import load_mesh_env_files as _load_mesh_env_files
+
+    _load_mesh_env_files()
+except Exception:
+    pass
+
 try:
     import chat_media as _chat_media
 except Exception:  # pragma: no cover

@@ -286,7 +286,10 @@ def cmd_gen_secret(args: argparse.Namespace) -> int:
     existing = _load_env_file(write_path)
     if existing.get("WXQK_MESH_LOGIN_KEY") and not getattr(args, "force", False):
         fp = _secret_fingerprint(existing["WXQK_MESH_LOGIN_KEY"])
-        print(f"configured=true length={len(existing['WXQK_MESH_LOGIN_KEY'])} fingerprint={fp}")
+        print(f"Secret generated")
+        print(f"Configured: yes")
+        print(f"Length: {len(existing['WXQK_MESH_LOGIN_KEY'])}")
+        print(f"Fingerprint: {fp}")
         print(f"kept existing key in {write_path} (pass --force to replace)")
         return 0
     _write_env_file(
@@ -298,7 +301,10 @@ def cmd_gen_secret(args: argparse.Namespace) -> int:
         },
         merge_existing=True,
     )
-    print(f"configured=true length={len(key)} fingerprint={_secret_fingerprint(key)}")
+    print(f"Secret generated")
+    print(f"Configured: yes")
+    print(f"Length: {len(key)}")
+    print(f"Fingerprint: {_secret_fingerprint(key)}")
     print(f"wrote {write_path} (mode 600 when supported)")
     print("NOTE: Prefer MeshCentral --loginTokenKey on a live 1.2.4 host (bootstrap does this).")
     if getattr(args, "show_secret", False):
@@ -416,6 +422,7 @@ def _sync_wxqk_mesh_env(login_key: str, env: dict[str, str]) -> Path:
         "WXQK_MESH_TIMEOUT": env.get("WXQK_MESH_TIMEOUT") or "15",
         "WXQK_MESH_TOKEN_EXPIRE_MIN": env.get("WXQK_MESH_TOKEN_EXPIRE_MIN") or "30",
         "WXQK_MESH_AGENT_PORT": env.get("WXQK_MESH_AGENT_PORT") or "4433",
+        "WXQK_MESH_WS_LOCAL_HOST": env.get("WXQK_MESH_WS_LOCAL_HOST") or "127.0.0.1",
     }
     local_path = WXQK_MESH_ENV_LOCAL
     _write_env_file(local_path, payload, merge_existing=True)
@@ -425,13 +432,20 @@ def _sync_wxqk_mesh_env(login_key: str, env: dict[str, str]) -> Path:
             WXQK_MESH_ENV_DEFAULT.parent.mkdir(parents=True, exist_ok=True)
             _write_env_file(WXQK_MESH_ENV_DEFAULT, payload, merge_existing=True)
             print(f"[MESH] synced {WXQK_MESH_ENV_DEFAULT}")
+            # Merge Mesh keys into legacy wxqk.env so older units still pick them up
+            wxqk_env_path = Path("/etc/wxqk/wxqk.env")
+            try:
+                _write_env_file(wxqk_env_path, payload, merge_existing=True)
+                print(f"[MESH] merged Mesh keys into {wxqk_env_path}")
+            except Exception as merge_exc:
+                print(f"[MESH] WARN could not merge into wxqk.env: {merge_exc}")
+            print("[MESH] ensure systemd has: EnvironmentFile=-/etc/wxqk/mesh.env")
+            print("[MESH] then: systemctl daemon-reload && systemctl restart wxqk")
         except Exception as exc:
-            print(f"[MESH] WARN could not write {WXQK_MESH_ENV_DEFAULT}: {exc}")
+            print(f"[MESH] WARN could not write system mesh env: {exc}")
     # Also keep deploy/.env login key in sync (Mesh compose env_file)
     mesh_env = dict(env)
-    mesh_env["WXQK_MESH_LOGIN_KEY"] = login_key
-    mesh_env["WXQK_MESH_ENABLED"] = mesh_env.get("WXQK_MESH_ENABLED") or "1"
-    mesh_env["MESHCENTRAL_VERSION"] = PINNED_VERSION
+    mesh_env.update(payload)
     _write_env_file(HERE / ".env", mesh_env, merge_existing=True)
     return local_path
 
@@ -539,6 +553,16 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     return cmd_doctor(args)
 
 
+def _compose_plugin_ok() -> tuple[bool, str]:
+    if not _docker_available():
+        return False, "docker missing"
+    proc = _run(["docker", "compose", "version"], check=False, capture=True)
+    if proc.returncode == 0:
+        detail = (proc.stdout or proc.stderr or "ok").strip().splitlines()
+        return True, (detail[0] if detail else "ok")[:80]
+    return False, "docker compose plugin missing"
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     failures = 0
 
@@ -547,23 +571,36 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if not docker_ok:
         failures += 1
 
+    compose_ok, compose_detail = _compose_plugin_ok()
+    _print_check(compose_ok, "Docker Compose", compose_detail, hint="Install Docker Compose v2 plugin")
+    if not compose_ok:
+        failures += 1
+
     pinned = _pinned_version()
     ver_ok = pinned == PINNED_VERSION
-    _print_check(ver_ok, "MeshCentral version pin", pinned or "missing", hint=f"Set VERSION to MESHCENTRAL_VERSION={PINNED_VERSION}")
+    _print_check(
+        ver_ok,
+        "MeshCentral version pin",
+        f"{pinned or 'missing'} (want {PINNED_VERSION})",
+        hint=f"Set MESHCENTRAL_VERSION={PINNED_VERSION} in VERSION/.env",
+    )
     if not ver_ok:
         failures += 1
 
     cfg_path = HERE / "config.json"
     target = cfg_path if cfg_path.exists() else CFG_EXAMPLE
+    cfg_loaded = False
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
         settings = data.get("settings") or {}
+        cfg_loaded = True
+        _print_check(True, "MeshCentral config", target.name)
         webrtc_ok = settings.get("webRTC") is False
         token_ok = settings.get("allowLoginToken") is True
         framing_ok = settings.get("allowFraming") is True
         _print_check(webrtc_ok, "webRTC=false", target.name, hint="Set settings.webRTC to false")
         _print_check(token_ok, "allowLoginToken=true", target.name, hint="Set settings.allowLoginToken to true")
-        _print_check(framing_ok, "allowFraming=true", target.name, hint="Set settings.allowFraming to true")
+        _print_check(framing_ok, "allowFraming=true / framing configuration", target.name, hint="Set settings.allowFraming to true")
         if not webrtc_ok:
             failures += 1
         if not token_ok:
@@ -575,18 +612,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         origins_ok = isinstance(origins, list) and bool(origins) and "*" not in origins
         _print_check(
             origins_ok,
-            "framing origin",
+            "framing configuration",
             f"{len(origins or [])} origin(s)" if isinstance(origins, list) else "missing",
             hint="Set domains.\"\".allowedFramingOrigins to explicit admin origins (no *)",
         )
         if not origins_ok:
             failures += 1
     except Exception as exc:
-        _print_check(False, "config.json", str(exc)[:120], hint="Run prepare/bootstrap")
+        _print_check(False, "MeshCentral config", str(exc)[:120], hint="Run prepare/bootstrap")
         failures += 1
 
     container_ok = False
-    if docker_ok:
+    if docker_ok and compose_ok:
         proc = _run(["docker", "compose", "ps", "--status", "running", "-q"], check=False, capture=True)
         container_ok = bool((proc.stdout or "").strip())
     _print_check(container_ok, "MeshCentral container", "running" if container_ok else "not running", hint="python manage.py up")
@@ -598,13 +635,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if WXQK_MESH_ENV_DEFAULT.exists():
         wxqk_env = {**wxqk_env, **_load_env_file(WXQK_MESH_ENV_DEFAULT)}
     internal = env.get("WXQK_MESH_INTERNAL_URL") or "http://127.0.0.1:80"
-    public = env.get("WXQK_MESH_URL") or ""
+    public = env.get("WXQK_MESH_URL") or wxqk_env.get("WXQK_MESH_URL") or ""
     https_ok, https_detail = _http_ok(internal)
-    _print_check(https_ok, "HTTPS/HTTP health", https_detail, hint="Check compose ports and nginx/TlsOffload")
+    _print_check(https_ok, "HTTPS endpoint", https_detail, hint="Check compose ports and nginx/TlsOffload")
     if not https_ok:
         failures += 1
 
-    agent_port = int(env.get("WXQK_MESH_AGENT_PORT") or "4433")
+    agent_port = int(env.get("WXQK_MESH_AGENT_PORT") or wxqk_env.get("WXQK_MESH_AGENT_PORT") or "4433")
     agent_ok = False
     try:
         import socket
@@ -615,7 +652,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         agent_detail = str(exc)[:80]
     else:
         agent_detail = f"127.0.0.1:{agent_port} open"
-    _print_check(agent_ok, "Agent port", agent_detail, hint="Ensure WXQK_MESH_AGENT_PORT is published")
+    _print_check(agent_ok, "Agent endpoint", agent_detail, hint="Ensure WXQK_MESH_AGENT_PORT is published")
     if not agent_ok:
         failures += 1
 
@@ -630,19 +667,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if not key_ok:
         failures += 1
 
+    mesh_url_ok = bool(str(wxqk_env.get("WXQK_MESH_URL") or env.get("WXQK_MESH_URL") or "").strip())
     enabled = str(wxqk_env.get("WXQK_MESH_ENABLED") or env.get("WXQK_MESH_ENABLED") or "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
-    _print_check(enabled, "wxqk Server Mesh enabled", "WXQK_MESH_ENABLED", hint="Set WXQK_MESH_ENABLED=1 in /etc/wxqk/mesh.env")
-    if not enabled:
+    env_file_ok = WXQK_MESH_ENV_LOCAL.exists() or WXQK_MESH_ENV_DEFAULT.exists() or (HERE / ".env").exists()
+    wxqk_env_ok = bool(enabled and key_ok and mesh_url_ok and env_file_ok)
+    _print_check(
+        wxqk_env_ok,
+        "wxqk Mesh env configured",
+        f"enabled={enabled} url={'set' if mesh_url_ok else 'missing'} key={'set' if key_ok else 'missing'}",
+        hint="python manage.py bootstrap → /etc/wxqk/mesh.env + EnvironmentFile in systemd",
+    )
+    if not wxqk_env_ok:
         failures += 1
 
     # control.ashx soft check: only when websocket-client + key available
     control_ok = False
     control_detail = "skipped"
+    synced: dict = {}
     if key_ok and public:
         try:
             sys.path.insert(0, str((HERE.parents[1] / "server" / "wxqk").resolve()))
@@ -656,10 +702,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             synced = mc.sync_nodes_via_control(timeout=8)
             control_ok = bool(synced.get("ok"))
             control_detail = str(synced.get("code") or synced.get("message") or "")[:120]
+            if login_key and login_key in control_detail:
+                control_detail = "ok" if control_ok else "failed"
         except Exception as exc:
             control_detail = str(exc)[:120]
-    _print_check(control_ok, "control.ashx", control_detail, hint="Verify loginTokenKey + TLS + MeshCentral up")
-    # control failure is reported but bootstrap hosts without full wxqk deps may skip hard-fail
+            if login_key and login_key in control_detail:
+                control_detail = "exception (redacted)"
+    _print_check(control_ok, "control.ashx reachable", control_detail, hint="Verify loginTokenKey + TLS + MeshCentral up")
     if key_ok and public and not control_ok and not getattr(args, "allow_control_fail", False):
         failures += 1
 
@@ -667,12 +716,53 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     node_detail = "n/a"
     if control_ok:
         try:
-            nodes = synced.get("nodes") or []  # type: ignore[name-defined]
+            nodes = synced.get("nodes") or []
             node_ok = True
             node_detail = f"nodes={len(nodes)}"
         except Exception:
             node_detail = "query failed"
     _print_check(node_ok or not control_ok, "node query", node_detail if control_ok else "skipped (control failed)")
+
+    # Optional wxqk Mesh health endpoint (same host). Timeout-bounded; never print secrets.
+    health_url = str(getattr(args, "wxqk_health_url", "") or os.environ.get("WXQK_MESH_HEALTH_URL") or "").strip()
+    if not health_url:
+        health_url = str(os.environ.get("WXQK_HEALTH_PROBE_URL") or "").strip()
+    if health_url:
+        health_ok = False
+        health_detail = "failed"
+        status_code = 0
+        body = ""
+        try:
+            import urllib.request
+
+            req = urllib.request.Request(health_url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status_code = int(getattr(resp, "status", 0) or 0)
+                body = resp.read(4096).decode("utf-8", errors="replace")
+            if login_key and login_key in body:
+                health_ok = False
+                health_detail = "FAIL secret leaked in health body"
+            else:
+                health_ok = 200 <= status_code < 500
+                health_detail = f"HTTP {status_code}"
+        except Exception as exc:
+            health_detail = str(exc)[:100]
+            health_ok = False
+        _print_check(
+            health_ok,
+            "wxqk Mesh health endpoint",
+            health_detail,
+            hint="Set WXQK_MESH_HEALTH_URL or pass --wxqk-health-url",
+        )
+        if not health_ok and not getattr(args, "allow_health_fail", False):
+            failures += 1
+    else:
+        _print_check(
+            True,
+            "wxqk Mesh health endpoint",
+            "skipped (set --wxqk-health-url to probe)",
+            hint="",
+        )
 
     print("")
     if failures:
@@ -710,10 +800,14 @@ def main() -> int:
     p_boot.add_argument("--allow-example-host", action="store_true", help="Allow mesh.example.invalid for lab")
     p_boot.add_argument("--rotate-key", action="store_true", help="DANGEROUS: replace loginTokenKey")
     p_boot.add_argument("--allow-control-fail", action="store_true", help="Do not fail doctor on control.ashx")
+    p_boot.add_argument("--allow-health-fail", action="store_true")
+    p_boot.add_argument("--wxqk-health-url", default="")
     p_boot.set_defaults(func=cmd_bootstrap)
 
     p_doc = sub.add_parser("doctor", help="Non-secret health checklist")
     p_doc.add_argument("--allow-control-fail", action="store_true")
+    p_doc.add_argument("--allow-health-fail", action="store_true")
+    p_doc.add_argument("--wxqk-health-url", default="", help="Optional wxqk /api/mesh/health URL to probe")
     p_doc.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()

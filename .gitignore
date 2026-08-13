@@ -72,6 +72,14 @@ Thumbs.db
 npm-debug.log*
 admin-ui/scripts/tmp-*
 admin-ui/scripts/_tmp*
+admin-ui/scripts/_*.ps1
+admin-ui/scripts/_*.py
+admin-ui/build/
+admin-ui/resources/meshcentral/meshagent.official.msh
 **/logs/
 admin-ui/diagnostics/
 admin-ui/config/
+
+# Server one-off diagnostics (never commit)
+server/wxqk/_tmp_*
+server/wxqk/_e2e_data/

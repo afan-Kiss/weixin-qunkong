@@ -90,8 +90,8 @@ class MeshManageBootstrapTest(unittest.TestCase):
                 self.mod.cmd_gen_secret(args)
             out = buf.getvalue()
             key = self.mod._load_env_file(target)["WXQK_MESH_LOGIN_KEY"]
-            self.assertIn("configured=true", out)
-            self.assertIn("fingerprint=", out)
+            self.assertIn("Fingerprint:", out)
+            self.assertIn("Configured:", out)
             self.assertNotIn(key, out)
 
     def test_prepare_is_idempotent(self):
@@ -123,6 +123,66 @@ class MeshManageBootstrapTest(unittest.TestCase):
         red = self.mod._redact_secret_text(raw)
         self.assertIn("<redacted>", red)
         self.assertNotIn("ababab", red)
+
+    def test_doctor_masks_login_key_in_stdout(self):
+        with tempfile.TemporaryDirectory() as folder:
+            here = Path(folder)
+            key = "cd" * 40
+            (here / "VERSION").write_text("MESHCENTRAL_VERSION=1.2.4\n", encoding="utf-8")
+            (here / "config.json").write_text(
+                json.dumps(
+                    {
+                        "settings": {"webRTC": False, "allowLoginToken": True, "allowFraming": True},
+                        "domains": {"": {"allowedFramingOrigins": ["https://admin.example"]}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (here / ".env").write_text(
+                "MESHCENTRAL_VERSION=1.2.4\nWXQK_MESH_ENABLED=1\n"
+                "WXQK_MESH_URL=https://mesh.example\nWXQK_MESH_INTERNAL_URL=http://127.0.0.1:9\n"
+                f"WXQK_MESH_LOGIN_KEY={key}\nWXQK_MESH_AGENT_PORT=9\n",
+                encoding="utf-8",
+            )
+            (here / "wxqk-mesh.env").write_text(
+                f"WXQK_MESH_ENABLED=1\nWXQK_MESH_URL=https://mesh.example\nWXQK_MESH_LOGIN_KEY={key}\n",
+                encoding="utf-8",
+            )
+            import io
+            from contextlib import redirect_stdout
+
+            args = mock.Mock(allow_control_fail=True, allow_health_fail=True, wxqk_health_url="")
+            buf = io.StringIO()
+            with mock.patch.object(self.mod, "HERE", here), mock.patch.object(
+                self.mod, "VERSION_FILE", here / "VERSION"
+            ), mock.patch.object(self.mod, "CFG_EXAMPLE", here / "config.json"), mock.patch.object(
+                self.mod, "WXQK_MESH_ENV_LOCAL", here / "wxqk-mesh.env"
+            ), mock.patch.object(self.mod, "WXQK_MESH_ENV_DEFAULT", here / "missing-system-mesh.env"), mock.patch.object(
+                self.mod, "_docker_available", return_value=False
+            ), mock.patch.object(self.mod, "_compose_plugin_ok", return_value=(False, "missing")), mock.patch.object(
+                self.mod, "_http_ok", return_value=(False, "down")
+            ), redirect_stdout(buf):
+                rc = self.mod.cmd_doctor(args)
+            out = buf.getvalue()
+            self.assertNotIn(key, out)
+            self.assertIn("fingerprint=", out)
+            self.assertIn("[FAIL]", out)
+            self.assertNotEqual(rc, 0)
+
+    def test_sync_wxqk_mesh_env_keeps_existing_key_on_rewrite(self):
+        with tempfile.TemporaryDirectory() as folder:
+            here = Path(folder)
+            key = "ef" * 40
+            local = here / "wxqk-mesh.env"
+            with mock.patch.object(self.mod, "HERE", here), mock.patch.object(
+                self.mod, "WXQK_MESH_ENV_LOCAL", local
+            ), mock.patch.object(self.mod, "WXQK_MESH_ENV_DEFAULT", here / "no-system"):
+                self.mod._sync_wxqk_mesh_env(key, {"WXQK_MESH_URL": "https://mesh.example"})
+                first = self.mod._load_env_file(local)["WXQK_MESH_LOGIN_KEY"]
+                self.mod._sync_wxqk_mesh_env(key, {"WXQK_MESH_URL": "https://mesh.example"})
+                second = self.mod._load_env_file(local)["WXQK_MESH_LOGIN_KEY"]
+                self.assertEqual(first, second)
+                self.assertEqual(first, key)
 
 
 if __name__ == "__main__":

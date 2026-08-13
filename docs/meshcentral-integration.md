@@ -133,3 +133,73 @@ Unchanged: `/api/mesh/*`, `mesh_node_map.json`, auto-bind via `control.ashx`, `c
 - `deploy/meshcentral/manage.py`
 - `admin-ui/scripts/fetch-mesh-agent.cjs` / `check-mesh.cjs`
 - `server/wxqk/meshcentral_client.py` (`PINNED_MESHCENTRAL_VERSION = "1.2.4"`)
+
+## 最终人工验收
+
+真实 Desktop 画面与 Files 上传下载 **由管理员在生产环境手动验证**。Cursor / CI 只保证 session gate 与部署脚本就绪。
+
+### 1. 服务器
+
+```bash
+cd deploy/meshcentral
+python manage.py bootstrap --public-host <YOUR_MESH_HOST>
+python manage.py doctor
+```
+
+要求 doctor 全部 `[PASS]`（或明确理解的跳过项）。确认 `/etc/wxqk/mesh.env` 已写入，且 wxqk systemd 含：
+
+```text
+EnvironmentFile=-/etc/wxqk/mesh.env
+```
+
+必要时：
+
+```bash
+systemctl daemon-reload
+systemctl restart wxqk
+```
+
+可选 session gate（仍不代替 GUI 测试）：
+
+```bash
+python server/wxqk/mesh_live_e2e_check.py --client-id <clientId>
+# 期望 RESULT: READY_FOR_USER_LIVE_TEST
+```
+
+### 2. 启动 Windows WXQK
+
+等待管理台设备状态变为：
+
+```text
+远程服务已就绪
+```
+
+### 3. 管理台
+
+打开 **远程维护**，选择设备（优先显示 hostname / 设备名 / 账号 / IP）。
+
+### 4. 测试 Desktop
+
+点击 **打开桌面**，检查：
+
+- 看到真实桌面
+- 画面更新
+- 鼠标可控制
+- 关闭再打开正常
+
+### 5. 测试 Files
+
+点击 **文件管理**，执行：
+
+- 列目录
+- 上传文件
+- 下载文件
+- SHA256 相同
+- 删除文件
+- 关闭重新打开
+
+完成后可标记：
+
+```text
+READY FOR USER LIVE TEST →（用户确认后）Desktop / Files 实机验收 PASS
+```

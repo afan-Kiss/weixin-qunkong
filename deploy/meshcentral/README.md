@@ -21,9 +21,16 @@ python manage.py doctor
 
 Idempotent bootstrap: prepare → config defaults → validate → compose up →
 read MeshCentral 1.2.4 `loginTokenKey` via `node …/meshcentral --loginTokenKey` →
-sync server-only `wxqk-mesh.env` (and `/etc/wxqk/mesh.env` when permitted).
+sync server-only `wxqk-mesh.env` and `/etc/wxqk/mesh.env`, merge Mesh keys into
+`/etc/wxqk/wxqk.env`, and remind you to restart wxqk with:
 
-Never prints the full login key (only `configured=true length=… fingerprint=…`).
+```text
+EnvironmentFile=-/etc/wxqk/mesh.env
+```
+
+wxqk `server.py` also loads `/etc/wxqk/mesh.env` at process start (server-only).
+
+Never prints the full login key (only length + fingerprint).
 
 Manual steps still available:
 

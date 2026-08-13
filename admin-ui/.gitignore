@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 dist
+build
 release
 release-v19
 release-v19-*
@@ -17,6 +18,9 @@ test-results
 dist-ssr
 *.local
 test-output.txt
+resources/meshcentral/meshagent.official.msh
+scripts/_*.ps1
+scripts/_tmp*
 
 # Editor directories and files
 .vscode/*

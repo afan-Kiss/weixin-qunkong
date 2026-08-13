@@ -381,6 +381,18 @@ class MeshCentralClientTest(unittest.TestCase):
         self.assertNotIn("LOGIN_KEY", json.dumps(snap))
         self.assertNotIn(os.environ["WXQK_MESH_LOGIN_KEY"], json.dumps(snap))
 
+    def test_health_check_never_returns_login_key(self):
+        key = os.environ["WXQK_MESH_LOGIN_KEY"]
+        with mock.patch.object(mc, "_http_get", return_value=(200, b"ok", "https://mesh.test")):
+            health = mc.health_check(deep=False)
+        blob = json.dumps(health)
+        self.assertNotIn(key, blob)
+        self.assertNotIn("loginTokenKey", blob.lower())
+        self.assertIn("loginKeyConfigured", health)
+        self.assertTrue(health["loginKeyConfigured"])
+        self.assertEqual(health.get("version"), mc.PINNED_MESHCENTRAL_VERSION)
+        self.assertTrue(health.get("webRtcDisabled"))
+
     def test_login_key_accepts_secret_alias(self):
         key = os.environ.pop("WXQK_MESH_LOGIN_KEY")
         os.environ["WXQK_MESH_SECRET"] = key

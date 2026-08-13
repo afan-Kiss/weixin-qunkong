@@ -77,6 +77,7 @@ Environment=WXQK_PORT=4812
 Environment=WXQK_BIND=127.0.0.1
 Environment=WXQK_DATA={REMOTE}/data
 EnvironmentFile=-/etc/wxqk/wxqk.env
+EnvironmentFile=-/etc/wxqk/mesh.env
 Environment=FACAI888_PORT=4812
 Environment=FACAI888_BIND=127.0.0.1
 Environment=FACAI888_DATA={REMOTE}/data
