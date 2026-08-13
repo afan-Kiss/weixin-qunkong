@@ -1,7 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const { createHash, generateKeyPairSync, sign } = require('node:crypto')
-const { writeFileSync, unlinkSync, mkdtempSync, readFileSync } = require('node:fs')
+const { writeFileSync, unlinkSync, mkdtempSync, readFileSync, mkdirSync, existsSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const path = require('node:path')
 const {
@@ -65,7 +65,7 @@ test('validateDownloadURL only allows https whitelist hosts', () => {
   assert.equal(validateDownloadURL('https://evil.example/pkg.exe').ok, false)
 })
 
-test('canonical manifest excludes releaseSequence and verifies ed25519', () => {
+test('canonical v1 manifest excludes releaseSequence and verifies ed25519', () => {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519')
   const pubDer = publicKey.export({ type: 'spki', format: 'der' })
   const pubRaw = pubDer.subarray(pubDer.length - 32)
@@ -100,7 +100,7 @@ test('applyUpdate falls back from legacy brand downloadURL via secure-config hel
 
 test('apply does not reject a newer semantic version when local releaseSequence is ahead', () => {
   const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
-  const applySource = src.slice(src.indexOf('async function applyUpdate'), src.indexOf('function cleanupUpdateTrashBestEffort'))
+  const applySource = src.slice(src.indexOf('async function applyUpdate'), src.indexOf('function isSafeUpdaterCleanupPath'))
   assert.doesNotMatch(applySource, /拒绝降级/)
   assert.doesNotMatch(applySource, /latest\s*<\s*curSeq/)
 })
@@ -108,22 +108,23 @@ test('apply does not reject a newer semantic version when local releaseSequence 
 test('non-mandatory manifest stays non-mandatory when an update is available', () => {
   const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
   const checkSource = src.slice(src.indexOf('async function checkForUpdate'), src.indexOf('async function reportUpdate'))
-  assert.match(checkSource, /const mandatory = Boolean\(manifest\.mandatory\)/)
-  assert.doesNotMatch(checkSource, /const mandatory[\s\S]*latest > currentSeq/)
+  assert.match(checkSource, /resolveUpdatePolicy\(manifest\)/)
+  assert.match(checkSource, /isForcedPolicy\(policy\)/)
+  assert.doesNotMatch(checkSource, /targetClientIds\.length\s*>\s*0/)
 })
 
-test('portable update writes and verifies the new executable before launching it directly', () => {
+test('portable update schedules helper after ready markers (no direct spawn+250ms)', () => {
   const src = readFileSync(path.join(__dirname, '..', 'electron', 'client-updater.cjs'), 'utf8')
   const ui = readFileSync(path.join(__dirname, '..', 'src', 'utils', 'clientUpdate.ts'), 'utf8')
   assert.match(src, /copyFileSync\(downloadPath, finalPath\)/)
   assert.match(src, /await verifyPackageFile\(finalPath, man\)/)
-  assert.match(src, /const child = spawn\(finalPath, \['--after-update'\]/)
-  assert.match(src, /PORTABLE_EXECUTABLE_FILE: finalPath/)
-  assert.match(src, /\[UPDATE_OLD_TRASH_ENV\]: currentExe/)
-  assert.match(src, /if \(!child\.pid\) throw new Error/)
-  assert.doesNotMatch(src, /\$child\.HasExited/)
-  assert.doesNotMatch(src.slice(src.indexOf('async function applyUpdate'), src.indexOf('function cleanupUpdateTrashBestEffort')), /renameSync\(currentExe/)
-  assert.match(ui, /applyClientUpdate\(\), true/)
+  assert.match(src, /schedulePortableReplacement\(/)
+  assert.match(src, /pendingHelper:\s*true/)
+  assert.match(src, /writePortableReadyMarkers/)
+  assert.doesNotMatch(src.slice(src.indexOf('async function applyUpdate'), src.indexOf('function isSafeUpdaterCleanupPath')), /const child = spawn\(finalPath/)
+  assert.doesNotMatch(src.slice(src.indexOf('async function ipcApplyClientUpdate'), src.indexOf('function stopUpdateScheduler')), /setTimeout\(\(\) => \{\s*try \{ options\.app\.exit\(0\)/)
+  assert.match(src, /exitDelay/)
+  assert.match(ui, /applyClientUpdate\(\), false/)
 })
 
 test('manifest signature failure blocks fetchManifest in production', () => {
@@ -155,8 +156,8 @@ test('main wires updater scheduler and client uses encoded service base', () => 
   assert.match(updater, /ipcApplyClientUpdate/)
   assert.match(updater, /releaseSingleInstanceLock/)
   assert.match(updater, /getServiceBase|secure-config/)
-  assert.doesNotMatch(updater, /CHECK_INTERVAL_MS/)
-  assert.doesNotMatch(updater, /setInterval\s*\(/)
+  assert.match(updater, /STARTUP_BACKOFF_MS|PERIODIC_CHECK_MS/)
+  assert.match(updater, /setInterval/)
   assert.match(preload, /checkClientUpdate/)
   assert.match(preload, /applyClientUpdate/)
   assert.match(ui, /bootstrapClientUpdate/)
@@ -175,11 +176,13 @@ test('main wires updater scheduler and client uses encoded service base', () => 
   assert.match(manifest, /微信群控系统v\{ver\}\.exe/)
   assert.match(manifest, /mesh\.example\.invalid\/wxqk/)
   assert.doesNotMatch(manifest, /120\.27\.219\.138/)
+  assert.match(manifest, /canonical_manifest_bytes_v2/)
   assert.match(updater, /LEGACY_UPDATE_OLD_TRASH_ENV/)
   assert.match(updater, /WXQK_UPDATE_OLD_TRASH/)
   assert.match(updater, /sameHost/)
   assert.doesNotMatch(updater, /xiangyuzhubao\.xyz\/wxqk\/api\/update\/package/)
-  assert.match(main, /clientId: String\(getRemoteAgentStatus/)
+  assert.match(main, /clientId: String\(resolveLocalClientId/)
+  assert.doesNotMatch(main.slice(main.indexOf("ipcMain.handle('update:check'"), main.indexOf("ipcMain.handle('update:mark-done'")), /getRemoteAgentStatus\(\)\?\.clientId/)
 })
 
 test('allowUnsignedForTest stays off by default', () => {
@@ -212,5 +215,6 @@ test('downloadWithResume falls back to single-connection on RANGE_UNSUPPORTED', 
   assert.match(src, /Fallback: single-connection full download/)
   assert.match(src, /download fallback http/)
   assert.match(src, /UPDATE_SIZE_MISMATCH/)
+  assert.match(src, /readPartsCompletedBytes|completedUniqueBytes/)
   assert.match(src, /partial > 1024 \* 1024/)
 })

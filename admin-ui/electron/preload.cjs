@@ -91,9 +91,10 @@ contextBridge.exposeInMainWorld('wxControl', {
   detectWeixinInstall: () => ipcRenderer.invoke('weixin:detect'),
   checkClientUpdate: () => ipcRenderer.invoke('update:check'),
   applyClientUpdate: () => ipcRenderer.invoke('update:apply'),
-  markStartupUpdateDone: () => ipcRenderer.invoke('update:mark-done'),
+  markStartupUpdateDone: (reason) => ipcRenderer.invoke('update:mark-done', reason == null ? '' : String(reason)),
+  quitApp: () => ipcRenderer.invoke('app:quit'),
   onUpdateStartupCheck: (listener) => {
-    const handler = () => listener()
+    const handler = (_event, payload) => listener(payload || {})
     ipcRenderer.on('update:startup-check', handler)
     return () => ipcRenderer.removeListener('update:startup-check', handler)
   },

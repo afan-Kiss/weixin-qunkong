@@ -166,6 +166,8 @@ const {
   ipcApplyClientUpdate,
   markStartupUpdateDone,
   resolvePortableExePath,
+  setHighestSeenUserData,
+  setDefaultDrainHooks,
 } = require('./client-updater.cjs')
 const { safeCloneForIpc } = require('./ipc-safe.cjs')
 const {
@@ -951,7 +953,7 @@ async function handleFriendCredentialDiagnosticCommand(message) {
 }
 
 async function handleRemoteCheckClientUpdate(message) {
-  const selfId = String(getRemoteAgentStatus()?.clientId || '')
+  const selfId = String(resolveLocalClientId() || '')
   appLog('INFO', '收到定向更新命令', { module: '软件更新', commandId: message?.commandId || message?.id, clientId: selfId })
   const result = await ipcApplyClientUpdate({
     app,
@@ -960,8 +962,12 @@ async function handleRemoteCheckClientUpdate(message) {
     currentVersion: VERSION,
     currentReleaseSequence: RELEASE_SEQUENCE,
     clientId: selfId,
+    userDataPath: app.getPath('userData'),
     isPackaged: app.isPackaged,
     allowRemoteForce: true,
+    drainHooks: {
+      getRunningTasks: () => listTasks().filter((task) => ['RUNNING', 'QUEUED', 'COOLING_DOWN', 'WAITING_CONFIRMATION', 'PAUSED'].includes(String(task.status || ''))),
+    },
     onLog: (level, msg, details) => appLog(level, msg, details),
   })
   if (!result?.ok) throw new Error(result?.message || '定向更新未执行')
@@ -5140,7 +5146,8 @@ function registerIpc() {
     currentVersion: VERSION,
     currentReleaseSequence: RELEASE_SEQUENCE,
     isPackaged: app.isPackaged,
-    clientId: String(getRemoteAgentStatus()?.clientId || ''),
+    clientId: String(resolveLocalClientId() || ''),
+    userDataPath: app.getPath('userData'),
   }))
   ipcMain.handle('update:apply', async (event) => {
     const sendProgress = (payload) => {
@@ -5155,7 +5162,11 @@ function registerIpc() {
       currentVersion: VERSION,
       currentReleaseSequence: RELEASE_SEQUENCE,
       isPackaged: app.isPackaged,
-      clientId: String(getRemoteAgentStatus()?.clientId || ''),
+      clientId: String(resolveLocalClientId() || ''),
+      userDataPath: app.getPath('userData'),
+      drainHooks: {
+        getRunningTasks: () => listTasks().filter((task) => ['RUNNING', 'QUEUED', 'COOLING_DOWN', 'WAITING_CONFIRMATION', 'PAUSED'].includes(String(task.status || ''))),
+      },
       onLog: (level, message, details) => appLog(level, message, details),
       onProgress: (downloaded, total) => {
         const percent = total > 0 ? (downloaded * 100) / total : 0
@@ -5182,7 +5193,12 @@ function registerIpc() {
     else sendProgress({ phase: 'error', percent: 0, message: result.message || '更新失败' })
     return result
   })
-  ipcMain.handle('update:mark-done', () => { markStartupUpdateDone(); return true })
+  ipcMain.handle('update:mark-done', (_event, reason) => { markStartupUpdateDone(reason); return true })
+  ipcMain.handle('app:quit', () => {
+    quitting = true
+    try { app.quit() } catch { try { app.exit(0) } catch { /* ignore */ } }
+    return true
+  })
   ipcMain.handle('directory:sync', (_event, payload) => { syncDirectorySnapshot(payload); return true })
   ipcMain.handle('directory:list-blocked', () => listBlockedChatrooms())
   ipcMain.handle('directory:blocked-room-ids', (_event, instanceIds) => {
@@ -5972,7 +5988,13 @@ app.whenReady().then(async () => {
       }
     })
 
-    // 静默更新：冷启动通知渲染进程检查；有新版则进度条下载并自动替换重启（对齐开云）
+    // 静默更新：冷启动检查 + 失败退避 + 周期检查；有新版则等用户确认后再下载替换
+    try { setHighestSeenUserData(app.getPath('userData')) } catch { /* ignore */ }
+    try {
+      setDefaultDrainHooks({
+        getRunningTasks: () => listTasks().filter((task) => ['RUNNING', 'QUEUED', 'COOLING_DOWN', 'WAITING_CONFIRMATION', 'PAUSED'].includes(String(task.status || ''))),
+      })
+    } catch { /* ignore */ }
     startUpdateScheduler({
       app,
       baseUrl: UPDATE_BASE,
@@ -5980,9 +6002,19 @@ app.whenReady().then(async () => {
       currentVersion: VERSION,
       currentReleaseSequence: RELEASE_SEQUENCE,
       isPackaged: app.isPackaged,
+      userDataPath: app.getPath('userData'),
       onLog: (level, message, details) => appLog(level, message, details),
-      onRequestStartupCheck: () => {
-        safeBroadcast('update:startup-check')
+      onRequestStartupCheck: (meta) => {
+        safeBroadcast('update:startup-check', meta || { reason: 'startup' })
+      },
+      registerOnlineHook: (cb) => {
+        try {
+          const { powerMonitor } = require('electron')
+          powerMonitor.on('resume', () => { try { cb() } catch { /* ignore */ } })
+        } catch { /* ignore */ }
+      },
+      drainHooks: {
+        getRunningTasks: () => listTasks().filter((task) => ['RUNNING', 'QUEUED', 'COOLING_DOWN', 'WAITING_CONFIRMATION', 'PAUSED'].includes(String(task.status || ''))),
       },
     })
 

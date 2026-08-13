@@ -51,15 +51,23 @@ function setProgressVisible(visible: boolean) {
   }
 }
 
+function isForcedUpdate(info: { mandatory?: boolean; policy?: string }) {
+  const policy = String(info?.policy || '')
+  if (policy === 'MANDATORY' || policy === 'REMOTE_TARGETED_MANDATORY' || policy === 'SECURITY_EMERGENCY') return true
+  return Boolean(info?.mandatory)
+}
+
 /**
  * 显示确认弹层；用户点「立即更新」后下载替换。
+ * automatic=false：始终等待用户选择（禁止假「稍后」自动开下）。
  */
 async function runClientUpdateModal(
-  info: { fileName?: string; latestVersion?: string; fileSize?: number; mandatory?: boolean },
-  applyFn: () => Promise<{ ok?: boolean; message?: string; deferred?: boolean }>,
+  info: { fileName?: string; latestVersion?: string; fileSize?: number; mandatory?: boolean; policy?: string },
+  applyFn: () => Promise<{ ok?: boolean; message?: string; deferred?: boolean; pending?: boolean }>,
   automatic = false,
 ) {
   const el = ensureModal()
+  const forced = isForcedUpdate(info)
   const name = String(info?.fileName || (info?.latestVersion ? `微信群控系统v${info.latestVersion}.exe` : '新版本'))
   const nameEl = document.getElementById('app-upd-name')
   const bar = document.getElementById('app-upd-bar')
@@ -70,37 +78,62 @@ async function runClientUpdateModal(
   const btnLater = document.getElementById('app-upd-later')
 
   if (nameEl) nameEl.textContent = name + (info?.fileSize ? `（${fmtBytes(Number(info.fileSize))}）` : '')
-  if (title) title.textContent = info?.mandatory ? '发现新版本（建议尽快更新）' : '发现新版本'
+  if (title) {
+    title.textContent = forced
+      ? (String(info?.policy) === 'SECURITY_EMERGENCY' ? '安全紧急更新' : '必须更新后才能继续')
+      : '发现新版本'
+  }
   if (hint) {
-    hint.textContent = info?.mandatory
-      ? '建议尽快更新。点「稍后更新」可继续使用本版本，下次启动再提示；点「立即更新」会关闭当前窗口并启动新版本。'
+    hint.textContent = forced
+      ? '当前版本需要更新。请选择「立即更新」，或「退出」关闭软件。不会在后台假装稍后自动更新。'
       : '更新会关闭当前窗口并启动新版本。可稍后更新，继续使用本版本。'
+  }
+  if (btnLater) {
+    if (forced) {
+      btnLater.textContent = '退出'
+      btnLater.removeAttribute('hidden')
+    } else {
+      btnLater.textContent = '稍后更新'
+      btnLater.removeAttribute('hidden')
+    }
   }
   if (bar) bar.style.width = '0%'
   if (pctEl) pctEl.textContent = '0%'
   setProgressVisible(false)
   el.removeAttribute('hidden')
 
-  const choice = automatic ? 'now' : await new Promise<'now' | 'later'>((resolve) => {
-    const onNow = () => {
-      cleanup()
-      resolve('now')
+  // 即使误传 automatic=true，强制更新也必须等用户点选，禁止假稍后
+  const waitForUser = !automatic || forced
+  const choice = waitForUser
+    ? await new Promise<'now' | 'later' | 'exit'>((resolve) => {
+      const onNow = () => {
+        cleanup()
+        resolve('now')
+      }
+      const onLater = () => {
+        cleanup()
+        resolve(forced ? 'exit' : 'later')
+      }
+      function cleanup() {
+        try { btnNow?.removeEventListener('click', onNow) } catch { /* ignore */ }
+        try { btnLater?.removeEventListener('click', onLater) } catch { /* ignore */ }
+      }
+      btnNow?.addEventListener('click', onNow)
+      btnLater?.addEventListener('click', onLater)
+    })
+    : 'now' as const
+
+  if (choice === 'exit') {
+    el.setAttribute('hidden', '')
+    try { await window.wxControl?.quitApp?.() } catch {
+      try { window.close() } catch { /* ignore */ }
     }
-    const onLater = () => {
-      cleanup()
-      resolve('later')
-    }
-    function cleanup() {
-      try { btnNow?.removeEventListener('click', onNow) } catch { /* ignore */ }
-      try { btnLater?.removeEventListener('click', onLater) } catch { /* ignore */ }
-    }
-    btnNow?.addEventListener('click', onNow)
-    btnLater?.addEventListener('click', onLater)
-  })
+    return { ok: false as const, deferred: false as const, message: '已退出以等待更新' }
+  }
 
   if (choice === 'later') {
     el.setAttribute('hidden', '')
-    return { ok: false as const, deferred: true as const, message: '已跳过本次更新，下次启动再检查' }
+    return { ok: false as const, deferred: true as const, message: '已跳过本次更新，稍后或下次检查再提示' }
   }
 
   setProgressVisible(true)
@@ -131,7 +164,7 @@ async function runClientUpdateModal(
           : '下载中，请勿关闭；完成后才会启动新版本并关闭旧版'
       }
     } else if (phase === 'installing') {
-      if (pctEl) pctEl.textContent = '100% · 新版本已启动，正在关闭旧版…'
+      if (pctEl) pctEl.textContent = '100% · 更新助手已调度，正在关闭旧版…'
       if (hint) hint.textContent = String(ev?.message || '请稍候，旧版本即将关闭')
     } else if (phase === 'error') {
       if (pctEl) pctEl.textContent = String(ev?.message || '更新失败')
@@ -146,7 +179,7 @@ async function runClientUpdateModal(
       onProgress({ phase: 'error', message: res?.message || '更新失败', percent: 0 })
       await new Promise((resolve) => setTimeout(resolve, 2200))
       el.setAttribute('hidden', '')
-      return { ok: false as const, message: res?.message || '更新失败' }
+      return { ok: false as const, message: res?.message || '更新失败', deferred: Boolean(res?.deferred || res?.pending) }
     }
     onProgress({ phase: 'installing', percent: 100, message: res?.message || '即将重启' })
     await new Promise((resolve) => setTimeout(resolve, 15000))
@@ -158,29 +191,34 @@ async function runClientUpdateModal(
 }
 
 let bootstrapStarted = false
+let modalOpen = false
+let deferOptionalUntilPeriodic = false
 
 /**
- * 冷启动自动检查更新：有新版弹确认，点「立即更新」再下载替换。
+ * 冷启动 / 周期检查更新：有新版弹确认，点「立即更新」再下载替换。
  */
 export async function bootstrapClientUpdate() {
   if (bootstrapStarted) return
   bootstrapStarted = true
   if (!window.wxControl?.checkClientUpdate) return
 
-  let alreadyChecked = false
-  try { alreadyChecked = sessionStorage.getItem(STARTUP_UPDATE_KEY) === '1' } catch { /* ignore */ }
+  let pageReloadGuard = false
+  try { pageReloadGuard = sessionStorage.getItem(STARTUP_UPDATE_KEY) === '1' } catch { /* ignore */ }
   // 同会话内页面重载：不再弹更新，只关掉主进程启动窗口
-  if (alreadyChecked) {
-    try { await window.wxControl?.markStartupUpdateDone?.() } catch { /* ignore */ }
-    return
+  if (pageReloadGuard) {
+    try { await window.wxControl?.markStartupUpdateDone?.('DEFERRED') } catch { /* ignore */ }
   }
 
-  const run = async () => {
-    // 重复触发（主进程信号 + 兜底）只忽略，绝不能提前 markStartupUpdateDone，
+  const run = async (meta?: { reason?: string }) => {
+    const reason = String(meta?.reason || 'startup')
+    // 重复触发（主进程信号 + 兜底）只忽略进行中的弹窗，绝不能提前 markStartupUpdateDone，
     // 否则用户还没点「立即更新」窗口就被关掉，表现为「点更新没有用」。
-    if (alreadyChecked) return
-    alreadyChecked = true
+    if (modalOpen) return
+    if (deferOptionalUntilPeriodic && reason !== 'periodic' && reason !== 'online') return
+    if (pageReloadGuard && reason === 'startup') return
+
     try { sessionStorage.setItem(STARTUP_UPDATE_KEY, '1') } catch { /* ignore */ }
+    pageReloadGuard = true
 
     let applySucceeded = false
     try {
@@ -188,27 +226,37 @@ export async function bootstrapClientUpdate() {
       if (!upd) return
       if (upd.ok === false) {
         console.warn('[update]', upd.message || '检查更新失败')
+        // 网络失败：不 mark done，留给启动退避 / 周期重试
         return
       }
-      if (!upd.needUpdate) return
+      if (!upd.needUpdate) {
+        try { await window.wxControl?.markStartupUpdateDone?.(upd.code || 'NO_UPDATE') } catch { /* ignore */ }
+        return
+      }
       if (upd.canApply === false) {
         console.warn('[update]', upd.message || '发现新版本，但当前不是便携包运行环境，无法自动替换')
         return
       }
-      const applied = await runClientUpdateModal(upd, () => window.wxControl!.applyClientUpdate(), true)
+      modalOpen = true
+      // automatic=false：等待用户；policy 驱动强制文案
+      const applied = await runClientUpdateModal(upd, () => window.wxControl!.applyClientUpdate(), false)
       if (applied?.ok === true) applySucceeded = true
-      else if (applied && 'deferred' in applied && applied.deferred) console.info('[update]', applied.message)
-      else if (applied?.ok === false) console.warn('[update]', applied.message)
+      else if (applied && 'deferred' in applied && applied.deferred) {
+        deferOptionalUntilPeriodic = !isForcedUpdate(upd)
+        console.info('[update]', applied.message)
+        try { await window.wxControl?.markStartupUpdateDone?.('DEFERRED') } catch { /* ignore */ }
+      } else if (applied?.ok === false) console.warn('[update]', applied.message)
     } catch (error) {
       console.warn('[update] check failed', error)
     } finally {
-      if (!applySucceeded) {
-        try { await window.wxControl?.markStartupUpdateDone?.() } catch { /* ignore */ }
+      modalOpen = false
+      // 失败不 markStartupUpdateDone，允许退避重试
+      if (applySucceeded) {
+        /* 进程即将退出 */
       }
     }
   }
 
-  // 主进程冷启动信号 + 本进程兜底（防止信号早于监听）；重复调用安全
-  window.wxControl.onUpdateStartupCheck?.(() => { void run() })
-  void run()
+  window.wxControl.onUpdateStartupCheck?.((payload?: { reason?: string }) => { void run(payload) })
+  void run({ reason: 'startup' })
 }

@@ -83,10 +83,13 @@ declare global {
         fileSize?: number
         message?: string
         code?: string
+        policy?: string
+        mandatory?: boolean
       }>
-      applyClientUpdate: () => Promise<{ ok: boolean; message?: string; deferred?: boolean }>
-      markStartupUpdateDone: () => Promise<boolean>
-      onUpdateStartupCheck: (listener: () => void) => () => void
+      applyClientUpdate: () => Promise<{ ok: boolean; message?: string; deferred?: boolean; pending?: boolean }>
+      markStartupUpdateDone: (reason?: string) => Promise<boolean>
+      quitApp: () => Promise<boolean>
+      onUpdateStartupCheck: (listener: (payload?: { reason?: string }) => void) => () => void
       onUpdateProgress: (listener: (payload: {
         phase?: string
         downloaded?: number
