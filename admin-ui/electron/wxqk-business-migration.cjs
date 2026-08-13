@@ -3,8 +3,11 @@
 /**
  * Migrate legacy portable business SQLite into stable userData BEFORE initStorage.
  *
- * Critical rule: stable DB with only logs / default app_settings is BOOTSTRAP_ONLY
- * and must NOT block migration of a meaningful legacy business DB (v1.99 noise case).
+ * Classification strategy:
+ * - Explicit RUNTIME_NOISE_TABLES never count as business conflict.
+ * - All other known persisted tables default to meaningful (missing tables = 0).
+ * - app_settings is key-level: bootstrap keys vs user/unknown keys.
+ * - Marker is a hint only; missing/corrupt stable forces re-evaluation.
  */
 
 const fs = require('fs')
@@ -12,12 +15,31 @@ const path = require('path')
 const { DatabaseSync } = require('node:sqlite')
 
 const BUSINESS_MIGRATION_MARKER_V2 = '.wxqk-business-data-migrated-v2'
-const BUSINESS_MIGRATION_MARKER = '.wxqk-business-data-migrated-v3'
-const MARKER_SCHEMA = 3
+const BUSINESS_MIGRATION_MARKER_V3 = '.wxqk-business-data-migrated-v3'
+const BUSINESS_MIGRATION_MARKER = '.wxqk-business-data-migrated-v4'
+const MARKER_SCHEMA = 4
 const DB_NAME = 'wechat-control.sqlite'
 
-/** Tables that represent real user business data. */
-const MEANINGFUL_TABLES = [
+/**
+ * Confirmed runtime noise / cache — alone never means real business data.
+ * remote_session_audit is scrubbed by clearRuntimeCaches and is not portable business.
+ */
+const RUNTIME_NOISE_TABLES = [
+  'logs',
+  'backend_session_cache',
+  'wechat_api_compatibility',
+  'wechat_api_runtime_samples',
+  'remote_session_audit',
+]
+
+/** @deprecated alias used by older callers/tests */
+const BOOTSTRAP_TABLES = [...RUNTIME_NOISE_TABLES]
+
+/**
+ * Known persisted business tables (from storage.cjs). Any unknown table found in
+ * sqlite_master that is not noise / app_settings is also treated as meaningful.
+ */
+const KNOWN_MEANINGFUL_TABLES = [
   'wechat_instances',
   'contacts',
   'chatrooms',
@@ -33,24 +55,31 @@ const MEANINGFUL_TABLES = [
   'qr_join_daily_attempts',
   'delivered_content_history',
   'chat_add_candidates',
+  'chat_add_rules',
+  'kicked_group_cleanup',
   'blocked_chatrooms',
   'operation_history',
   'exclusion_rules',
   'risk_events',
-  'remote_session_audit',
 ]
 
-/** Startup noise — alone never means "already has business data". */
-const BOOTSTRAP_TABLES = [
+/** @deprecated exported name kept for tests */
+const MEANINGFUL_TABLES = [...KNOWN_MEANINGFUL_TABLES]
+
+/**
+ * Only auto-start / pure technical setting keys may live here.
+ * Production currently has no confirmed bootstrap-only keys.
+ */
+const BOOTSTRAP_SETTING_KEYS = Object.freeze([])
+
+/** Known user-facing setting keys (storage saveSetting). */
+const USER_SETTING_KEYS = Object.freeze(['general', 'qrMonitor'])
+
+const COUNT_TABLES = [...new Set([
+  ...KNOWN_MEANINGFUL_TABLES,
+  ...RUNTIME_NOISE_TABLES,
   'app_settings',
-  'logs',
-  'backend_session_cache',
-  'wechat_api_compatibility',
-  'wechat_api_runtime_samples',
-]
-
-/** @deprecated keep for callers that still count a flat list */
-const COUNT_TABLES = [...new Set([...MEANINGFUL_TABLES, ...BOOTSTRAP_TABLES])]
+])]
 
 /**
  * @param {import('node:sqlite').DatabaseSync} db
@@ -62,6 +91,81 @@ function countTable(db, table) {
     return Number(row?.c || 0)
   } catch {
     return 0
+  }
+}
+
+/**
+ * Seeded default chat_add_rules row must not alone mark a DB as meaningful.
+ * @param {import('node:sqlite').DatabaseSync} db
+ */
+function countMeaningfulChatAddRules(db) {
+  try {
+    const row = db.prepare(`
+      SELECT COUNT(*) AS c FROM chat_add_rules
+      WHERE id = 1 AND (
+        COALESCE(enabled, 0) != 0
+        OR TRIM(COALESCE(instance_id, '')) != ''
+        OR TRIM(COALESCE(account_wxid, '')) != ''
+        OR TRIM(COALESCE(exclude_text, '')) != ''
+        OR TRIM(COALESCE(room_ids_json, '[]')) NOT IN ('[]', '')
+        OR TRIM(COALESCE(keywords_json, '[]')) NOT IN ('[]', '')
+      )
+    `).get()
+    return Number(row?.c || 0)
+  } catch {
+    // Older schema without account_wxid — fall back without that column.
+    try {
+      const row = db.prepare(`
+        SELECT COUNT(*) AS c FROM chat_add_rules
+        WHERE COALESCE(enabled, 0) != 0
+          OR TRIM(COALESCE(instance_id, '')) != ''
+          OR TRIM(COALESCE(exclude_text, '')) != ''
+          OR TRIM(COALESCE(room_ids_json, '[]')) NOT IN ('[]', '')
+          OR TRIM(COALESCE(keywords_json, '[]')) NOT IN ('[]', '')
+      `).get()
+      return Number(row?.c || 0)
+    } catch {
+      return 0
+    }
+  }
+}
+
+/**
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {{ bootstrap: Record<string, string>, user: Record<string, string>, unknown: Record<string, string>, updatedAt: Record<string, string> }}
+ */
+function classifyAppSettingsKeys(db) {
+  const bootstrap = {}
+  const user = {}
+  const unknown = {}
+  const updatedAt = {}
+  try {
+    const rows = db.prepare('SELECT key, value_json, updated_at FROM app_settings').all()
+    for (const row of rows || []) {
+      const key = String(row.key || '').trim()
+      if (!key) continue
+      const value = String(row.value_json || '')
+      const at = String(row.updated_at || '')
+      updatedAt[key] = at
+      if (BOOTSTRAP_SETTING_KEYS.includes(key)) bootstrap[key] = value
+      else if (USER_SETTING_KEYS.includes(key)) user[key] = value
+      else unknown[key] = value
+    }
+  } catch { /* table missing */ }
+  return { bootstrap, user, unknown, updatedAt }
+}
+
+/**
+ * @param {import('node:sqlite').DatabaseSync} db
+ */
+function listUserTables(db) {
+  try {
+    return db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type='table' AND name NOT LIKE 'sqlite_%'
+    `).all().map((r) => String(r.name || '')).filter(Boolean)
+  } catch {
+    return []
   }
 }
 
@@ -78,8 +182,10 @@ function classifyBusinessDb(dbPath, deps = {}) {
       readable: true,
       businessCounts: {},
       bootstrapCounts: {},
+      settings: { bootstrapKeys: [], userKeys: [], unknownKeys: [] },
       meaningfulRows: 0,
       bootstrapRows: 0,
+      userSettingRows: 0,
       classification: 'missing',
     }
   }
@@ -97,8 +203,10 @@ function classifyBusinessDb(dbPath, deps = {}) {
       readable: false,
       businessCounts: {},
       bootstrapCounts: {},
+      settings: { bootstrapKeys: [], userKeys: [], unknownKeys: [] },
       meaningfulRows: -1,
       bootstrapRows: -1,
+      userSettingRows: -1,
       classification: 'unreadable',
       error: String(err?.message || err),
     }
@@ -108,16 +216,49 @@ function classifyBusinessDb(dbPath, deps = {}) {
   const bootstrapCounts = {}
   let meaningfulRows = 0
   let bootstrapRows = 0
+  let userSettingRows = 0
+  let settingsMeta = { bootstrapKeys: [], userKeys: [], unknownKeys: [], updatedAt: {} }
+
   try {
-    for (const table of MEANINGFUL_TABLES) {
-      const n = countTable(db, table)
+    const present = new Set(listUserTables(db))
+    const noise = new Set(RUNTIME_NOISE_TABLES)
+
+    for (const table of RUNTIME_NOISE_TABLES) {
+      const n = present.has(table) ? countTable(db, table) : 0
+      bootstrapCounts[table] = n
+      bootstrapRows += n
+    }
+
+    const meaningfulCandidates = new Set(KNOWN_MEANINGFUL_TABLES)
+    for (const name of present) {
+      if (name === 'app_settings') continue
+      if (noise.has(name)) continue
+      meaningfulCandidates.add(name)
+    }
+
+    for (const table of meaningfulCandidates) {
+      let n = 0
+      if (table === 'chat_add_rules') n = countMeaningfulChatAddRules(db)
+      else if (present.has(table) || KNOWN_MEANINGFUL_TABLES.includes(table)) n = countTable(db, table)
       businessCounts[table] = n
       meaningfulRows += n
     }
-    for (const table of BOOTSTRAP_TABLES) {
-      const n = countTable(db, table)
-      bootstrapCounts[table] = n
-      bootstrapRows += n
+
+    if (present.has('app_settings')) {
+      const classified = classifyAppSettingsKeys(db)
+      settingsMeta = {
+        bootstrapKeys: Object.keys(classified.bootstrap),
+        userKeys: Object.keys(classified.user),
+        unknownKeys: Object.keys(classified.unknown),
+        updatedAt: classified.updatedAt,
+      }
+      const bootstrapSettingCount = settingsMeta.bootstrapKeys.length
+      userSettingRows = settingsMeta.userKeys.length + settingsMeta.unknownKeys.length
+      bootstrapCounts.app_settings_bootstrap_keys = bootstrapSettingCount
+      bootstrapCounts.app_settings_user_keys = userSettingRows
+      bootstrapRows += bootstrapSettingCount
+      // Raw app_settings row count kept for logs but does not alone force conflict.
+      bootstrapCounts.app_settings = countTable(db, 'app_settings')
     }
   } finally {
     try { db.close() } catch { /* ignore */ }
@@ -125,6 +266,7 @@ function classifyBusinessDb(dbPath, deps = {}) {
 
   let classification = 'empty'
   if (meaningfulRows > 0) classification = 'meaningful_business'
+  else if (userSettingRows > 0) classification = 'user_settings_only'
   else if (bootstrapRows > 0) classification = 'bootstrap_only'
 
   return {
@@ -132,13 +274,14 @@ function classifyBusinessDb(dbPath, deps = {}) {
     readable: true,
     businessCounts,
     bootstrapCounts,
+    settings: settingsMeta,
     meaningfulRows,
     bootstrapRows,
+    userSettingRows,
     classification,
-    // Back-compat fields used by older tests / logs
     counts: { ...businessCounts, ...bootstrapCounts },
-    totalRows: meaningfulRows + bootstrapRows,
-    empty: meaningfulRows === 0 && bootstrapRows === 0,
+    totalRows: meaningfulRows + bootstrapRows + userSettingRows,
+    empty: meaningfulRows === 0 && bootstrapRows === 0 && userSettingRows === 0,
   }
 }
 
@@ -163,6 +306,7 @@ function inspectSqliteDb(dbPath) {
     classification: c.classification,
     meaningfulRows: c.meaningfulRows,
     bootstrapRows: c.bootstrapRows,
+    userSettingRows: c.userSettingRows,
   }
 }
 
@@ -184,10 +328,6 @@ function dbSidecars(dbPath) {
   return [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]
 }
 
-/**
- * @param {string} markerPath
- * @param {{ existsSync?: typeof fs.existsSync, readFileSync?: typeof fs.readFileSync }} [deps]
- */
 function readMigrationMarker(markerPath, deps = {}) {
   const existsSync = deps.existsSync || fs.existsSync
   const readFileSync = deps.readFileSync || fs.readFileSync
@@ -200,31 +340,93 @@ function readMigrationMarker(markerPath, deps = {}) {
 }
 
 /**
- * Fast-skip only when a verified schema>=3 success marker exists.
+ * Marker is a hint. Fast-skip only when verified AND stable DB still matches summary.
  * @param {string} stableDir
+ * @param {string} stableDb
  * @param {object} deps
+ * @param {typeof classifyBusinessDb} [classify]
  */
-function resolveVerifiedMarker(stableDir, deps = {}) {
+function resolveVerifiedMarker(stableDir, stableDb, deps = {}, classify = classifyBusinessDb) {
   const existsSync = deps.existsSync || fs.existsSync
   const readFileSync = deps.readFileSync || fs.readFileSync
-  const v3 = path.join(stableDir, BUSINESS_MIGRATION_MARKER)
-  const row = readMigrationMarker(v3, { existsSync, readFileSync })
-  if (
-    row
-    && Number(row.schema || 0) >= MARKER_SCHEMA
-    && row.status === 'migrated'
-    && row.verified === true
-  ) {
-    return { skip: true, marker: v3, row }
+  const candidates = [
+    path.join(stableDir, BUSINESS_MIGRATION_MARKER),
+    path.join(stableDir, BUSINESS_MIGRATION_MARKER_V3),
+  ]
+  let best = null
+  let markerPath = candidates[0]
+  for (const p of candidates) {
+    const row = readMigrationMarker(p, { existsSync, readFileSync })
+    if (!row) continue
+    if (
+      Number(row.schema || 0) >= 3
+      && row.status === 'migrated'
+      && row.verified === true
+    ) {
+      best = row
+      markerPath = p
+      break
+    }
   }
-  return { skip: false, marker: v3, row }
+  if (!best) return { skip: false, marker: markerPath, row: null, reason: 'no_verified_marker' }
+
+  // Stable missing / unreadable → must re-evaluate (disaster recovery)
+  if (!existsSync(stableDb)) {
+    return { skip: false, marker: markerPath, row: best, reason: 'marker_stable_missing' }
+  }
+  const stableClass = classify(stableDb, deps)
+  if (!stableClass.readable) {
+    return { skip: false, marker: markerPath, row: best, reason: 'marker_stable_unreadable' }
+  }
+
+  const recorded = best.meaningfulCounts && typeof best.meaningfulCounts === 'object'
+    ? best.meaningfulCounts
+    : null
+  if (recorded) {
+    for (const [table, expected] of Object.entries(recorded)) {
+      const want = Number(expected || 0)
+      if (want <= 0) continue
+      const have = Number(stableClass.businessCounts?.[table] || 0)
+      if (have < want) {
+        return {
+          skip: false,
+          marker: markerPath,
+          row: best,
+          reason: 'marker_count_mismatch',
+          table,
+          expected: want,
+          actual: have,
+          stableClassification: stableClass.classification,
+        }
+      }
+    }
+  } else if (Number(best.legacyMeaningfulRows || 0) > 0 && stableClass.meaningfulRows <= 0) {
+    return {
+      skip: false,
+      marker: markerPath,
+      row: best,
+      reason: 'marker_stable_empty_vs_legacy',
+      stableClassification: stableClass.classification,
+    }
+  }
+
+  // Schema 4+ markers with matching counts may fast-skip.
+  // Older schema-3 markers without meaningfulCounts only skip when stable still meaningful.
+  if (Number(best.schema || 0) >= MARKER_SCHEMA) {
+    return { skip: true, marker: markerPath, row: best, reason: 'verified_v4' }
+  }
+  if (stableClass.classification === 'meaningful_business' || stableClass.classification === 'user_settings_only') {
+    return { skip: true, marker: markerPath, row: best, reason: 'verified_v3_stable_ok' }
+  }
+  return {
+    skip: false,
+    marker: markerPath,
+    row: best,
+    reason: 'marker_needs_reeval',
+    stableClassification: stableClass.classification,
+  }
 }
 
-/**
- * @param {string} backupDir
- * @param {string} stableDb
- * @param {object} api
- */
 function backupStableDbFiles(backupDir, stableDb, api) {
   api.mkdirSync(backupDir, { recursive: true })
   const backed = []
@@ -237,11 +439,6 @@ function backupStableDbFiles(backupDir, stableDb, api) {
   return backed
 }
 
-/**
- * @param {string} backupDir
- * @param {string} stableDb
- * @param {object} api
- */
 function restoreStableDbFiles(backupDir, stableDb, api) {
   const dataDir = path.dirname(stableDb)
   for (const f of dbSidecars(stableDb)) {
@@ -255,12 +452,79 @@ function restoreStableDbFiles(backupDir, stableDb, api) {
 }
 
 /**
- * Verify meaningful table counts did not drop vs legacy.
- * @param {ReturnType<typeof classifyBusinessDb>} legacyClass
- * @param {ReturnType<typeof classifyBusinessDb>} afterClass
+ * Merge user/unknown app_settings from pre-migration stable backup into final stable.
+ * Conflict policy: same key → newer updated_at wins; equal/missing → keep stable (newer client).
+ * @param {string} backupDbPath
+ * @param {string} stableDbPath
  */
+function mergeUserAppSettingsFromBackup(backupDbPath, stableDbPath) {
+  if (!fs.existsSync(backupDbPath) || !fs.existsSync(stableDbPath)) {
+    return { merged: 0, skipped: 'missing_db' }
+  }
+  let backupDb
+  let stableDb
+  try {
+    backupDb = new DatabaseSync(backupDbPath)
+    stableDb = new DatabaseSync(stableDbPath)
+  } catch (err) {
+    try { backupDb?.close() } catch { /* ignore */ }
+    try { stableDb?.close() } catch { /* ignore */ }
+    return { merged: 0, error: String(err?.message || err) }
+  }
+
+  let merged = 0
+  const details = []
+  try {
+    const fromStable = classifyAppSettingsKeys(backupDb)
+    const candidates = { ...fromStable.user, ...fromStable.unknown }
+    const upsert = stableDb.prepare(`
+      INSERT INTO app_settings(key, value_json, updated_at) VALUES(?,?,?)
+      ON CONFLICT(key) DO UPDATE SET
+        value_json=excluded.value_json,
+        updated_at=excluded.updated_at
+    `)
+    const getExisting = stableDb.prepare('SELECT value_json, updated_at FROM app_settings WHERE key=?')
+
+    stableDb.exec('BEGIN')
+    for (const [key, valueJson] of Object.entries(candidates)) {
+      const stableAt = String(fromStable.updatedAt[key] || '')
+      const existing = getExisting.get(key)
+      if (!existing) {
+        upsert.run(key, valueJson, stableAt || new Date().toISOString())
+        merged += 1
+        details.push({ key, action: 'insert_from_stable' })
+        continue
+      }
+      const legacyAt = String(existing.updated_at || '')
+      // Prefer stable (newer client session) when timestamps equal or stable newer
+      if (!legacyAt || (stableAt && stableAt >= legacyAt) || (!stableAt && existing.value_json !== valueJson)) {
+        if (String(existing.value_json) !== valueJson) {
+          upsert.run(key, valueJson, stableAt || legacyAt || new Date().toISOString())
+          merged += 1
+          details.push({ key, action: 'prefer_stable' })
+        }
+      } else {
+        details.push({ key, action: 'keep_legacy' })
+      }
+    }
+    stableDb.exec('COMMIT')
+  } catch (err) {
+    try { stableDb.exec('ROLLBACK') } catch { /* ignore */ }
+    try { backupDb.close() } catch { /* ignore */ }
+    try { stableDb.close() } catch { /* ignore */ }
+    return { merged: 0, error: String(err?.message || err) }
+  }
+  try { backupDb.close() } catch { /* ignore */ }
+  try { stableDb.close() } catch { /* ignore */ }
+  return { merged, details }
+}
+
 function verifyMeaningfulCounts(legacyClass, afterClass) {
-  for (const table of MEANINGFUL_TABLES) {
+  const tables = new Set([
+    ...Object.keys(legacyClass.businessCounts || {}),
+    ...KNOWN_MEANINGFUL_TABLES,
+  ])
+  for (const table of tables) {
     const beforeN = Number(legacyClass.businessCounts?.[table] || 0)
     const afterN = Number(afterClass.businessCounts?.[table] || 0)
     if (beforeN > 0 && afterN < beforeN) {
@@ -273,21 +537,17 @@ function verifyMeaningfulCounts(legacyClass, afterClass) {
   return { ok: true }
 }
 
+function snapshotMeaningfulCounts(classification) {
+  const out = {}
+  for (const [table, n] of Object.entries(classification.businessCounts || {})) {
+    const v = Number(n || 0)
+    if (v > 0) out[table] = v
+  }
+  return out
+}
+
 /**
- * @param {{
- *   stableUserDataDir: string,
- *   legacyPortableUserDataDir: string,
- *   log?: (level: string, msg: string, extra?: object) => void,
- *   existsSync?: typeof fs.existsSync,
- *   mkdirSync?: typeof fs.mkdirSync,
- *   copyFileSync?: typeof fs.copyFileSync,
- *   renameSync?: typeof fs.renameSync,
- *   writeFileSync?: typeof fs.writeFileSync,
- *   unlinkSync?: typeof fs.unlinkSync,
- *   readFileSync?: typeof fs.readFileSync,
- *   classifyBusinessDb?: typeof classifyBusinessDb,
- *   checkpointSqliteDb?: typeof checkpointSqliteDb,
- * }} opts
+ * @param {object} opts
  */
 function migrateLegacyBusinessDataIfNeeded(opts) {
   const api = {
@@ -301,6 +561,7 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
   }
   const classify = opts.classifyBusinessDb || classifyBusinessDb
   const checkpoint = opts.checkpointSqliteDb || checkpointSqliteDb
+  const mergeSettings = opts.mergeUserAppSettingsFromBackup || mergeUserAppSettingsFromBackup
   const log = typeof opts.log === 'function'
     ? opts.log
     : (level, msg, extra) => {
@@ -315,19 +576,26 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
     return { migrated: false, reason: 'no_legacy' }
   }
 
-  const verified = resolveVerifiedMarker(stable, api)
+  const stableDataDir = path.join(stable, 'data')
+  const stableDb = path.join(stableDataDir, DB_NAME)
+  const markerPath = path.join(stable, BUSINESS_MIGRATION_MARKER)
+
+  const verified = resolveVerifiedMarker(stable, stableDb, api, classify)
   if (verified.skip) {
     return { migrated: false, reason: 'already_migrated', marker: verified.row }
   }
+  if (verified.reason && verified.reason.startsWith('marker_')) {
+    log('WARN', 'migration marker verification failed — re-evaluating', {
+      reason: verified.reason,
+      table: verified.table,
+    })
+  }
 
   const legacyDb = path.join(legacy, 'data', DB_NAME)
-  const stableDataDir = path.join(stable, 'data')
-  const stableDb = path.join(stableDataDir, DB_NAME)
-  const markerV3 = path.join(stable, BUSINESS_MIGRATION_MARKER)
 
   if (!api.existsSync(legacyDb)) {
     try {
-      api.writeFileSync(markerV3, JSON.stringify({
+      api.writeFileSync(markerPath, JSON.stringify({
         schema: MARKER_SCHEMA,
         status: 'skipped',
         skipped: 'no_legacy_db',
@@ -345,29 +613,40 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
     return { migrated: false, reason: 'legacy_unreadable', error: legacyClass.error, legacyClassification: legacyClass.classification }
   }
 
-  const stableClass = api.existsSync(stableDb)
+  let stableClass = api.existsSync(stableDb)
     ? classify(stableDb)
     : {
       exists: false,
       readable: true,
       businessCounts: {},
       bootstrapCounts: {},
+      settings: { bootstrapKeys: [], userKeys: [], unknownKeys: [] },
       meaningfulRows: 0,
       bootstrapRows: 0,
+      userSettingRows: 0,
       classification: 'missing',
       counts: {},
       totalRows: 0,
       empty: true,
     }
 
-  if (!stableClass.readable && stableClass.exists) {
-    return { migrated: false, reason: 'stable_unreadable', error: stableClass.error }
+  // Corrupt stable + meaningful legacy → treat as recoverable (backup then replace)
+  const stableCorrupt = Boolean(stableClass.exists && !stableClass.readable)
+  if (stableCorrupt) {
+    log('WARN', 'stable DB unreadable — will attempt legacy recovery if safe', {
+      error: stableClass.error,
+    })
+    stableClass = {
+      ...stableClass,
+      classification: 'unreadable',
+      meaningfulRows: 0,
+      userSettingRows: 0,
+    }
   }
 
-  // No meaningful legacy — keep stable
   if (legacyClass.classification !== 'meaningful_business') {
     try {
-      api.writeFileSync(markerV3, JSON.stringify({
+      api.writeFileSync(markerPath, JSON.stringify({
         schema: MARKER_SCHEMA,
         status: 'skipped',
         skipped: legacyClass.classification === 'empty' ? 'legacy_empty' : 'NO_MEANINGFUL_LEGACY_DATA',
@@ -377,6 +656,7 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
         stableClassification: stableClass.classification,
         legacyMeaningfulRows: legacyClass.meaningfulRows,
         stableMeaningfulRows: stableClass.meaningfulRows,
+        meaningfulCounts: snapshotMeaningfulCounts(stableClass),
       }, null, 2), 'utf8')
     } catch { /* ignore */ }
     return {
@@ -387,7 +667,7 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
     }
   }
 
-  // True conflict: both have meaningful business data
+  // True conflict: both sides have meaningful *table* business (not settings-only)
   if (stableClass.classification === 'meaningful_business') {
     log('ERROR', 'LEGACY_DATA_CONFLICT — both DBs have meaningful business data', {
       legacyMeaningful: legacyClass.meaningfulRows,
@@ -406,11 +686,13 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
     }
   }
 
-  // legacy meaningful + stable missing|empty|bootstrap_only → migrate
+  const needsSettingsMerge = stableClass.classification === 'user_settings_only'
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const backupKind = stableClass.classification === 'bootstrap_only'
-    ? 'bootstrap'
-    : (stableClass.classification === 'empty' ? 'empty' : 'missing')
+  const backupKind = needsSettingsMerge
+    ? 'user-settings'
+    : (stableClass.classification === 'bootstrap_only'
+      ? 'bootstrap'
+      : (stableCorrupt ? 'corrupt' : (stableClass.classification === 'empty' ? 'empty' : 'missing')))
   const backupDir = path.join(stableDataDir, `migration-backup-${backupKind}-${stamp}`)
   let backed = []
 
@@ -419,10 +701,12 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
     stableClassification: stableClass.classification,
     legacyMeaningful: legacyClass.meaningfulRows,
     stableBootstrap: stableClass.bootstrapRows,
+    stableUserSettings: stableClass.userSettingRows,
+    needsSettingsMerge,
   })
 
   try {
-    if (stableClass.exists && stableClass.classification !== 'missing') {
+    if (api.existsSync(stableDb)) {
       backed = backupStableDbFiles(backupDir, stableDb, api)
     }
   } catch (err) {
@@ -449,7 +733,6 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
       copied.push(name)
     }
 
-    // Verify staging copy before touching live stable files
     const stagedDb = path.join(stagingDir, DB_NAME)
     const stagedClass = classify(stagedDb)
     const stagedOk = verifyMeaningfulCounts(legacyClass, stagedClass)
@@ -461,7 +744,6 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
       })
     }
 
-    // Atomic-ish replace: move live aside only after staging verified
     const liveAside = path.join(stableDataDir, `.wxqk-live-aside-${stamp}`)
     api.mkdirSync(liveAside, { recursive: true })
     for (const f of dbSidecars(stableDb)) {
@@ -479,7 +761,6 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
       }
     }
 
-    // Cleanup staging / aside (backupDir already has pre-migration stable)
     try {
       for (const name of [DB_NAME, `${DB_NAME}-wal`, `${DB_NAME}-shm`]) {
         const p = path.join(liveAside, name)
@@ -489,7 +770,6 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
       }
     } catch { /* ignore */ }
   } catch (err) {
-    // Restore from backup if we had one
     try {
       if (backed.length > 0) restoreStableDbFiles(backupDir, stableDb, api)
     } catch { /* ignore */ }
@@ -503,6 +783,17 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
       legacyClassification: legacyClass.classification,
       stableBeforeClassification: stableClass.classification,
       rolledBack: backed.length > 0,
+    }
+  }
+
+  let settingsMerge = { merged: 0 }
+  if (needsSettingsMerge && backed.length > 0) {
+    const backupDbPath = path.join(backupDir, DB_NAME)
+    settingsMerge = mergeSettings(backupDbPath, stableDb)
+    if (settingsMerge.error) {
+      log('WARN', 'app_settings merge incomplete', { error: settingsMerge.error })
+    } else {
+      log('INFO', 'app_settings merged from pre-migration stable', { merged: settingsMerge.merged })
     }
   }
 
@@ -524,6 +815,7 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
     }
   }
 
+  const meaningfulCounts = snapshotMeaningfulCounts(afterClass)
   const summary = {
     schema: MARKER_SCHEMA,
     status: 'migrated',
@@ -539,22 +831,26 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
     legacyMeaningfulRows: legacyClass.meaningfulRows,
     stableBeforeMeaningfulRows: stableClass.meaningfulRows,
     stableBeforeBootstrapRows: stableClass.bootstrapRows,
+    stableBeforeUserSettingRows: stableClass.userSettingRows,
+    meaningfulCounts,
+    settingsMerge,
     legacyCounts: legacyClass.counts,
     stableCounts: afterClass.counts,
     legacyTotal: legacyClass.totalRows,
     stableTotal: afterClass.totalRows,
-    // Note if an old v2 marker was ignored / superseded
     supersededV2Marker: api.existsSync(path.join(stable, BUSINESS_MIGRATION_MARKER_V2)),
+    supersededV3Marker: api.existsSync(path.join(stable, BUSINESS_MIGRATION_MARKER_V3)),
   }
 
   try {
-    api.writeFileSync(markerV3, JSON.stringify(summary, null, 2), 'utf8')
+    api.writeFileSync(markerPath, JSON.stringify(summary, null, 2), 'utf8')
   } catch { /* ignore — migration already verified on disk */ }
 
   log('INFO', 'migration complete', {
     legacyMeaningful: legacyClass.meaningfulRows,
     stableMeaningful: afterClass.meaningfulRows,
     stableBefore: stableClass.classification,
+    settingsMerged: settingsMerge.merged || 0,
   })
 
   return {
@@ -568,16 +864,23 @@ function migrateLegacyBusinessDataIfNeeded(opts) {
 module.exports = {
   BUSINESS_MIGRATION_MARKER,
   BUSINESS_MIGRATION_MARKER_V2,
+  BUSINESS_MIGRATION_MARKER_V3,
   MARKER_SCHEMA,
   DB_NAME,
   COUNT_TABLES,
   MEANINGFUL_TABLES,
+  KNOWN_MEANINGFUL_TABLES,
   BOOTSTRAP_TABLES,
+  RUNTIME_NOISE_TABLES,
+  BOOTSTRAP_SETTING_KEYS,
+  USER_SETTING_KEYS,
   classifyBusinessDb,
+  classifyAppSettingsKeys,
   inspectSqliteDb,
   checkpointSqliteDb,
   readMigrationMarker,
   resolveVerifiedMarker,
   verifyMeaningfulCounts,
+  mergeUserAppSettingsFromBackup,
   migrateLegacyBusinessDataIfNeeded,
 }

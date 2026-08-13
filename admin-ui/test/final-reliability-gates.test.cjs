@@ -101,10 +101,11 @@ test('business DB conflict does not overwrite when BOTH have meaningful business
   try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
 })
 
-test('v1.99 bootstrap-only stable yields to meaningful legacy (logs+settings noise)', () => {
+test('v1.99 settings+logs stable yields to meaningful legacy (no table conflict)', () => {
   const {
     classifyBusinessDb,
     BUSINESS_MIGRATION_MARKER_V2,
+    MARKER_SCHEMA,
   } = require('../electron/wxqk-business-migration.cjs')
   const root = mkdtempSync(path.join(tmpdir(), 'biz-v199-'))
   const stable = path.join(root, 'stable')
@@ -124,7 +125,7 @@ test('v1.99 bootstrap-only stable yields to meaningful legacy (logs+settings noi
   }
   ldb.close()
 
-  // Stable: v1.99 bootstrap noise only
+  // Stable: v1.99 noise — logs + default user setting keys (no business tables)
   const stableDb = path.join(stable, 'data', 'wechat-control.sqlite')
   makeDb(stableDb, { settings: { general: { lang: 'zh' } } })
   const sdb = new DatabaseSync(stableDb)
@@ -137,9 +138,9 @@ test('v1.99 bootstrap-only stable yields to meaningful legacy (logs+settings noi
   const legacyClass = classifyBusinessDb(legacyDb)
   const stableClass = classifyBusinessDb(stableDb)
   assert.equal(legacyClass.classification, 'meaningful_business')
-  assert.equal(stableClass.classification, 'bootstrap_only')
-  assert.ok(stableClass.bootstrapRows > 0)
+  assert.equal(stableClass.classification, 'user_settings_only')
   assert.equal(stableClass.meaningfulRows, 0)
+  assert.ok(stableClass.userSettingRows >= 1)
 
   // Old v2 marker must NOT permanently block recovery
   writeFileSync(path.join(stable, BUSINESS_MIGRATION_MARKER_V2), JSON.stringify({
@@ -153,7 +154,7 @@ test('v1.99 bootstrap-only stable yields to meaningful legacy (logs+settings noi
   })
   assert.equal(result.migrated, true)
   assert.equal(result.code, 'OK')
-  assert.equal(result.stableBeforeClassification, 'bootstrap_only')
+  assert.equal(result.stableBeforeClassification, 'user_settings_only')
   assert.equal(result.legacyClassification, 'meaningful_business')
   assert.ok(result.backupDir)
   assert.ok(existsSync(path.join(stable, BUSINESS_MIGRATION_MARKER)))
@@ -164,11 +165,14 @@ test('v1.99 bootstrap-only stable yields to meaningful legacy (logs+settings noi
   assert.ok(after.businessCounts.tasks >= 1)
   assert.ok(after.businessCounts.qr_items >= 1)
   assert.ok(after.businessCounts.contacts >= 5)
+  // Stable user settings merged back
+  assert.ok(after.settings.userKeys.includes('general'))
 
   const marker = JSON.parse(readFileSync(path.join(stable, BUSINESS_MIGRATION_MARKER), 'utf8'))
-  assert.equal(marker.schema, 3)
+  assert.equal(marker.schema, MARKER_SCHEMA)
   assert.equal(marker.status, 'migrated')
   assert.equal(marker.verified, true)
+  assert.ok(marker.meaningfulCounts?.wechat_instances >= 1)
 
   // Verified marker → idempotent skip
   const second = migrateLegacyBusinessDataIfNeeded({
@@ -235,6 +239,133 @@ test('migration copy failure rolls back bootstrap stable and does not write succ
   assert.ok(stableAfter.counts.app_settings >= 1)
   assert.equal(stableAfter.counts.wechat_instances || 0, 0)
   assert.ok(copyCalls >= 1)
+  try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
+})
+
+test('LEGACY_TABLE_CLASSIFICATION_GATE: chat_add_rules + kicked_group_cleanup are meaningful', () => {
+  const {
+    classifyBusinessDb,
+    RUNTIME_NOISE_TABLES,
+    KNOWN_MEANINGFUL_TABLES,
+  } = require('../electron/wxqk-business-migration.cjs')
+  assert.ok(KNOWN_MEANINGFUL_TABLES.includes('chat_add_rules'))
+  assert.ok(KNOWN_MEANINGFUL_TABLES.includes('kicked_group_cleanup'))
+  assert.ok(RUNTIME_NOISE_TABLES.includes('logs'))
+  assert.ok(RUNTIME_NOISE_TABLES.includes('remote_session_audit'))
+  assert.ok(!KNOWN_MEANINGFUL_TABLES.includes('remote_session_audit'))
+
+  const root = mkdtempSync(path.join(tmpdir(), 'biz-class-'))
+  const dbPath = path.join(root, 't.sqlite')
+  mkdirSync(path.dirname(dbPath), { recursive: true })
+  const db = new DatabaseSync(dbPath)
+  db.exec(`
+    CREATE TABLE chat_add_rules (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      enabled INTEGER NOT NULL DEFAULT 0,
+      instance_id TEXT,
+      account_wxid TEXT,
+      room_ids_json TEXT NOT NULL DEFAULT '[]',
+      keywords_json TEXT NOT NULL DEFAULT '[]',
+      exclude_text TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE kicked_group_cleanup (
+      instance_id TEXT NOT NULL,
+      room_id TEXT NOT NULL,
+      account_wxid TEXT,
+      room_name TEXT,
+      evidence TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(instance_id, room_id)
+    );
+  `)
+  // Seeded default rule alone is NOT meaningful
+  db.prepare(`INSERT INTO chat_add_rules(id,enabled,room_ids_json,keywords_json,exclude_text,updated_at)
+    VALUES(1,0,'[]','[]','',?)`).run(new Date().toISOString())
+  assert.equal(classifyBusinessDb(dbPath).classification, 'empty')
+
+  db.prepare(`UPDATE chat_add_rules SET enabled=1, keywords_json=? WHERE id=1`)
+    .run(JSON.stringify(['hello']))
+  assert.equal(classifyBusinessDb(dbPath).classification, 'meaningful_business')
+
+  db.prepare(`UPDATE chat_add_rules SET enabled=0, keywords_json='[]' WHERE id=1`).run()
+  db.prepare(`INSERT INTO kicked_group_cleanup(instance_id,room_id,evidence,created_at,updated_at)
+    VALUES(?,?,?,?,?)`).run('i1', 'r@chatroom', 'kick', new Date().toISOString(), new Date().toISOString())
+  assert.equal(classifyBusinessDb(dbPath).classification, 'meaningful_business')
+  db.close()
+  try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
+})
+
+test('APP_SETTINGS_MERGE_GATE: user settings from stable survive legacy migrate', () => {
+  const { classifyBusinessDb, USER_SETTING_KEYS } = require('../electron/wxqk-business-migration.cjs')
+  assert.ok(USER_SETTING_KEYS.includes('general'))
+  assert.ok(USER_SETTING_KEYS.includes('qrMonitor'))
+  const root = mkdtempSync(path.join(tmpdir(), 'biz-merge-'))
+  const stable = path.join(root, 'stable')
+  const legacy = path.join(root, 'legacy')
+  makeDb(path.join(legacy, 'data', 'wechat-control.sqlite'), { instance: true })
+  makeDb(path.join(stable, 'data', 'wechat-control.sqlite'), {})
+  const past = new Date(Date.now() - 60_000).toISOString()
+  const future = new Date(Date.now() + 60_000).toISOString()
+  const ldb = new DatabaseSync(path.join(legacy, 'data', 'wechat-control.sqlite'))
+  ldb.prepare('INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)')
+    .run('general', JSON.stringify({ lang: 'legacy' }), past)
+  ldb.prepare('INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)')
+    .run('qrMonitor', JSON.stringify({ enabled: false }), past)
+  ldb.close()
+  const sdb = new DatabaseSync(path.join(stable, 'data', 'wechat-control.sqlite'))
+  sdb.prepare('INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)')
+    .run('general', JSON.stringify({ lang: 'stable-new' }), future)
+  sdb.prepare('INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)')
+    .run('qrMonitor', JSON.stringify({ enabled: true, rooms: ['a'] }), future)
+  sdb.close()
+
+  assert.equal(classifyBusinessDb(path.join(stable, 'data', 'wechat-control.sqlite')).classification, 'user_settings_only')
+  const result = migrateLegacyBusinessDataIfNeeded({
+    stableUserDataDir: stable,
+    legacyPortableUserDataDir: legacy,
+  })
+  assert.equal(result.migrated, true)
+  assert.ok((result.settingsMerge?.merged || 0) >= 1)
+  const afterDb = new DatabaseSync(path.join(stable, 'data', 'wechat-control.sqlite'))
+  const general = JSON.parse(afterDb.prepare("SELECT value_json FROM app_settings WHERE key='general'").get().value_json)
+  const qr = JSON.parse(afterDb.prepare("SELECT value_json FROM app_settings WHERE key='qrMonitor'").get().value_json)
+  afterDb.close()
+  assert.equal(general.lang, 'stable-new')
+  assert.equal(qr.enabled, true)
+  try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
+})
+
+test('MIGRATION_MARKER_RECOVERY_GATE: verified marker does not block missing/corrupt stable recovery', () => {
+  const {
+    BUSINESS_MIGRATION_MARKER,
+    MARKER_SCHEMA,
+    classifyBusinessDb,
+  } = require('../electron/wxqk-business-migration.cjs')
+  const root = mkdtempSync(path.join(tmpdir(), 'biz-marker-rec-'))
+  const stable = path.join(root, 'stable')
+  const legacy = path.join(root, 'legacy')
+  makeDb(path.join(legacy, 'data', 'wechat-control.sqlite'), { instance: true, task: true, qr: true })
+  mkdirSync(path.join(stable, 'data'), { recursive: true })
+  writeFileSync(path.join(stable, BUSINESS_MIGRATION_MARKER), JSON.stringify({
+    schema: MARKER_SCHEMA,
+    status: 'migrated',
+    verified: true,
+    meaningfulCounts: { wechat_instances: 1, tasks: 1, qr_items: 1 },
+    legacyMeaningfulRows: 3,
+  }), 'utf8')
+  // Stable DB missing despite verified marker
+  assert.equal(existsSync(path.join(stable, 'data', 'wechat-control.sqlite')), false)
+  const result = migrateLegacyBusinessDataIfNeeded({
+    stableUserDataDir: stable,
+    legacyPortableUserDataDir: legacy,
+  })
+  assert.equal(result.migrated, true)
+  const after = classifyBusinessDb(path.join(stable, 'data', 'wechat-control.sqlite'))
+  assert.ok(after.businessCounts.wechat_instances >= 1)
+  assert.ok(after.businessCounts.tasks >= 1)
   try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
 })
 

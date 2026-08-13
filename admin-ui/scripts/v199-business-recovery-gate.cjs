@@ -95,8 +95,11 @@ function main() {
       legacyQr: beforeLegacy.businessCounts.qr_items,
       stableClassification: beforeStable.classification,
       stableLogs: beforeStable.bootstrapCounts.logs,
-      stableSettings: beforeStable.bootstrapCounts.app_settings,
+      stableSettings: beforeStable.bootstrapCounts.app_settings
+        || beforeStable.userSettingRows
+        || 0,
       stableBusiness: beforeStable.meaningfulRows,
+      stableUserSettingRows: beforeStable.userSettingRows,
     }
 
     const result = migrateLegacyBusinessDataIfNeeded({
@@ -131,7 +134,8 @@ function main() {
       result.migrated
       && result.code === 'OK'
       && beforeLegacy.classification === 'meaningful_business'
-      && beforeStable.classification === 'bootstrap_only'
+      && (beforeStable.classification === 'bootstrap_only' || beforeStable.classification === 'user_settings_only')
+      && beforeStable.meaningfulRows === 0
       && after.businessCounts.wechat_instances === 2
       && after.businessCounts.tasks === 3
       && after.businessCounts.qr_items === 5
