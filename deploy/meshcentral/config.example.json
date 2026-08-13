@@ -42,6 +42,13 @@
         "companyName": "WXQK",
         "serviceName": "WXQK",
         "fileName": "WXQK"
+      },
+      "agentFileInfo": {
+        "icon": "wxqk-agent.ico",
+        "filedescription": "WXQK",
+        "internalname": "WXQK",
+        "originalfilename": "WXQK.exe",
+        "productname": "WXQK"
       }
     }
   }

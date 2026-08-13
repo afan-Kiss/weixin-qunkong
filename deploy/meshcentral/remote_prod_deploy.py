@@ -217,6 +217,20 @@ def _config_json(host: str) -> str:
                     f"https://{host}:{MESH_PUBLIC_PORT}",
                     f"https://{host}:8443",
                 ],
+                "agentCustomization": {
+                    "displayName": "WXQK",
+                    "description": "WXQK",
+                    "companyName": "WXQK",
+                    "serviceName": "WXQK",
+                    "fileName": "WXQK",
+                },
+                "agentFileInfo": {
+                    "icon": "wxqk-agent.ico",
+                    "filedescription": "WXQK",
+                    "internalname": "WXQK",
+                    "originalfilename": "WXQK.exe",
+                    "productname": "WXQK",
+                },
             }
         },
     }

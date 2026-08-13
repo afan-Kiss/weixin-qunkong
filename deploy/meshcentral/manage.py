@@ -419,6 +419,41 @@ def _ensure_agent_customization(domain0: dict) -> None:
     domain0["agentCustomization"] = merged
 
 
+AGENT_ICON_NAME = "wxqk-agent.ico"
+
+
+def _ensure_agent_file_info(domain0: dict) -> None:
+    """MeshCentral agentFileInfo — Windows EXE icon + version resource metadata."""
+    want = {
+        "icon": AGENT_ICON_NAME,
+        "filedescription": "WXQK",
+        "internalname": "WXQK",
+        "originalfilename": "WXQK.exe",
+        "productname": "WXQK",
+    }
+    existing = domain0.get("agentFileInfo")
+    if not isinstance(existing, dict):
+        domain0["agentFileInfo"] = dict(want)
+        return
+    merged = dict(existing)
+    for key, val in want.items():
+        if key == "icon" or not str(merged.get(key) or "").strip():
+            merged[key] = val
+    domain0["agentFileInfo"] = merged
+
+
+def ensure_agent_icon_file() -> Path:
+    """Ensure meshcentral-data has wxqk-agent.ico (copied from deploy folder)."""
+    src = HERE / AGENT_ICON_NAME
+    dest = HERE / "data" / AGENT_ICON_NAME
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not src.is_file():
+        raise FileNotFoundError(f"missing agent icon source: {src}")
+    if (not dest.is_file()) or (src.stat().st_mtime > dest.stat().st_mtime) or (src.stat().st_size != dest.stat().st_size):
+        shutil.copyfile(src, dest)
+    return dest
+
+
 def _apply_config_defaults(public_host: str, framing_origins: list[str]) -> None:
     cfg_path = HERE / "config.json"
     if not cfg_path.exists():
@@ -455,6 +490,11 @@ def _apply_config_defaults(public_host: str, framing_origins: list[str]) -> None
     if not domain0.get("certUrl"):
         domain0["certUrl"] = f"https://{public_host}/"
     _ensure_agent_customization(domain0)
+    _ensure_agent_file_info(domain0)
+    try:
+        ensure_agent_icon_file()
+    except FileNotFoundError:
+        pass
     title = str(domain0.get("title") or "").strip()
     if not title or title.lower() in ("meshcentral", "wxqk remote"):
         domain0["title"] = "WXQK"
@@ -706,6 +746,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             hint='Set domains."".agentCustomization fileName/serviceName/companyName/displayName/description to WXQK',
         )
         if not custom_ok:
+            failures += 1
+        fileinfo = (domain0 or {}).get("agentFileInfo") if isinstance(domain0, dict) else None
+        icon_name = str((fileinfo or {}).get("icon") or "").strip()
+        icon_path = HERE / "data" / (icon_name or AGENT_ICON_NAME)
+        icon_src = HERE / AGENT_ICON_NAME
+        icon_ok = (
+            isinstance(fileinfo, dict)
+            and icon_name == AGENT_ICON_NAME
+            and (icon_path.is_file() or icon_src.is_file())
+        )
+        _print_check(
+            icon_ok,
+            "agentFileInfo icon",
+            AGENT_ICON_NAME if icon_ok else "missing wxqk-agent.ico / agentFileInfo.icon",
+            hint=f"Place {AGENT_ICON_NAME} in deploy/meshcentral/ and set domains.\"\".agentFileInfo.icon",
+        )
+        if not icon_ok:
             failures += 1
     except Exception as exc:
         _print_check(False, "MeshCentral config", str(exc)[:120], hint="Run prepare/bootstrap")
