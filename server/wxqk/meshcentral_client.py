@@ -616,18 +616,85 @@ def agent_name_for_client(client_id: str) -> str:
     return f"WXQK-{cid}" if cid else ""
 
 
-def _node_still_present(nodes: list[dict[str, Any]], mesh_node_id: str) -> bool:
+# Live readiness states (mapping alone is never "ready")
+REMOTE_STATE_UNBOUND = "unbound"
+REMOTE_STATE_PREPARING = "preparing"
+REMOTE_STATE_BOUND_OFFLINE = "bound_offline"
+REMOTE_STATE_READY = "ready"
+REMOTE_STATE_ERROR = "error"
+REMOTE_STATE_UNVERIFIED = "unverified"
+
+# Short TTL cache for MeshCentral live node queries (seconds)
+_LIVE_STATUS_TTL_S = float(_env_int("WXQK_MESH_LIVE_CACHE_TTL", 5))
+_LIVE_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_LIVE_STATUS_LOCK = threading.RLock()
+
+
+def _live_cache_get(key: str) -> Optional[dict[str, Any]]:
+    now = time.time()
+    with _LIVE_STATUS_LOCK:
+        row = _LIVE_STATUS_CACHE.get(key)
+        if not row:
+            return None
+        expires_at, payload = row
+        if now >= expires_at:
+            _LIVE_STATUS_CACHE.pop(key, None)
+            return None
+        return dict(payload)
+
+
+def _live_cache_set(key: str, payload: dict[str, Any], ttl_s: Optional[float] = None) -> None:
+    ttl = _LIVE_STATUS_TTL_S if ttl_s is None else float(ttl_s)
+    with _LIVE_STATUS_LOCK:
+        _LIVE_STATUS_CACHE[key] = (time.time() + max(0.5, ttl), dict(payload))
+
+
+def clear_live_status_cache() -> None:
+    """Test helper — drop all live status cache entries."""
+    with _LIVE_STATUS_LOCK:
+        _LIVE_STATUS_CACHE.clear()
+
+
+def node_is_online(node: Optional[dict[str, Any]]) -> bool:
+    """
+    MeshCentral 1.2.4 node online signal:
+      - conn bitmask / int > 0 (agent connected)
+      - or explicit online truthy
+    """
+    if not isinstance(node, dict):
+        return False
+    online = node.get("online")
+    if online in (True, 1, "1", "true", "True", "yes", "YES"):
+        return True
+    if online in (False, 0, "0", "false", "False"):
+        return False
+    conn = node.get("conn")
+    if conn is None:
+        return False
+    try:
+        return int(conn) > 0
+    except Exception:
+        return bool(conn)
+
+
+def find_node_by_id(nodes: list[dict[str, Any]], mesh_node_id: str) -> Optional[dict[str, Any]]:
     want = str(mesh_node_id or "").strip()
     if not want:
-        return False
+        return None
     want_leaf = want.split("/")[-1]
     for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
         nid = node_id_of(node)
         if not nid:
             continue
         if nid == want or nid.split("/")[-1] == want_leaf:
-            return True
-    return False
+            return node
+    return None
+
+
+def _node_still_present(nodes: list[dict[str, Any]], mesh_node_id: str) -> bool:
+    return find_node_by_id(nodes, mesh_node_id) is not None
 
 
 def match_node_for_client(
@@ -700,6 +767,73 @@ def node_id_of(node: dict[str, Any]) -> str:
     return ""
 
 
+def _bind_result_payload(
+    *,
+    ok: bool,
+    code: str,
+    message: str,
+    user_message: str = "",
+    remote_state: str,
+    mapping: Optional[dict[str, Any]] = None,
+    mesh_node_id: str = "",
+    agent_name: str = "",
+    online: bool = False,
+    verified: bool = False,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    nid = str(mesh_node_id or (mapping or {}).get("mesh_node_id") or "").strip()
+    bound = bool(nid)
+    ready = bool(ok and verified and online and bound and remote_state == REMOTE_STATE_READY)
+    out: dict[str, Any] = {
+        "ok": bool(ok) if remote_state != REMOTE_STATE_READY else bool(ready),
+        "code": code,
+        "message": message,
+        "userMessage": user_message or message,
+        "remoteState": remote_state,
+        "bound": bound,
+        "online": bool(online),
+        "ready": ready,
+        "verified": bool(verified),
+        "meshNodeId": nid,
+        "mapping": mapping,
+    }
+    if remote_state == REMOTE_STATE_READY and ready:
+        out["ok"] = True
+    elif remote_state in (
+        REMOTE_STATE_BOUND_OFFLINE,
+        REMOTE_STATE_PREPARING,
+        REMOTE_STATE_UNVERIFIED,
+        REMOTE_STATE_UNBOUND,
+    ):
+        out["ok"] = False
+    if agent_name:
+        out["agentName"] = agent_name
+    if extra:
+        out.update(extra)
+    return out
+
+
+def _persist_matched_mapping(
+    data_dir: Path,
+    *,
+    client_id: str,
+    matched: dict[str, Any],
+    owner_username: str = "",
+) -> dict[str, Any]:
+    nid = node_id_of(matched)
+    group_id = str(matched.get("meshid") or matched.get("meshId") or matched.get("mesh") or "").strip()
+    online = node_is_online(matched)
+    return sync_device_mapping(
+        data_dir,
+        client_id=client_id,
+        mesh_node_id=nid,
+        mesh_group_id=group_id,
+        mesh_agent_status="online" if online else "bound",
+        mesh_last_seen=_utcnow_iso(),
+        owner_username=owner_username,
+    )
+
+
 def auto_bind_client(
     data_dir: Path,
     client_id: str,
@@ -719,34 +853,57 @@ def auto_bind_client(
       3) unique hostname fallback (legacy migration only)
 
     Remaps when old mapped node is gone and a new agentName node appears.
+
+    Important:
+      - Control query failure keeps historical mapping but never reports ready.
+      - Authoritative empty node list never treats stale mapping as live-ready.
+      - Session/status readiness requires the mapped node to be online.
     """
     if not is_enabled():
-        return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
+        return {
+            "ok": False,
+            "code": "MESH_DISABLED",
+            "message": "MeshCentral 未启用",
+            "userMessage": "远程服务不可用",
+            "remoteState": REMOTE_STATE_ERROR,
+            "bound": False,
+            "online": False,
+            "ready": False,
+            "verified": False,
+        }
     cid = str(client_id or "").strip()
     if not cid:
-        return {"ok": False, "code": "BAD_REQUEST", "message": "clientId 必填"}
+        return {
+            "ok": False,
+            "code": "BAD_REQUEST",
+            "message": "clientId 必填",
+            "userMessage": "远程服务准备失败",
+            "remoteState": REMOTE_STATE_ERROR,
+            "bound": False,
+            "online": False,
+            "ready": False,
+            "verified": False,
+        }
     host_hint = str(hostname or "").strip()
     expected_agent = str(agent_name or "").strip() or agent_name_for_client(cid)
+    existing = get_mapping(data_dir, cid)
+    existing_nid = str((existing or {}).get("mesh_node_id") or "").strip()
 
     synced = sync_nodes_via_control(userid=userid)
     if not synced.get("ok"):
-        # Soft path: if mapping already exists, keep it while Mesh sync is down
-        existing = get_mapping(data_dir, cid)
-        if existing and str(existing.get("mesh_node_id") or "").strip():
-            return {
-                "ok": True,
-                "code": "OK",
-                "message": "already bound (mesh sync unavailable)",
-                "mapping": existing,
-                "bound": True,
-                "meshNodeId": str(existing.get("mesh_node_id") or ""),
-            }
-        return {
-            "ok": False,
-            "code": str(synced.get("code") or "MESH_SYNC_FAILED"),
-            "message": str(synced.get("message") or "同步节点失败"),
-            "nodes": synced.get("nodes") or [],
-        }
+        return _bind_result_payload(
+            ok=False,
+            code=str(synced.get("code") or "MESH_SYNC_FAILED"),
+            message=str(synced.get("message") or "同步节点失败"),
+            user_message="正在等待设备上线…",
+            remote_state=REMOTE_STATE_UNVERIFIED if existing_nid else REMOTE_STATE_PREPARING,
+            mapping=existing,
+            mesh_node_id=existing_nid,
+            agent_name=expected_agent,
+            online=False,
+            verified=False,
+            extra={"nodes": synced.get("nodes") or []},
+        )
 
     nodes = [n for n in (synced.get("nodes") or []) if isinstance(n, dict)]
     matched, match_err = match_node_for_client(
@@ -756,124 +913,359 @@ def auto_bind_client(
         allow_hostname_fallback=allow_hostname_fallback,
     )
 
-    existing = get_mapping(data_dir, cid)
-    existing_nid = str((existing or {}).get("mesh_node_id") or "").strip()
-    if existing_nid and _node_still_present(nodes, existing_nid):
-        return {
-            "ok": True,
-            "code": "OK",
-            "message": "already bound",
-            "mapping": existing,
-            "bound": True,
-            "meshNodeId": existing_nid,
-        }
-
-    # Old mapping stale + new agentName node → remap
-    if existing_nid and matched and not _node_still_present(nodes, existing_nid):
-        new_nid = node_id_of(matched)
-        if new_nid and new_nid != existing_nid:
-            group_id = str(matched.get("meshid") or matched.get("meshId") or matched.get("mesh") or "").strip()
-            mapping = sync_device_mapping(
+    if existing_nid:
+        present = find_node_by_id(nodes, existing_nid)
+        if present is not None:
+            online = node_is_online(present)
+            sync_device_mapping(
                 data_dir,
                 client_id=cid,
-                mesh_node_id=new_nid,
-                mesh_group_id=group_id,
-                mesh_agent_status="online" if matched.get("conn") or matched.get("online") else "bound",
+                mesh_node_id=existing_nid,
+                mesh_agent_status="online" if online else "bound",
                 mesh_last_seen=_utcnow_iso(),
                 owner_username=owner_username,
             )
-            return {
-                "ok": True,
-                "code": "OK",
-                "message": "remapped after agent reinstall",
-                "mapping": mapping,
-                "bound": True,
-                "meshNodeId": new_nid,
-                "agentName": expected_agent,
-            }
+            mapping = get_mapping(data_dir, cid) or existing
+            if online:
+                return _bind_result_payload(
+                    ok=True,
+                    code="OK",
+                    message="already bound",
+                    user_message="远程服务已就绪",
+                    remote_state=REMOTE_STATE_READY,
+                    mapping=mapping,
+                    mesh_node_id=existing_nid,
+                    agent_name=expected_agent,
+                    online=True,
+                    verified=True,
+                )
+            return _bind_result_payload(
+                ok=False,
+                code="MESH_AGENT_OFFLINE",
+                message="设备当前离线",
+                user_message="正在等待客户端远程服务上线…",
+                remote_state=REMOTE_STATE_BOUND_OFFLINE,
+                mapping=mapping,
+                mesh_node_id=existing_nid,
+                agent_name=expected_agent,
+                online=False,
+                verified=True,
+            )
+
+        if matched:
+            new_nid = node_id_of(matched)
+            if new_nid:
+                mapping = _persist_matched_mapping(
+                    data_dir,
+                    client_id=cid,
+                    matched=matched,
+                    owner_username=owner_username,
+                )
+                online = node_is_online(matched)
+                if online:
+                    return _bind_result_payload(
+                        ok=True,
+                        code="OK",
+                        message="remapped after agent reinstall",
+                        user_message="远程服务已就绪",
+                        remote_state=REMOTE_STATE_READY,
+                        mapping=mapping,
+                        mesh_node_id=new_nid,
+                        agent_name=expected_agent,
+                        online=True,
+                        verified=True,
+                    )
+                return _bind_result_payload(
+                    ok=False,
+                    code="MESH_AGENT_OFFLINE",
+                    message="设备当前离线",
+                    user_message="正在等待客户端远程服务上线…",
+                    remote_state=REMOTE_STATE_BOUND_OFFLINE,
+                    mapping=mapping,
+                    mesh_node_id=new_nid,
+                    agent_name=expected_agent,
+                    online=False,
+                    verified=True,
+                )
 
     if match_err in ("MESH_AMBIGUOUS", "MESH_HOSTNAME_AMBIGUOUS"):
-        return {
-            "ok": False,
-            "code": match_err,
-            "message": "发现重复设备，无法自动绑定",
-            "nodeCount": len(nodes),
-            "hostname": host_hint or None,
-            "agentName": expected_agent,
-        }
+        return _bind_result_payload(
+            ok=False,
+            code=match_err,
+            message="发现重复设备，无法自动绑定",
+            user_message="发现重复设备",
+            remote_state=REMOTE_STATE_ERROR,
+            mapping=existing,
+            mesh_node_id=existing_nid,
+            agent_name=expected_agent,
+            online=False,
+            verified=True,
+            extra={"nodeCount": len(nodes), "hostname": host_hint or None},
+        )
 
     if not matched:
-        # Keep stale mapping only if sync listed zero nodes (transient); otherwise clear path fails
-        if existing_nid and not nodes:
-            return {
-                "ok": True,
-                "code": "OK",
-                "message": "already bound (nodes empty)",
-                "mapping": existing,
-                "bound": True,
-                "meshNodeId": existing_nid,
-            }
-        return {
-            "ok": False,
-            "code": match_err or "MESH_NO_MATCH",
-            "message": "未找到可绑定的远程设备（Agent 可能尚未上线）",
-            "nodeCount": len(nodes),
-            "hostname": host_hint or None,
-            "agentName": expected_agent,
-        }
+        return _bind_result_payload(
+            ok=False,
+            code=match_err or "MESH_NO_MATCH",
+            message="未找到可绑定的远程设备（Agent 可能尚未上线）",
+            user_message="正在等待客户端上线…",
+            remote_state=REMOTE_STATE_PREPARING if not existing_nid else REMOTE_STATE_UNBOUND,
+            mapping=existing,
+            mesh_node_id=existing_nid,
+            agent_name=expected_agent,
+            online=False,
+            verified=True,
+            extra={"nodeCount": len(nodes), "hostname": host_hint or None},
+        )
 
     nid = node_id_of(matched)
     if not nid:
-        return {"ok": False, "code": "MESH_NODE_ID_MISSING", "message": "匹配节点缺少 node id"}
-    group_id = str(matched.get("meshid") or matched.get("meshId") or matched.get("mesh") or "").strip()
-    mapping = sync_device_mapping(
+        return _bind_result_payload(
+            ok=False,
+            code="MESH_NODE_ID_MISSING",
+            message="匹配节点缺少 node id",
+            user_message="远程服务准备失败",
+            remote_state=REMOTE_STATE_ERROR,
+            mapping=existing,
+            agent_name=expected_agent,
+            online=False,
+            verified=True,
+        )
+    mapping = _persist_matched_mapping(
         data_dir,
         client_id=cid,
+        matched=matched,
+        owner_username=owner_username,
+    )
+    online = node_is_online(matched)
+    if online:
+        return _bind_result_payload(
+            ok=True,
+            code="OK",
+            message="auto bound",
+            user_message="远程服务已就绪",
+            remote_state=REMOTE_STATE_READY,
+            mapping=mapping,
+            mesh_node_id=nid,
+            agent_name=expected_agent,
+            online=True,
+            verified=True,
+        )
+    return _bind_result_payload(
+        ok=False,
+        code="MESH_AGENT_OFFLINE",
+        message="设备当前离线",
+        user_message="正在等待客户端远程服务上线…",
+        remote_state=REMOTE_STATE_BOUND_OFFLINE,
+        mapping=mapping,
         mesh_node_id=nid,
-        mesh_group_id=group_id,
-        mesh_agent_status="online" if matched.get("conn") or matched.get("online") else "bound",
+        agent_name=expected_agent,
+        online=False,
+        verified=True,
+    )
+
+
+def resolve_live_device_status(
+    data_dir: Path,
+    client_id: str,
+    *,
+    userid: str = "",
+    hostname: str = "",
+    owner_username: str = "",
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """
+    Live status for a clientId. Database mapping is cache only — never proof of readiness.
+    Uses a short TTL cache to avoid hammering control.ashx.
+    """
+    if not is_enabled():
+        return {
+            "ok": False,
+            "code": "MESH_DISABLED",
+            "message": "远程服务不可用",
+            "userMessage": "远程服务不可用",
+            "clientId": client_id,
+            "bound": False,
+            "online": False,
+            "ready": False,
+            "verified": False,
+            "remoteState": REMOTE_STATE_ERROR,
+        }
+    cid = str(client_id or "").strip()
+    if not cid:
+        return {
+            "ok": False,
+            "code": "BAD_REQUEST",
+            "message": "clientId 必填",
+            "userMessage": "远程服务准备失败",
+            "clientId": "",
+            "bound": False,
+            "online": False,
+            "ready": False,
+            "verified": False,
+            "remoteState": REMOTE_STATE_ERROR,
+        }
+
+    cache_key = f"status:{cid}"
+    if not force_refresh:
+        cached = _live_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+    row = get_mapping(data_dir, cid)
+    node_id = str((row or {}).get("mesh_node_id") or "").strip() if row else ""
+    if not node_id:
+        bound = auto_bind_client(
+            data_dir,
+            cid,
+            owner_username=owner_username,
+            userid=userid,
+            hostname=hostname,
+        )
+        payload = {
+            "ok": True,
+            "code": str(bound.get("code") or "MESH_PREPARING"),
+            "message": str(bound.get("message") or "正在准备远程服务…"),
+            "userMessage": str(bound.get("userMessage") or bound.get("message") or "正在准备远程服务…"),
+            "clientId": cid,
+            "bound": bool(bound.get("bound")),
+            "online": bool(bound.get("online")),
+            "ready": bool(bound.get("ready")),
+            "verified": bool(bound.get("verified")),
+            "remoteState": str(bound.get("remoteState") or REMOTE_STATE_PREPARING),
+            "mapping": bound.get("mapping") or row,
+            "meshNodeId": str(bound.get("meshNodeId") or ""),
+            "config": config_snapshot(),
+        }
+        if payload["ready"]:
+            payload["code"] = "OK"
+            payload["message"] = "远程服务已就绪"
+            payload["userMessage"] = "远程服务已就绪"
+        elif not payload["bound"]:
+            payload["code"] = "MESH_PREPARING"
+            payload["message"] = "正在准备远程服务…"
+            payload["userMessage"] = "正在准备远程服务…"
+            payload["remoteState"] = REMOTE_STATE_PREPARING
+        _live_cache_set(cache_key, payload)
+        return payload
+
+    synced = sync_nodes_via_control(userid=userid)
+    if not synced.get("ok"):
+        payload = {
+            "ok": True,
+            "code": str(synced.get("code") or "MESH_SYNC_FAILED"),
+            "message": str(synced.get("message") or "暂时无法确认设备在线状态"),
+            "userMessage": "正在等待设备上线…",
+            "clientId": cid,
+            "bound": True,
+            "online": False,
+            "ready": False,
+            "verified": False,
+            "remoteState": REMOTE_STATE_UNVERIFIED,
+            "mapping": row,
+            "meshNodeId": node_id,
+            "config": config_snapshot(),
+        }
+        _live_cache_set(cache_key, payload, ttl_s=min(2.0, _LIVE_STATUS_TTL_S))
+        return payload
+
+    nodes = [n for n in (synced.get("nodes") or []) if isinstance(n, dict)]
+    present = find_node_by_id(nodes, node_id)
+    if present is None:
+        remapped = auto_bind_client(
+            data_dir,
+            cid,
+            owner_username=owner_username,
+            userid=userid,
+            hostname=hostname,
+        )
+        if remapped.get("ready"):
+            payload = {
+                "ok": True,
+                "code": "OK",
+                "message": "远程服务已就绪",
+                "userMessage": "远程服务已就绪",
+                "clientId": cid,
+                "bound": True,
+                "online": True,
+                "ready": True,
+                "verified": True,
+                "remoteState": REMOTE_STATE_READY,
+                "mapping": remapped.get("mapping") or get_mapping(data_dir, cid),
+                "meshNodeId": str(remapped.get("meshNodeId") or ""),
+                "config": config_snapshot(),
+            }
+            _live_cache_set(cache_key, payload)
+            return payload
+        payload = {
+            "ok": True,
+            "code": str(remapped.get("code") or "MESH_NODE_MISSING"),
+            "message": str(remapped.get("message") or "设备映射已失效，正在重新绑定…"),
+            "userMessage": str(remapped.get("userMessage") or "正在绑定设备…"),
+            "clientId": cid,
+            "bound": bool(remapped.get("bound") or node_id),
+            "online": bool(remapped.get("online")),
+            "ready": False,
+            "verified": True,
+            "remoteState": str(remapped.get("remoteState") or REMOTE_STATE_UNBOUND),
+            "mapping": remapped.get("mapping") or row,
+            "meshNodeId": str(remapped.get("meshNodeId") or node_id),
+            "config": config_snapshot(),
+        }
+        _live_cache_set(cache_key, payload)
+        return payload
+
+    online = node_is_online(present)
+    sync_device_mapping(
+        data_dir,
+        client_id=cid,
+        mesh_node_id=node_id,
+        mesh_agent_status="online" if online else "bound",
         mesh_last_seen=_utcnow_iso(),
         owner_username=owner_username,
     )
-    return {
-        "ok": True,
-        "code": "OK",
-        "message": "auto bound",
-        "mapping": mapping,
-        "bound": True,
-        "meshNodeId": nid,
-        "agentName": expected_agent,
-    }
-
-
-def get_device_status(data_dir: Path, client_id: str) -> dict[str, Any]:
-    if not is_enabled():
-        return {"ok": False, "code": "MESH_DISABLED", "message": "远程服务不可用"}
-    row = get_mapping(data_dir, client_id)
-    node_id = str((row or {}).get("mesh_node_id") or "").strip() if row else ""
-    if not node_id:
-        return {
+    mapping = get_mapping(data_dir, cid) or row
+    if online:
+        payload = {
             "ok": True,
-            "code": "MESH_PREPARING",
-            "message": "正在准备远程服务…",
-            "userMessage": "正在准备远程服务…",
-            "clientId": client_id,
-            "bound": False,
-            "mapping": row,
+            "code": "OK",
+            "message": "远程服务已就绪",
+            "userMessage": "远程服务已就绪",
+            "clientId": cid,
+            "bound": True,
+            "online": True,
+            "ready": True,
+            "verified": True,
+            "remoteState": REMOTE_STATE_READY,
+            "mapping": mapping,
+            "meshNodeId": node_id,
+            "config": config_snapshot(),
         }
-    return {
-        "ok": True,
-        "code": "OK",
-        "message": "远程服务已就绪",
-        "userMessage": "远程服务已就绪",
-        "clientId": client_id,
-        "bound": True,
-        "mapping": row,
-        "config": config_snapshot(),
-    }
+    else:
+        payload = {
+            "ok": True,
+            "code": "MESH_AGENT_OFFLINE",
+            "message": "设备当前离线",
+            "userMessage": "设备当前离线",
+            "clientId": cid,
+            "bound": True,
+            "online": False,
+            "ready": False,
+            "verified": True,
+            "remoteState": REMOTE_STATE_BOUND_OFFLINE,
+            "mapping": mapping,
+            "meshNodeId": node_id,
+            "config": config_snapshot(),
+        }
+    _live_cache_set(cache_key, payload)
+    return payload
 
 
-def _ensure_bound_node_id(
+def get_device_status(data_dir: Path, client_id: str, **kwargs: Any) -> dict[str, Any]:
+    return resolve_live_device_status(data_dir, client_id, **kwargs)
+
+
+def _ensure_live_online_node_id(
     data_dir: Path,
     client_id: str,
     *,
@@ -881,11 +1273,23 @@ def _ensure_bound_node_id(
     hostname: str = "",
     owner_username: str = "",
 ) -> tuple[str, Optional[dict[str, Any]]]:
-    """Return (mesh_node_id, failure_payload_or_None). Auto-binds once when unbound."""
-    row = get_mapping(data_dir, client_id)
-    node_id = str((row or {}).get("mesh_node_id") or "").strip()
-    if node_id:
-        return node_id, None
+    """
+    Shared Desktop/Files session gate:
+      validate mapping -> self-heal bind -> confirm agent online.
+    Returns (mesh_node_id, failure_payload_or_None).
+    """
+    clear_live_status_cache()
+    status = resolve_live_device_status(
+        data_dir,
+        client_id,
+        userid=userid,
+        hostname=hostname,
+        owner_username=owner_username,
+        force_refresh=True,
+    )
+    if status.get("ready") and str(status.get("meshNodeId") or "").strip():
+        return str(status.get("meshNodeId") or "").strip(), None
+
     bound = auto_bind_client(
         data_dir,
         client_id,
@@ -893,17 +1297,40 @@ def _ensure_bound_node_id(
         userid=userid,
         hostname=hostname,
     )
-    if bound.get("ok"):
-        node_id = str(bound.get("meshNodeId") or (bound.get("mapping") or {}).get("mesh_node_id") or "").strip()
-        if node_id:
-            return node_id, None
+    if bound.get("ready") and str(bound.get("meshNodeId") or "").strip():
+        return str(bound.get("meshNodeId") or "").strip(), None
+
+    code = str(bound.get("code") or status.get("code") or "MESH_PREPARE_FAILED")
+    remote_state = str(bound.get("remoteState") or status.get("remoteState") or REMOTE_STATE_ERROR)
+    user_message = str(
+        bound.get("userMessage")
+        or status.get("userMessage")
+        or bound.get("message")
+        or status.get("message")
+        or "远程服务准备失败"
+    )
+    if code == "MESH_AGENT_OFFLINE" or remote_state == REMOTE_STATE_BOUND_OFFLINE:
+        user_message = "正在等待客户端远程服务上线…"
+    elif remote_state == REMOTE_STATE_UNVERIFIED:
+        user_message = "正在等待设备上线…"
+    elif code in ("MESH_NO_MATCH", "MESH_NODE_MISSING", "MESH_PREPARING"):
+        user_message = "正在绑定设备…"
     return "", {
         "ok": False,
-        "code": str(bound.get("code") or "MESH_PREPARE_FAILED"),
-        "message": str(bound.get("message") or "远程服务准备失败"),
-        "userMessage": str(bound.get("message") or "远程服务准备失败"),
-        "bound": False,
+        "code": code,
+        "message": str(bound.get("message") or status.get("message") or user_message),
+        "userMessage": user_message,
+        "bound": bool(bound.get("bound") or status.get("bound")),
+        "online": False,
+        "ready": False,
+        "verified": bool(bound.get("verified") if "verified" in bound else status.get("verified")),
+        "remoteState": remote_state,
+        "meshNodeId": str(bound.get("meshNodeId") or status.get("meshNodeId") or ""),
+        "mapping": bound.get("mapping") or status.get("mapping"),
     }
+
+
+_ensure_bound_node_id = _ensure_live_online_node_id
 
 
 def get_remote_session(
@@ -916,7 +1343,7 @@ def get_remote_session(
 ) -> dict[str, Any]:
     if not is_enabled():
         return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
-    node_id, fail = _ensure_bound_node_id(
+    node_id, fail = _ensure_live_online_node_id(
         data_dir,
         client_id,
         userid=userid,
@@ -936,7 +1363,13 @@ def get_remote_session(
         "meshNodeId": node_id,
         "viewmode": VIEWMODE_DESKTOP,
         "embedUrl": url,
+        "ready": True,
+        "online": True,
+        "bound": True,
+        "verified": True,
+        "remoteState": REMOTE_STATE_READY,
         "message": "desktop session ready",
+        "userMessage": "远程服务已就绪",
     }
 
 
@@ -950,7 +1383,7 @@ def get_files_session(
 ) -> dict[str, Any]:
     if not is_enabled():
         return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
-    node_id, fail = _ensure_bound_node_id(
+    node_id, fail = _ensure_live_online_node_id(
         data_dir,
         client_id,
         userid=userid,
@@ -970,7 +1403,13 @@ def get_files_session(
         "meshNodeId": node_id,
         "viewmode": VIEWMODE_FILES,
         "embedUrl": url,
+        "ready": True,
+        "online": True,
+        "bound": True,
+        "verified": True,
+        "remoteState": REMOTE_STATE_READY,
         "message": "files session ready",
+        "userMessage": "远程服务已就绪",
     }
 
 

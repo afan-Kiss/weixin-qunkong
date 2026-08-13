@@ -80,7 +80,8 @@ test('userMessageForCode never exposes MESH_UNBOUND wording', () => {
 })
 
 test('bind helpers treat ambiguous as hard stop', () => {
-  assert.equal(isBindSuccess({ ok: true, bound: true, meshNodeId: 'n' }), true)
+  assert.equal(isBindSuccess({ ok: true, bound: true, ready: true, online: true, meshNodeId: 'n' }), true)
+  assert.equal(isBindSuccess({ ok: true, bound: true, meshNodeId: 'n' }), false)
   assert.equal(shouldStopBindRetry({ code: 'MESH_HOSTNAME_AMBIGUOUS' }), true)
   assert.equal(shouldStopBindRetry({ code: 'MESH_NO_MATCH' }), false)
 })
@@ -94,4 +95,11 @@ test('ensureMeshReady is single-flight for same clientId', async () => {
   assert.equal(rb.code, ra.code)
   const st = getMeshPrepareStatus()
   assert.ok([PHASE.FAILED, PHASE.IDLE, PHASE.READY].includes(st.phase) || st.phase)
+})
+
+test('PREPARE_RETRY_DELAYS_MS fit under default prepare timeout', () => {
+  const { PREPARE_RETRY_DELAYS_MS, DEFAULT_PREPARE_TIMEOUT_MS } = require('../electron/mesh-remote-bridge.cjs')
+  const sum = PREPARE_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0)
+  // Leave headroom for request timeouts and agent install; delays alone must not exhaust deadline.
+  assert.ok(sum < DEFAULT_PREPARE_TIMEOUT_MS - 20000)
 })

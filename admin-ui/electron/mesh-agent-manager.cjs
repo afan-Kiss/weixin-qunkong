@@ -172,7 +172,8 @@ function installedAgentNeedsRepair(clientId) {
       for (const key of ['MeshServer', 'ServerID', 'MeshID']) {
         const want = String(tmpl.get(key) || '').trim()
         const got = String(parsed.get(key) || '').trim()
-        if (want && got && want !== got) return true
+        // Template requires the field: missing/empty got must repair (not only mismatch).
+        if (want && want !== got) return true
       }
     }
     return false
@@ -713,6 +714,22 @@ async function ensureMeshAgentRunning(options = {}) {
     }
   }
   if (before.status === 'stopped' || before.status === 'installed_no_service') {
+    // Even when stopped: validate installed .msh before start (stale agentName / MeshServer / etc).
+    if (clientId && installedAgentNeedsRepair(clientId)) {
+      log('WARN', 'stopped agent needs repair before start', {
+        clientId,
+        expected: buildAgentName(clientId),
+      })
+      const repaired = await repairMeshAgent({ clientId })
+      return {
+        ok: repaired.ok,
+        code: repaired.ok ? 'OK' : repaired.code,
+        action: 'repair',
+        message: repaired.message,
+        status: repaired.status || (await getMeshAgentStatus()),
+        agentName: buildAgentName(clientId),
+      }
+    }
     const started = await startMeshAgent()
     return {
       ok: started.ok,

@@ -96,7 +96,17 @@ class RemoteSecurityTest(unittest.TestCase):
                     mesh_node_id="nodeABC",
                     owner_username="alice",
                 )
-                sess = mc.get_remote_session(data_dir, "c1")
+                with mock.patch.object(
+                    mc,
+                    "sync_nodes_via_control",
+                    return_value={
+                        "ok": True,
+                        "code": "OK",
+                        "nodes": [{"_id": "nodeABC", "name": "WXQK-c1", "conn": 1}],
+                    },
+                ):
+                    with mock.patch.object(mc, "mint_login_token", return_value="tok"):
+                        sess = mc.get_remote_session(data_dir, "c1")
                 self.assertTrue(sess.get("ok"))
                 self.assertIn("embedUrl", sess)
                 self.assertIn("login=", sess["embedUrl"])
@@ -117,6 +127,9 @@ class RemoteSecurityTest(unittest.TestCase):
         self.assertIn("embedUrl", text)
         self.assertIn("friendlyMeshError", text)
         self.assertIn("远程服务已就绪", text)
+        self.assertIn("设备当前离线", text)
+        self.assertIn("正在等待设备上线", text)
+        self.assertIn("正在绑定设备", text)
         self.assertIn("displayClientLabel", text)
         self.assertIn("looksLikeInternalId", text)
         self.assertIn('placeholder="搜索账号 / IP"', text)

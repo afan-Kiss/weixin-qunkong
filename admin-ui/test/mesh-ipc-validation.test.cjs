@@ -46,9 +46,11 @@ test('main keeps silent agent IPC only (no desktop/files session UI)', () => {
 
 test('bind success helper accepts already-bound and fresh bind payloads', () => {
   const { isBindSuccess, shouldStopBindRetry } = require('../electron/mesh-remote-bridge.cjs')
-  assert.equal(isBindSuccess({ ok: true, code: 'OK', bound: true, meshNodeId: 'n1' }), true)
-  assert.equal(isBindSuccess({ ok: true, code: 'OK', mapping: { mesh_node_id: 'n2' } }), true)
+  assert.equal(isBindSuccess({ ok: true, code: 'OK', bound: true, ready: true, online: true, meshNodeId: 'n1' }), true)
+  assert.equal(isBindSuccess({ ok: true, code: 'OK', ready: true, mapping: { mesh_node_id: 'n2' } }), true)
+  assert.equal(isBindSuccess({ ok: true, code: 'OK', bound: true, meshNodeId: 'n1' }), false)
   assert.equal(isBindSuccess({ ok: false, code: 'MESH_NO_MATCH' }), false)
+  assert.equal(isBindSuccess({ ok: false, code: 'MESH_AGENT_OFFLINE', bound: true, online: false }), false)
   assert.equal(shouldStopBindRetry({ code: 'MESH_DISABLED' }), true)
   assert.equal(shouldStopBindRetry({ code: 'MESH_NO_MATCH' }), false)
   assert.equal(shouldStopBindRetry({ code: 'MESH_AMBIGUOUS' }), true)

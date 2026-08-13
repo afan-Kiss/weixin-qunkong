@@ -77,17 +77,25 @@ test('getMeshAgentStatus reports missing when files absent', async () => {
 test('ensureMeshAgentRunning starts when files exist but service missing', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-agent-'))
   const root = path.join(tmp, 'meshcentral')
+  const installed = path.join(tmp, 'installed')
   fs.mkdirSync(root)
+  fs.mkdirSync(installed)
   const exe = path.join(root, 'meshagent.exe')
   const msh = path.join(root, 'meshagent.msh')
   fs.writeFileSync(exe, 'fake')
-  fs.writeFileSync(msh, 'MeshName=Test\n')
+  fs.writeFileSync(msh, 'MeshName=Test\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\n')
+  fs.writeFileSync(path.join(installed, 'MeshAgent.exe'), 'fake')
+  fs.writeFileSync(
+    path.join(installed, 'MeshAgent.msh'),
+    'MeshName=Test\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\nagentName=WXQK-client-test-1\n',
+  )
 
   let serviceRunning = false
 
   setMeshAgentDepsForTest({
     isPackaged: true,
     resourcesPath: tmp,
+    installedAgentDir: installed,
     platform: 'win32',
     fs,
     execFile: (cmd, args, opts, cb) => {
@@ -257,4 +265,97 @@ test('installMeshAgent fails clearly when binaries missing', async () => {
   const result = await installMeshAgent()
   assert.equal(result.ok, false)
   assert.equal(result.code, 'MESH_AGENT_FILES_MISSING')
+})
+
+test('installedAgentNeedsRepair when template MeshServer present but installed missing', () => {
+  const {
+    installedAgentNeedsRepair,
+    setMeshAgentDepsForTest,
+    resetMeshAgentDepsForTest,
+  } = require('../electron/mesh-agent-manager.cjs')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-repair-'))
+  const root = path.join(tmp, 'meshcentral')
+  const installed = path.join(tmp, 'installed')
+  fs.mkdirSync(root)
+  fs.mkdirSync(installed)
+  fs.writeFileSync(path.join(root, 'meshagent.exe'), 'fake')
+  fs.writeFileSync(
+    path.join(root, 'meshagent.msh'),
+    'MeshName=WXQK\nMeshID=mesh-id\nServerID=server-id\nMeshServer=wss://mesh.example/agent.ashx\n',
+  )
+  fs.writeFileSync(path.join(installed, 'MeshAgent.exe'), 'fake')
+  // Missing MeshServer / ServerID / MeshID entirely
+  fs.writeFileSync(path.join(installed, 'MeshAgent.msh'), 'agentName=WXQK-c1\n')
+  setMeshAgentDepsForTest({
+    isPackaged: true,
+    resourcesPath: tmp,
+    installedAgentDir: installed,
+    platform: 'win32',
+    fs,
+  })
+  assert.equal(installedAgentNeedsRepair('c1'), true)
+  // Wrong agentName
+  fs.writeFileSync(
+    path.join(installed, 'MeshAgent.msh'),
+    'MeshID=mesh-id\nServerID=server-id\nMeshServer=wss://mesh.example/agent.ashx\nagentName=WRONG\n',
+  )
+  assert.equal(installedAgentNeedsRepair('c1'), true)
+  // Matching
+  fs.writeFileSync(
+    path.join(installed, 'MeshAgent.msh'),
+    'MeshID=mesh-id\nServerID=server-id\nMeshServer=wss://mesh.example/agent.ashx\nagentName=WXQK-c1\n',
+  )
+  assert.equal(installedAgentNeedsRepair('c1'), false)
+  resetMeshAgentDepsForTest()
+})
+
+test('ensureMeshAgentRunning repairs stopped agent with stale msh before start', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-agent-'))
+  const root = path.join(tmp, 'meshcentral')
+  const installed = path.join(tmp, 'installed')
+  fs.mkdirSync(root)
+  fs.mkdirSync(installed)
+  fs.writeFileSync(path.join(root, 'meshagent.exe'), 'fake')
+  fs.writeFileSync(
+    path.join(root, 'meshagent.msh'),
+    'MeshName=WXQK Devices\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\n',
+  )
+  fs.writeFileSync(path.join(installed, 'MeshAgent.exe'), 'fake')
+  fs.writeFileSync(path.join(installed, 'MeshAgent.msh'), 'agentName=OLD\n')
+  let powershellRuns = 0
+  let running = false
+  setMeshAgentDepsForTest({
+    isPackaged: true,
+    resourcesPath: tmp,
+    installedAgentDir: installed,
+    platform: 'win32',
+    fs,
+    execFile: (cmd, args, opts, cb) => {
+      const c = String(cmd || '').toLowerCase()
+      if (c.includes('sc') && args[0] === 'query') {
+        return cb(null, running ? 'STATE              : 4  RUNNING\n' : 'STATE              : 1  STOPPED\n', '')
+      }
+      if (c.includes('sc') && args[0] === 'stop') {
+        running = false
+        return cb(null, 'OK\n', '')
+      }
+      if (c.includes('sc') && args[0] === 'start') {
+        running = true
+        return cb(null, 'OK\n', '')
+      }
+      if (c.includes('powershell')) {
+        powershellRuns += 1
+        return cb(null, '', '')
+      }
+      if (String(args[0] || '').includes('version') || String(args[0] || '') === '-version') {
+        return cb(null, 'MeshAgent 1.2.3\n', '')
+      }
+      return cb(null, '', '')
+    },
+  })
+
+  const ensured = await ensureMeshAgentRunning({ clientId: 'c1' })
+  assert.equal(ensured.action, 'repair')
+  assert.equal(ensured.ok, true)
+  assert.ok(powershellRuns >= 1)
 })

@@ -1168,30 +1168,48 @@ async function refreshDesktopMeshStatus() {
   const ip = String(online.ip || '').trim() || '—';
   try {
     const st = await api('/api/mesh/status?clientId=' + encodeURIComponent(cid));
-    const bound = !!st.bound;
+    const ready = !!(st.ready || st.remoteState === 'ready');
+    const remoteState = String(st.remoteState || '');
     const userMsg = st.userMessage || st.message || '';
-    // Never surface internal codes like MESH_UNBOUND / meshNodeId / clientId as primary UX
-    const statusLabel = bound
-      ? '<span class="badge badge-ok">远程服务已就绪</span>'
-      : '<span class="badge badge-neutral">' + escHtml(userMsg || '正在准备远程服务…') + '</span>';
+    let statusLabel = '';
+    if (ready) {
+      statusLabel = '<span class="badge badge-ok">远程服务已就绪</span>';
+    } else if (remoteState === 'bound_offline' || st.code === 'MESH_AGENT_OFFLINE') {
+      statusLabel = '<span class="badge badge-neutral">设备当前离线</span>';
+    } else if (remoteState === 'unverified' || st.code === 'MESH_SYNC_FAILED' || st.code === 'MESH_WS_ERROR') {
+      statusLabel = '<span class="badge badge-neutral">正在等待设备上线…</span>';
+    } else if (remoteState === 'preparing' || st.code === 'MESH_PREPARING') {
+      statusLabel = '<span class="badge badge-neutral">正在启动远程服务…</span>';
+    } else if (remoteState === 'unbound' || st.code === 'MESH_NO_MATCH' || st.code === 'MESH_NODE_MISSING') {
+      statusLabel = '<span class="badge badge-neutral">正在绑定设备…</span>';
+    } else if (st.ok === false && st.code === 'MESH_DISABLED') {
+      statusLabel = '<span class="badge badge-deny">远程服务不可用</span>';
+    } else if (st.ok === false || remoteState === 'error') {
+      statusLabel = '<span class="badge badge-deny">远程服务准备失败</span>';
+    } else {
+      statusLabel = '<span class="badge badge-neutral">' + escHtml(userMsg || '正在准备远程服务…') + '</span>';
+    }
     info.innerHTML = '<div><b>设备</b><div>' + escHtml(label) + '</div>'
       + '<div class="muted" style="margin-top:4px;font-size:12px">IP ' + escHtml(ip) + '</div></div>'
       + '<div style="margin-top:10px"><b>状态</b><div>' + statusLabel + '</div></div>'
-      + (userMsg && bound ? '<div style="margin-top:10px" class="muted">' + escHtml(userMsg) + '</div>' : '');
+      + (userMsg && ready ? '<div style="margin-top:10px" class="muted">' + escHtml(userMsg) + '</div>' : '');
   } catch (e) {
     info.innerHTML = '<span class="badge badge-deny">远程服务准备失败</span><div class="muted" style="margin-top:8px">' + escHtml(e.message || e) + '</div>';
   }
 }
 function friendlyMeshError(data) {
   const code = String((data && data.code) || '');
+  const remoteState = String((data && data.remoteState) || '');
   if (code === 'MESH_DISABLED' || code === 'MESH_WS_UNAVAILABLE' || code === 'MESH_SYNC_FAILED' || code === 'MESH_WS_ERROR') {
     return 'MeshCentral 不可用';
   }
   if (code === 'MESH_AMBIGUOUS' || code === 'MESH_HOSTNAME_AMBIGUOUS') return '发现重复设备';
   if (code === 'MESH_INSTALL_FAILED' || code === 'MESH_AGENT_FILES_MISSING') return 'MeshAgent 安装失败';
-  if (code === 'MESH_AGENT_OFFLINE' || code === 'MESH_NODE_TIMEOUT') return 'MeshAgent 无法连接服务器';
-  if (code === 'MESH_NO_MATCH' || code === 'MESH_UNBOUND' || code === 'MESH_PREPARING' || code === 'MESH_PREPARE_FAILED') {
-    return '设备绑定失败';
+  if (code === 'MESH_AGENT_OFFLINE' || code === 'MESH_NODE_TIMEOUT' || remoteState === 'bound_offline') {
+    return '正在等待客户端远程服务上线…';
+  }
+  if (code === 'MESH_NO_MATCH' || code === 'MESH_UNBOUND' || code === 'MESH_NODE_MISSING' || code === 'MESH_PREPARING' || code === 'MESH_PREPARE_FAILED') {
+    return '正在绑定设备…';
   }
   const msg = String((data && (data.userMessage || data.message)) || '');
   if (/未绑定|MESH_|meshNode|auto-bind|Mesh node/i.test(msg)) return '远程服务准备失败';
@@ -1213,13 +1231,13 @@ async function openMeshSession(mode, { forceTab } = {}) {
   });
   try {
     let data = await api(path, { method: 'POST', body: sessionBody });
-    // Self-heal once: shared auto-bind then retry (Desktop/Files 同一路径)
-    if (!data || !data.ok || !data.embedUrl) {
+    // Self-heal once only when session failed without a usable live session
+    if (!data || !data.ok || !data.embedUrl || data.ready === false) {
       const bind = await api('/api/mesh/auto-bind', {
         method: 'POST',
         body: bindBody,
       });
-      if (bind && bind.ok) {
+      if (bind && (bind.ready || (bind.ok && bind.online))) {
         await refreshDesktopMeshStatus();
         data = await api(path, { method: 'POST', body: sessionBody });
       } else if (!data || !data.ok) {
@@ -1274,7 +1292,7 @@ async function autoBindDesktopClient() {
         agentName: 'WXQK-' + cid,
       }),
     });
-    alert(data && data.ok ? '远程服务已就绪' : friendlyMeshError(data));
+    alert(data && (data.ready || (data.ok && data.online)) ? '远程服务已就绪' : friendlyMeshError(data));
     await refreshDesktopMeshStatus();
   } catch (e) {
     alert(e.message || '远程服务准备失败');

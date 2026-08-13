@@ -130,17 +130,162 @@ class MeshCentralClientTest(unittest.TestCase):
             self.assertIsNotNone(got)
             assert got is not None
             self.assertEqual(got["mesh_group_id"], "group-1")
-            status = mc.get_device_status(data_dir, "client-1")
-            self.assertTrue(status["ok"])
-            self.assertTrue(status["bound"])
+            online_nodes = {
+                "ok": True,
+                "code": "OK",
+                "nodes": [{"_id": "node-9", "name": "WXQK-client-1", "conn": 1}],
+            }
+            mc.clear_live_status_cache()
+            with mock.patch.object(mc, "sync_nodes_via_control", return_value=online_nodes):
+                status = mc.get_device_status(data_dir, "client-1")
+                self.assertTrue(status["ok"])
+                self.assertTrue(status["bound"])
+                self.assertTrue(status["ready"])
+                self.assertEqual(status["remoteState"], mc.REMOTE_STATE_READY)
 
-            with mock.patch.object(mc, "mint_login_token", return_value="tok"):
-                desktop = mc.get_remote_session(data_dir, "client-1")
-                files = mc.get_files_session(data_dir, "client-1")
+                with mock.patch.object(mc, "mint_login_token", return_value="tok"):
+                    desktop = mc.get_remote_session(data_dir, "client-1")
+                    files = mc.get_files_session(data_dir, "client-1")
             self.assertTrue(desktop["ok"])
             self.assertIn("viewmode=11", desktop["embedUrl"])
             self.assertTrue(files["ok"])
             self.assertIn("viewmode=13", files["embedUrl"])
+
+    def test_status_mapping_exists_but_node_missing_not_ready(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            mc.sync_device_mapping(data_dir, client_id="c1", mesh_node_id="old-node")
+            mc.clear_live_status_cache()
+            with mock.patch.object(
+                mc,
+                "sync_nodes_via_control",
+                return_value={"ok": True, "code": "OK", "nodes": []},
+            ):
+                st = mc.get_device_status(data_dir, "c1")
+            self.assertTrue(st["ok"])
+            self.assertFalse(st.get("ready"))
+            self.assertNotEqual(st.get("remoteState"), mc.REMOTE_STATE_READY)
+
+    def test_status_node_offline_not_ready(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            mc.sync_device_mapping(data_dir, client_id="c1", mesh_node_id="n1")
+            mc.clear_live_status_cache()
+            with mock.patch.object(
+                mc,
+                "sync_nodes_via_control",
+                return_value={
+                    "ok": True,
+                    "code": "OK",
+                    "nodes": [{"_id": "n1", "name": "WXQK-c1", "conn": 0}],
+                },
+            ):
+                st = mc.get_device_status(data_dir, "c1")
+            self.assertFalse(st.get("ready"))
+            self.assertEqual(st.get("remoteState"), mc.REMOTE_STATE_BOUND_OFFLINE)
+            self.assertEqual(st.get("code"), "MESH_AGENT_OFFLINE")
+
+    def test_status_sync_failure_keeps_mapping_not_ready(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            mc.sync_device_mapping(data_dir, client_id="c1", mesh_node_id="n1")
+            mc.clear_live_status_cache()
+            with mock.patch.object(
+                mc,
+                "sync_nodes_via_control",
+                return_value={"ok": False, "code": "MESH_WS_ERROR", "message": "boom", "nodes": []},
+            ):
+                st = mc.get_device_status(data_dir, "c1")
+            self.assertFalse(st.get("ready"))
+            self.assertTrue(st.get("bound"))
+            self.assertFalse(st.get("verified"))
+            self.assertEqual(mc.get_mapping(data_dir, "c1")["mesh_node_id"], "n1")
+
+    def test_auto_bind_empty_nodes_does_not_claim_ready(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            mc.sync_device_mapping(data_dir, client_id="c1", mesh_node_id="stale")
+            with mock.patch.object(
+                mc,
+                "sync_nodes_via_control",
+                return_value={"ok": True, "code": "OK", "nodes": []},
+            ):
+                result = mc.auto_bind_client(data_dir, "c1")
+            self.assertFalse(result.get("ok"))
+            self.assertFalse(result.get("ready"))
+            self.assertEqual(result.get("code"), "MESH_NO_MATCH")
+            self.assertEqual(mc.get_mapping(data_dir, "c1")["mesh_node_id"], "stale")
+
+    def test_auto_bind_remaps_when_old_node_gone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            mc.sync_device_mapping(data_dir, client_id="c1", mesh_node_id="old")
+            with mock.patch.object(
+                mc,
+                "sync_nodes_via_control",
+                return_value={
+                    "ok": True,
+                    "code": "OK",
+                    "nodes": [{"_id": "new-node", "name": "WXQK-c1", "conn": 1, "meshid": "g"}],
+                },
+            ):
+                result = mc.auto_bind_client(data_dir, "c1")
+            self.assertTrue(result.get("ready"))
+            self.assertEqual(result.get("meshNodeId"), "new-node")
+            self.assertEqual(mc.get_mapping(data_dir, "c1")["mesh_node_id"], "new-node")
+
+    def test_session_requires_online_node(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            mc.sync_device_mapping(data_dir, client_id="c1", mesh_node_id="n1")
+            mc.clear_live_status_cache()
+            with mock.patch.object(
+                mc,
+                "sync_nodes_via_control",
+                return_value={
+                    "ok": True,
+                    "code": "OK",
+                    "nodes": [{"_id": "n1", "name": "WXQK-c1", "conn": 0}],
+                },
+            ):
+                desk = mc.get_remote_session(data_dir, "c1")
+                files = mc.get_files_session(data_dir, "c1")
+            self.assertFalse(desk.get("ok"))
+            self.assertFalse(files.get("ok"))
+            self.assertEqual(desk.get("code"), "MESH_AGENT_OFFLINE")
+            self.assertNotIn("embedUrl", desk)
+
+    def test_session_online_generates_desktop_and_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            mc.sync_device_mapping(data_dir, client_id="c1", mesh_node_id="n1")
+            mc.clear_live_status_cache()
+            with mock.patch.object(
+                mc,
+                "sync_nodes_via_control",
+                return_value={
+                    "ok": True,
+                    "code": "OK",
+                    "nodes": [{"_id": "n1", "name": "WXQK-c1", "conn": 1}],
+                },
+            ):
+                with mock.patch.object(mc, "mint_login_token", return_value="tok"):
+                    desk = mc.get_remote_session(data_dir, "c1")
+                    files = mc.get_files_session(data_dir, "c1")
+            self.assertTrue(desk["ok"])
+            self.assertTrue(files["ok"])
+            self.assertIn("viewmode=11", desk["embedUrl"])
+            self.assertIn("hide=63", desk["embedUrl"])
+            self.assertIn("viewmode=13", files["embedUrl"])
+            self.assertIn("hide=63", files["embedUrl"])
+            self.assertIn("node=n1", desk["embedUrl"])
+            self.assertIn("node=n1", files["embedUrl"])
+
+    def test_node_is_online_helpers(self):
+        self.assertTrue(mc.node_is_online({"conn": 1}))
+        self.assertFalse(mc.node_is_online({"conn": 0}))
+        self.assertTrue(mc.node_is_online({"online": True}))
+        self.assertFalse(mc.node_is_online({}))
 
     def test_sync_nodes_soft_fail_without_websocket(self):
         with mock.patch.object(mc, "websocket", None):
@@ -214,13 +359,18 @@ class MeshCentralClientTest(unittest.TestCase):
                     "ok": True,
                     "code": "OK",
                     "bound": True,
+                    "online": True,
+                    "ready": True,
+                    "verified": True,
+                    "remoteState": mc.REMOTE_STATE_READY,
                     "meshNodeId": "node-auto",
                     "mapping": {"mesh_node_id": "node-auto"},
                 }
 
-            with mock.patch.object(mc, "auto_bind_client", side_effect=fake_auto_bind):
-                with mock.patch.object(mc, "mint_login_token", return_value="tok"):
-                    sess = mc.get_remote_session(data_dir, "c-new", hostname="PC1")
+            with mock.patch.object(mc, "sync_nodes_via_control", return_value={"ok": True, "nodes": []}):
+                with mock.patch.object(mc, "auto_bind_client", side_effect=fake_auto_bind):
+                    with mock.patch.object(mc, "mint_login_token", return_value="tok"):
+                        sess = mc.get_remote_session(data_dir, "c-new", hostname="PC1")
             self.assertTrue(sess["ok"])
             self.assertIn("node=node-auto", sess["embedUrl"])
             self.assertEqual(mc.get_mapping(data_dir, "c-new")["mesh_node_id"], "node-auto")
