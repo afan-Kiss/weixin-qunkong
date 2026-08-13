@@ -177,6 +177,23 @@ def resolve_manifest_for_client(
     return stable, stable_sig, stable_sig_v2
 
 
+def _max_targeted_release_sequence(data_dir: Path) -> int:
+    store = load_targeted_releases(data_dir)
+    releases = store.get("releases") if isinstance(store, dict) else []
+    highest = 0
+    if not isinstance(releases, list):
+        return 0
+    for rel in releases:
+        if not isinstance(rel, dict):
+            continue
+        man = rel.get("manifest") if isinstance(rel.get("manifest"), dict) else {}
+        try:
+            highest = max(highest, int(man.get("releaseSequence") or 0))
+        except Exception:
+            continue
+    return highest
+
+
 def publish_targeted_release(
     data_dir: Path,
     *,
@@ -189,6 +206,7 @@ def publish_targeted_release(
     download_url: str = "",
     seed_b64: str = "",
     public_base_url: str = "https://mesh.example.invalid/wxqk",
+    release_sequence: int | None = None,
 ) -> dict[str, Any]:
     """Publish a package only for selected clientIds; keep global stable manifest unchanged."""
     targets = normalize_target_client_ids(target_client_ids)
@@ -204,9 +222,26 @@ def publish_targeted_release(
     size = pkg.stat().st_size
     stable = load_manifest(data_dir)
     try:
-        seq = int(stable.get("releaseSequence") or 0) + 1
+        stable_seq = int(stable.get("releaseSequence") or 0)
     except Exception:
-        seq = 1
+        stable_seq = 0
+    # Prefer portable package releaseSequence (e.g. 102) over global-stable+1 (often stale).
+    meta = load_package_meta(data_dir, bid)
+    try:
+        meta_seq = int(meta.get("releaseSequence") or 0)
+    except Exception:
+        meta_seq = 0
+    try:
+        explicit_seq = int(release_sequence) if release_sequence is not None else 0
+    except Exception:
+        explicit_seq = 0
+    seq = max(
+        1,
+        stable_seq + 1,
+        meta_seq,
+        explicit_seq,
+        _max_targeted_release_sequence(data_dir),
+    )
     caller_ver = str(version or "").strip().lstrip("vV")
     if not (len(caller_ver) <= 16 and caller_ver.replace(".", "", 1).isdigit() and caller_ver.count(".") == 1):
         stem = Path(str(file_name or "")).stem

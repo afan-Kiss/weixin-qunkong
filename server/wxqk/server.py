@@ -3453,6 +3453,11 @@ class Handler(BaseHTTPRequestHandler):
                 seed = str(_env("FACAI888_PUBLISH_KEY_B64", default="") or "").strip()
                 targets = body.get("targetClientIds")
                 if isinstance(targets, list) and any(str(x).strip() for x in targets):
+                    raw_seq = body.get("releaseSequence")
+                    try:
+                        release_seq = int(raw_seq) if raw_seq is not None and str(raw_seq).strip() != "" else None
+                    except Exception:
+                        release_seq = None
                     self._send(200, um.publish_targeted_release(
                         DATA_DIR,
                         version=str(body.get("version") or "").strip(),
@@ -3464,6 +3469,7 @@ class Handler(BaseHTTPRequestHandler):
                         download_url=str(body.get("downloadURL") or "").strip(),
                         seed_b64=seed,
                         public_base_url=PUBLIC_BASE_URL,
+                        release_sequence=release_seq,
                     ))
                 else:
                     self._send(200, um.publish_release(
@@ -3534,16 +3540,111 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "message": "targetClientId required"})
                 return
             import command_queue as cq
-            enq = cq.enqueue(cid, "CHECK_CLIENT_UPDATE", {"reason": str(body.get("reason") or "targeted_diagnostic")}, policy_epoch=_policy_epoch(), ttl_sec=600)
+            try:
+                ttl_sec = float(body.get("ttlSec") or body.get("ttl_sec") or 600)
+            except Exception:
+                ttl_sec = 600.0
+            ttl_sec = max(60.0, min(ttl_sec, 86400.0))
+            reason = str(body.get("reason") or "targeted_diagnostic")
+            enq = cq.enqueue(
+                cid,
+                "CHECK_CLIENT_UPDATE",
+                {"reason": reason},
+                policy_epoch=_policy_epoch(),
+                ttl_sec=ttl_sec,
+            )
             cmd_id = str(enq.get("commandId") or "")
-            tell_agent(cid, {
+            pushed = tell_agent(cid, {
                 "type": "check_client_update",
                 "commandType": "CHECK_CLIENT_UPDATE",
                 "commandId": cmd_id,
                 "id": cmd_id,
-                "reason": str(body.get("reason") or "targeted_diagnostic"),
+                "reason": reason,
             })
-            self._send(200, {"ok": True, "clientId": cid, "commandId": cmd_id})
+            online = bool(get_online_meta(cid).get("online"))
+            self._send(200, {
+                "ok": True,
+                "clientId": cid,
+                "commandId": cmd_id,
+                "ttlSec": ttl_sec,
+                "agentPush": bool(pushed),
+                "online": online,
+            })
+            return
+
+        if path == "/api/admin/legacy-update-status":
+            if not self._require_admin():
+                return
+            qs = self._qs()
+            cid = safe_id(
+                (body.get("targetClientId") if isinstance(body, dict) else None)
+                or (body.get("clientId") if isinstance(body, dict) else None)
+                or (qs.get("clientId") or [""])[0]
+                or (qs.get("targetClientId") or [""])[0]
+                or ""
+            )
+            if not cid or cid == "unknown":
+                self._send(400, {"ok": False, "message": "clientId required"})
+                return
+            import command_queue as cq
+            import update_manifest as um
+            meta = get_online_meta(cid)
+            man, sig, sig_v2 = um.resolve_manifest_for_client(
+                DATA_DIR,
+                client_id=cid,
+                client_ip=str(meta.get("ip") or ""),
+                online_lookup=lambda x: get_online_meta(x),
+                clients_by_ip=lambda tip: clients_by_ip(tip),
+            )
+            pending = cq.peek_pending(cid, limit=20)
+            recent = cq.recent_commands(cid, limit=20, command_type="CHECK_CLIENT_UPDATE")
+            events = []
+            try:
+                for ev in list(um.recent_events(DATA_DIR, limit=80) or []):
+                    if not isinstance(ev, dict):
+                        continue
+                    ev_cid = str(ev.get("clientId") or "").strip()
+                    if ev_cid and ev_cid != cid:
+                        continue
+                    events.append({
+                        "event": ev.get("event"),
+                        "version": ev.get("version"),
+                        "releaseSequence": ev.get("releaseSequence"),
+                        "t": ev.get("t"),
+                        "code": ev.get("code"),
+                        "clientIdSuffix": ("…" + ev_cid[-8:]) if len(ev_cid) >= 8 else "",
+                    })
+                    if len(events) >= 12:
+                        break
+            except Exception:
+                events = []
+            self._send(200, {
+                "ok": True,
+                "clientIdSuffix": ("…" + cid[-8:]) if len(cid) >= 8 else cid,
+                "online": {
+                    "online": bool(meta.get("online")),
+                    "version": meta.get("version") or "",
+                    "hostname": meta.get("hostname") or meta.get("host") or "",
+                    "account": meta.get("account") or "",
+                    "ip": meta.get("ip") or "",
+                    "lastSeenText": meta.get("lastSeenText") or "",
+                },
+                "targetedManifest": {
+                    "version": (man or {}).get("version") or "",
+                    "releaseSequence": (man or {}).get("releaseSequence") or 0,
+                    "sha256": (man or {}).get("sha256") or "",
+                    "fileName": (man or {}).get("fileName") or "",
+                    "mandatory": bool((man or {}).get("mandatory")),
+                    "securityEmergency": bool((man or {}).get("securityEmergency")),
+                    "failBeforeReady": (man or {}).get("failBeforeReady"),
+                    "targetClientIdsCount": len((man or {}).get("targetClientIds") or []),
+                    "hasSignature": bool(sig),
+                    "hasSignatureV2": bool(sig_v2),
+                },
+                "pendingCommands": pending,
+                "recentCheckClientUpdate": recent,
+                "recentUpdateEvents": events,
+            })
             return
 
         self._send(404, {"ok": False, "message": "not found"})

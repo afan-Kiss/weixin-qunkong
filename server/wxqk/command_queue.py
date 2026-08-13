@@ -294,6 +294,50 @@ def peek_pending(device_id: str, limit: int = 20) -> list[dict[str, Any]]:
     return [_row_to_wire(r) for r in rows]
 
 
+def get_command(device_id: str, command_id: str) -> dict[str, Any] | None:
+    cid = str(device_id or "").strip()
+    cmd_id = str(command_id or "").strip()
+    if not cid or not cmd_id:
+        return None
+    with sdb.db_lock:
+        conn = sdb.get_conn()
+        row = conn.execute(
+            "SELECT * FROM device_commands WHERE command_id=? AND device_id=?",
+            (cmd_id, cid),
+        ).fetchone()
+    return _row_to_wire(row) if row else None
+
+
+def recent_commands(device_id: str, *, limit: int = 20, command_type: str = "") -> list[dict[str, Any]]:
+    """Recent commands for diagnostics (any status)."""
+    cid = str(device_id or "").strip()
+    if not cid:
+        return []
+    ctype = _normalize_type(command_type) if command_type else ""
+    lim = max(1, min(int(limit or 20), 100))
+    with sdb.db_lock:
+        conn = sdb.get_conn()
+        if ctype:
+            rows = conn.execute(
+                """
+                SELECT * FROM device_commands
+                WHERE device_id=? AND command_type=?
+                ORDER BY issued_at DESC LIMIT ?
+                """,
+                (cid, ctype, lim),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM device_commands
+                WHERE device_id=?
+                ORDER BY issued_at DESC LIMIT ?
+                """,
+                (cid, lim),
+            ).fetchall()
+    return [_row_to_wire(r) for r in rows]
+
+
 def ack(
     device_id: str,
     command_id: str,

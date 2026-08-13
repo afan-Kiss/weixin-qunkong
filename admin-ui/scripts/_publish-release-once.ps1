@@ -215,6 +215,16 @@ $pubObj = @{
   mandatory = [bool]$Mandatory.IsPresent
   fileName = $fileName
 }
+# Carry portable package.json releaseSequence so targeted publish is not stuck at global-stable+1.
+try {
+  $pkgJsonPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'package.json'
+  if (Test-Path -LiteralPath $pkgJsonPath) {
+    $pkgJson = Get-Content -LiteralPath $pkgJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $pkgSeq = 0
+    try { $pkgSeq = [int]$pkgJson.releaseSequence } catch { $pkgSeq = 0 }
+    if ($pkgSeq -gt 0) { $pubObj.releaseSequence = $pkgSeq }
+  }
+} catch {}
 if ($TargetClientIds -and $TargetClientIds.Count -gt 0) {
   $pubObj.targetClientIds = @($TargetClientIds)
 }
