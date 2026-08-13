@@ -1091,7 +1091,11 @@ async function installMeshAgent(options = {}) {
     log('INFO', 'installing WXQK agent service')
   }
 
-  let result = await installBrandedWindowsService({ exePath: installExe, mshPath: installMsh })
+  // Primary path: official MeshCentral agent -fullinstall from staging (exe+msh same dir).
+  // PowerShell New-Service is fallback when branding/fullinstall cannot produce healthy ImagePath.
+  const elevateOpts = stagingDir ? { cwd: stagingDir } : {}
+  let result = await runElevated(installExe, ['-fullinstall'], elevateOpts)
+  let installPath = 'fullinstall'
   if (isElevationDenied(result)) {
     return {
       ok: false,
@@ -1101,8 +1105,19 @@ async function installMeshAgent(options = {}) {
     }
   }
   if (!result.ok) {
-    const elevateOpts = stagingDir ? { cwd: stagingDir } : {}
-    result = await runElevated(installExe, ['-fullinstall'], elevateOpts)
+    log('WARN', 'fullinstall failed — trying -install', { error: redact(result.stderr || result.error || '') })
+    result = await runElevated(installExe, ['-install'], elevateOpts)
+    installPath = 'install'
+  }
+  let after = await getMeshAgentStatus()
+  if (!result.ok || !isBrandedInstallHealthy(after)) {
+    log('WARN', 'official install incomplete — PowerShell branded fallback', {
+      status: after.status,
+      imagePathOk: after.imagePathOk,
+      installedExePresent: after.installedExePresent,
+    })
+    result = await installBrandedWindowsService({ exePath: installExe, mshPath: installMsh })
+    installPath = 'powershell_new_service'
     if (isElevationDenied(result)) {
       return {
         ok: false,
@@ -1110,9 +1125,6 @@ async function installMeshAgent(options = {}) {
         message: '需要管理员权限才能安装服务',
         status: await getMeshAgentStatus(),
       }
-    }
-    if (!result.ok) {
-      result = await runElevated(installExe, ['-install'], elevateOpts)
     }
   }
 
@@ -1125,11 +1137,12 @@ async function installMeshAgent(options = {}) {
 
   await runElevated('sc.exe', ['config', SERVICE_NAME, 'type=', 'own'])
 
-  const after = await getMeshAgentStatus()
+  after = await getMeshAgentStatus()
   // CRITICAL: never treat orphan servicePresent as install success
-  const ok = Boolean(result.ok) && isBrandedInstallHealthy(after)
+  const ok = isBrandedInstallHealthy(after) && (Boolean(result.ok) || after.status === 'running' || after.status === 'stopped')
   log(ok ? 'INFO' : 'ERROR', 'install finished', {
     ok,
+    installPath,
     status: after.status,
     imagePathOk: after.imagePathOk,
     installedExePresent: after.installedExePresent,
@@ -1143,6 +1156,7 @@ async function installMeshAgent(options = {}) {
     agentName: agentName || undefined,
     stagingDir: stagingDir || undefined,
     mshSynced: Boolean(mshSync && mshSync.ok),
+    installPath,
   }
 }
 

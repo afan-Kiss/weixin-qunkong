@@ -118,6 +118,7 @@ test('ensureMeshAgentRunning starts when files exist but service missing', async
     resourcesPath: tmp,
     installedAgentDir: installed,
     serviceBinaryPath: path.join(installed, 'WXQK.exe'),
+    legacyInstalledAgentDir: path.join(tmp, 'no-legacy'),
     platform: 'win32',
     fs,
     execFile: (cmd, args, opts, cb) => {

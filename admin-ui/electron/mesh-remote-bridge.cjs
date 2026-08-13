@@ -67,9 +67,12 @@ function log(message, details) {
         .replace(/MeshID=[^"&\s]+/gi, 'MeshID=***')
         .replace(/ServerID=[^"&\s]+/gi, 'ServerID=***')
       : ''
-    console.log(`[MESH] ${message}${safe ? ` ${safe}` : ''}`)
+    const suffix = safe ? ` ${safe}` : ''
+    console.log(`[MESH] ${message}${suffix}`)
+    console.log(`[MESH-BOOT] ${message}${suffix}`)
   } catch {
     console.log(`[MESH] ${message}`)
+    console.log(`[MESH-BOOT] ${message}`)
   }
 }
 
@@ -351,6 +354,7 @@ async function ensureMeshReady(clientId, opts = {}) {
         return finishFailed(cid, ensured?.code || 'MESH_START_FAILED', ensured?.message || '服务启动失败')
       }
       log('agent running', { action: ensured.action, clientId: redactClientId(cid) })
+      log('service_running', { action: ensured.action, status: ensured?.status?.status })
 
       // Optional quick status check after agent is confirmed running.
       try {

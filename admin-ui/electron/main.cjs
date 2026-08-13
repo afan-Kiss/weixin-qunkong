@@ -156,7 +156,7 @@ async function tryDownloadQrImageViaCdn(record, row, temporaryPath, opts = {}) {
 }
 const { matchChatAddRule } = require('./chat-add-friend.cjs')
 const { isWeixinExe, detectPreferredWeixin, readFileVersion } = require('./weixin-detect.cjs')
-const { BUILD_ID, VERSION, RELEASE_SEQUENCE } = require('./device-identity.cjs')
+const { BUILD_ID, VERSION, RELEASE_SEQUENCE, loadOrCreate } = require('./device-identity.cjs')
 const {
   startUpdateScheduler,
   stopUpdateScheduler,
@@ -728,6 +728,62 @@ function notifyWithoutFocus(title, body, channel, payload) {
   const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
   if (win && win.isVisible() && win.isFocused()) {
     dialog.showMessageBox(win, { type: 'info', title: headline, message: text }).catch(() => {})
+  }
+}
+
+/**
+ * Shared device identity (idempotent). Same file as remote-agent.cjs uses.
+ * Mesh Agent prepare MUST use this — never wait for account session / WSS.
+ */
+function getOrCreateLocalDeviceIdentity() {
+  return loadOrCreate(app.getPath('userData'))
+}
+
+function resolveLocalClientId() {
+  try {
+    const identity = getOrCreateLocalDeviceIdentity()
+    const clientId = String(identity?.clientId || identity?.deviceId || '').trim()
+    if (clientId) {
+      appLog('INFO', '[MESH-BOOT] identity_ready', {
+        clientIdPrefix: clientId.slice(0, 8),
+        deviceIdPrefix: String(identity?.deviceId || '').slice(0, 8),
+      })
+    }
+    return clientId
+  } catch (error) {
+    appLog('ERROR', '[MESH-BOOT] identity_ready failed', { error: rawErrorMessage(error) })
+    return ''
+  }
+}
+
+/**
+ * Local WXQK Mesh Agent prepare — independent of softwareAuth.session / business WSS.
+ * Fire-and-forget; mesh-remote-bridge single-flight prevents duplicate UAC.
+ * @param {string} [reason]
+ */
+function startLocalMeshPrepareOnStartup(reason = 'cold_boot') {
+  try {
+    appLog('INFO', '[MESH-BOOT] prepare_requested', { reason })
+    const clientId = resolveLocalClientId()
+    if (!clientId) {
+      appLog('ERROR', '[MESH-BOOT] client_id_ready failed', { reason })
+      return
+    }
+    appLog('INFO', '[MESH-BOOT] client_id_ready', { reason, clientIdPrefix: clientId.slice(0, 8) })
+    void meshRemote.ensureMeshReady(clientId)
+      .then((st) => {
+        appLog('INFO', '[MESH-BOOT] prepare_settled', {
+          reason,
+          phase: st?.phase,
+          remoteReady: Boolean(st?.remoteReady),
+          code: st?.code || '',
+        })
+      })
+      .catch((error) => {
+        appLog('ERROR', '[MESH-BOOT] prepare_failed', { reason, error: rawErrorMessage(error) })
+      })
+  } catch (error) {
+    appLog('ERROR', '[MESH-BOOT] prepare_requested failed', { reason, error: rawErrorMessage(error) })
   }
 }
 
@@ -4877,9 +4933,8 @@ function registerIpc() {
         resumeQueuedTasks()
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
-      const selfId = String(getRemoteAgentStatus()?.clientId || '')
-      // 后台 prepare：不 await，不挡登录返回
-      meshRemote.ensureMeshReady(selfId).catch(() => {})
+      // Mesh prepare uses local identity + single-flight（与 cold_boot 合并，不重复 UAC）
+      startLocalMeshPrepareOnStartup('auth:login')
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '登录失败，请稍后重试') } }
   })
@@ -4892,9 +4947,7 @@ function registerIpc() {
         resumeQueuedTasks()
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
-      const selfId = String(getRemoteAgentStatus()?.clientId || '')
-      // 后台 prepare：不 await，不挡登录返回
-      meshRemote.ensureMeshReady(selfId).catch(() => {})
+      startLocalMeshPrepareOnStartup('auth:register')
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '注册失败，请稍后重试') } }
   })
@@ -5796,6 +5849,10 @@ app.whenReady().then(async () => {
     createWindow()
     markStartup('main window created')
 
+    // Local WXQK Agent：与账号 session / 业务 WSS 解耦；不 await，不挡主界面
+    startLocalMeshPrepareOnStartup('cold_boot')
+    markStartup('mesh prepare requested')
+
     // 非首屏必需：窗口创建后再跑，避免同步磁盘 IO / SQL / 托盘挡住首屏
     setImmediate(() => {
       try {
@@ -5854,17 +5911,12 @@ app.whenReady().then(async () => {
       },
     })
 
-    // 账号校验走网络，绝不 await 挡住启动后续；超时也只影响恢复实例 / MeshAgent
+    // 账号校验走网络，绝不 await 挡住启动；也不再作为 Mesh Agent 启动门槛
     void softwareAuth.session().then((account) => {
       if (!account) return
-      // 远程 Agent 可并行；QUEUED 任务必须等 restoreInstances 完成后再恢复
+      // 业务 remote-agent（WSS）与实例恢复；Mesh Agent 已在 cold_boot 独立准备
       startRemoteAgent(remoteAgentOptions(account.username))
-        .then((st) => {
-          const selfId = String(st?.clientId || getRemoteAgentStatus()?.clientId || '')
-          // 后台 ensureMeshReady：绝不 await 挡主界面
-          return meshRemote.ensureMeshReady(selfId)
-        })
-        .catch((error) => appLog('ERROR', '设备连接失败', { error: rawErrorMessage(error) }))
+        .catch((error) => appLog('ERROR', '业务设备连接失败', { error: rawErrorMessage(error) }))
       restoreInstancesThenResumeQueuedTasks()
         .catch((error) => appLog('ERROR', '恢复微信实例失败', { error: rawErrorMessage(error) }))
     }).catch((error) => appLog('ERROR', '读取登录会话失败', { error: rawErrorMessage(error) }))

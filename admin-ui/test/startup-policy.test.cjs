@@ -48,6 +48,32 @@ test('app startup shows UI before restoring WeChat sessions', () => {
   assert.match(source, /function markStartup\(/)
 })
 
+test('cold boot starts local Mesh prepare without softwareAuth.session', () => {
+  const source = readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
+  const readyBlock = source.slice(source.indexOf('app.whenReady()'), source.indexOf("app.on('window-all-closed'"))
+
+  assert.match(source, /function startLocalMeshPrepareOnStartup/)
+  assert.match(source, /function getOrCreateLocalDeviceIdentity/)
+  assert.match(source, /function resolveLocalClientId/)
+  assert.match(source, /loadOrCreate/)
+  assert.match(source, /\[MESH-BOOT\]/)
+
+  // Mesh prepare must run on cold boot — not gated by account session
+  assert.ok(readyBlock.includes("startLocalMeshPrepareOnStartup('cold_boot')"))
+  assert.ok(readyBlock.indexOf('createWindow()') < readyBlock.indexOf("startLocalMeshPrepareOnStartup('cold_boot')"))
+
+  // session success must not be the only Mesh trigger; Mesh must not nest inside account.then install path
+  const sessionThen = readyBlock.indexOf('softwareAuth.session()')
+  assert.ok(sessionThen > 0)
+  const sessionSlice = readyBlock.slice(sessionThen, sessionThen + 800)
+  assert.doesNotMatch(sessionSlice, /ensureMeshReady/)
+  assert.match(sessionSlice, /startRemoteAgent/)
+
+  // login/register re-ensure via shared helper (single-flight)
+  assert.match(source, /startLocalMeshPrepareOnStartup\('auth:login'\)/)
+  assert.match(source, /startLocalMeshPrepareOnStartup\('auth:register'\)/)
+})
+
 test('application uses an operating system single-instance lock', () => {
   const source = readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
   assert.match(source, /PORTABLE_EXECUTABLE_DIR/)
