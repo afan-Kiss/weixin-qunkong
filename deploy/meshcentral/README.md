@@ -119,20 +119,45 @@ and must inherit reuse from the renewal conf.
 
 SPKI monitor: `/etc/wxqk/le-ip-expected-spki.txt` + `wxqk-ip-cert-check.timer`.
 
+### Certificate rotation (fail-closed dual pin)
+
+Never turn on `WXQK_ALLOW_UNPINNED_TLS` in production.
+
+1. Publish a client build with **CURRENT + NEXT** SPKI pins.
+2. Wait until field clients upgrade.
+3. Swap the server cert/key to the NEXT pin.
+4. Confirm old and new clients still connect.
+5. In a later client release, remove the old pin.
+
+`python manage.py doctor` documents this policy. MeshCentral production identity is guarded:
+if `.wxqk-production-mesh` exists but `data/` was wiped, bootstrap **fail-closes** with
+`MESH_PRODUCTION_IDENTITY_MISSING` — restore from `python manage.py backup` / `restore`.
+
 ## Relay verification
 
 1. `config.json` → `"webRTC": false`
 2. On Windows clients/viewers: `.\check-mesh-relay.ps1`
 3. Confirm MeshAgent TCP peers are your MeshCentral host, not the viewer public IP
 
-## Backup / upgrade
+## Backup / upgrade / restore
 
 ```bash
+# Snapshot MeshCentral identity (data + config + production marker). Contains secrets — server only.
 python manage.py backup
+
+# After accidental wipe of meshcentral-data (do NOT re-bootstrap a new ServerID):
+python manage.py restore --from backups/wxqk-mesh-<stamp>
+python manage.py doctor
+docker compose up -d
+
+# Upgrade MeshCentral image pin
 # edit VERSION + .env MESHCENTRAL_VERSION
 python manage.py validate
 python manage.py up
 # re-check webRTC=false
 ```
+
+Restore must bring old Agents back online **without reinstall**. If `doctor` reports
+`MESH_PRODUCTION_IDENTITY_MISSING`, restore from `backups/` — never create a replacement Mesh group.
 
 See `docs/meshcentral-integration.md`.

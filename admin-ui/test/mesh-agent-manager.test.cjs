@@ -339,7 +339,7 @@ test('installedAgentNeedsRepair when template MeshServer present but installed m
   assert.equal(installedAgentNeedsRepair('c1'), true)
   fs.writeFileSync(
     path.join(installed, 'WXQK.msh'),
-    'MeshID=mesh-id\nServerID=server-id\nMeshServer=wss://mesh.example/agent.ashx\nagentName=WXQK-c1\n',
+    'MeshName=WXQK\nMeshID=mesh-id\nServerID=server-id\nMeshServer=wss://mesh.example/agent.ashx\nagentName=WXQK-c1\n',
   )
   assert.equal(installedAgentNeedsRepair('c1'), false)
 })
@@ -949,6 +949,129 @@ test('ensureMeshAgentRunning fails clearly when UAC denied during stale repair',
   assert.equal(ensured.ok, false)
   assert.equal(ensured.action, 'repair_stale')
   assert.equal(ensured.code, 'MESH_ELEVATION_REQUIRED')
+})
+
+test('getMeshAgentStatus reports outdated_agent when packaged SHA differs', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-outdated-'))
+  const root = path.join(tmp, 'meshcentral')
+  const installed = path.join(tmp, 'installed')
+  fs.mkdirSync(root)
+  fs.mkdirSync(installed)
+  fs.writeFileSync(path.join(root, 'WXQK.exe'), 'NEW-AGENT-BYTES-V2')
+  fs.writeFileSync(path.join(root, 'WXQK.msh'), 'MeshName=WXQK\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\n')
+  fs.writeFileSync(path.join(installed, 'WXQK.exe'), 'OLD-AGENT-BYTES-V1')
+  fs.writeFileSync(path.join(installed, 'WXQK.msh'), 'MeshName=WXQK\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\nagentName=WXQK-c1\n')
+  setMeshAgentDepsForTest({
+    isPackaged: true,
+    resourcesPath: tmp,
+    installedAgentDir: installed,
+    serviceBinaryPath: path.join(installed, 'WXQK.exe'),
+    platform: 'win32',
+    fs,
+    execFile: (cmd, args, opts, cb) => {
+      if (String(cmd).toLowerCase().includes('sc') && args[0] === 'query') {
+        return cb(null, 'STATE              : 4  RUNNING\n', '')
+      }
+      return cb(null, '', '')
+    },
+  })
+  const status = await getMeshAgentStatus()
+  assert.equal(status.status, 'outdated_agent')
+  assert.equal(status.outdatedAgent, true)
+  assert.ok(status.packagedSha256)
+  assert.ok(status.installedSha256)
+  assert.notEqual(status.packagedSha256, status.installedSha256)
+})
+
+test('ensureMeshAgentRunning upgrades outdated_agent and preserves agentName', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-upgrade-'))
+  const root = path.join(tmp, 'meshcentral')
+  const installed = path.join(tmp, 'installed')
+  fs.mkdirSync(root)
+  fs.mkdirSync(installed)
+  fs.writeFileSync(path.join(root, 'WXQK.exe'), 'NEW-AGENT-BYTES-V2')
+  fs.writeFileSync(path.join(root, 'WXQK.msh'), 'MeshName=WXQK\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\n')
+  fs.writeFileSync(path.join(installed, 'WXQK.exe'), 'OLD-AGENT-BYTES-V1')
+  fs.writeFileSync(path.join(installed, 'WXQK.msh'), 'MeshName=WXQK\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\nagentName=WXQK-c1\n')
+  let running = true
+  setMeshAgentDepsForTest({
+    isPackaged: true,
+    resourcesPath: tmp,
+    installedAgentDir: installed,
+    serviceBinaryPath: path.join(installed, 'WXQK.exe'),
+    platform: 'win32',
+    fs,
+    execFile: (cmd, args, opts, cb) => {
+      const c = String(cmd || '').toLowerCase()
+      const a0 = String(args?.[0] || '')
+      if (c.includes('sc') && a0 === 'query') {
+        return cb(null, running ? 'STATE : 4 RUNNING\n' : 'STATE : 1 STOPPED\n', '')
+      }
+      if (c.includes('sc') && a0 === 'stop') {
+        running = false
+        return cb(null, 'ok', '')
+      }
+      if (c.includes('sc') && a0 === 'start') {
+        running = true
+        return cb(null, 'ok', '')
+      }
+      if (c.includes('sc') && (a0 === 'config' || a0 === 'failure' || a0 === 'failureflag')) {
+        return cb(null, 'ok', '')
+      }
+      if (c.includes('powershell')) {
+        // Simulate install: copy packaged exe over installed
+        try {
+          fs.copyFileSync(path.join(root, 'WXQK.exe'), path.join(installed, 'WXQK.exe'))
+          const msh = fs.readFileSync(path.join(root, 'WXQK.msh'), 'utf8')
+          fs.writeFileSync(path.join(installed, 'WXQK.msh'), `${msh}agentName=WXQK-c1\n`)
+        } catch { /* ignore */ }
+        running = true
+        return cb(null, 'ok', '')
+      }
+      return cb(null, '', '')
+    },
+  })
+  const before = await getMeshAgentStatus()
+  assert.equal(before.status, 'outdated_agent')
+  const ensured = await ensureMeshAgentRunning({ clientId: 'c1' })
+  assert.equal(ensured.action, 'upgrade')
+  assert.equal(ensured.ok, true)
+  assert.equal(ensured.status.status, 'running')
+  assert.equal(ensured.status.outdatedAgent, false)
+  assert.equal(ensured.status.packagedSha256, ensured.status.installedSha256)
+  const msh = fs.readFileSync(path.join(installed, 'WXQK.msh'), 'utf8')
+  assert.match(msh, /agentName=WXQK-c1/)
+  assert.match(msh, /MeshID=x/)
+  assert.match(msh, /ServerID=y/)
+})
+
+test('getMeshAgentStatus reports service_config_broken when StartMode Disabled', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-disabled-'))
+  const root = path.join(tmp, 'meshcentral')
+  const installed = path.join(tmp, 'installed')
+  fs.mkdirSync(root)
+  fs.mkdirSync(installed)
+  fs.writeFileSync(path.join(root, 'WXQK.exe'), 'fake')
+  fs.writeFileSync(path.join(root, 'WXQK.msh'), 'MeshName=WXQK\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\n')
+  fs.writeFileSync(path.join(installed, 'WXQK.exe'), 'fake')
+  fs.writeFileSync(path.join(installed, 'WXQK.msh'), 'MeshName=WXQK\nMeshID=x\nServerID=y\nMeshServer=wss://x/agent.ashx\nagentName=WXQK-c1\n')
+  setMeshAgentDepsForTest({
+    isPackaged: true,
+    resourcesPath: tmp,
+    installedAgentDir: installed,
+    serviceBinaryPath: path.join(installed, 'WXQK.exe'),
+    serviceStartMode: 'Disabled',
+    platform: 'win32',
+    fs,
+    execFile: (cmd, args, opts, cb) => {
+      if (String(cmd).toLowerCase().includes('sc') && args[0] === 'query') {
+        return cb(null, 'STATE : 1 STOPPED\n', '')
+      }
+      return cb(null, '', '')
+    },
+  })
+  const status = await getMeshAgentStatus()
+  assert.equal(status.status, 'service_config_broken')
 })
 
 test('wrong ImagePath MeshAgent.exe is treated as stale_service', async () => {

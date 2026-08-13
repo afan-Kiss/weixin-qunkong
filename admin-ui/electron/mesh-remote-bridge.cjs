@@ -14,6 +14,7 @@ const { getServiceBase } = require('./secure-config.cjs')
 const { insecureTlsForService } = require('./service-tls.cjs')
 const softwareAuth = require('./software-auth.cjs')
 const meshAgent = require('./mesh-agent-manager.cjs')
+const networkGate = require('./mesh-network-gate.cjs')
 
 /**
  * Retry gaps inside a single prepare deadline.
@@ -132,6 +133,9 @@ function resetMeshPrepareStateForTest() {
 
 function userMessageForCode(code, fallback) {
   const c = String(code || '')
+  if (c === 'NETWORK_BLOCKED') {
+    return '本地服务已就绪，但网络无法连通远程节点。请检查防火墙/公司网络后重试。'
+  }
   if (c === 'MESH_ELEVATION_REQUIRED') {
     return '需要管理员权限以修复远程服务'
   }
@@ -356,6 +360,44 @@ async function ensureMeshReady(clientId, opts = {}) {
       log('agent running', { action: ensured.action, clientId: redactClientId(cid) })
       log('service_running', { action: ensured.action, status: ensured?.status?.status })
 
+      // Network gate: local agent healthy but AgentPort unreachable → classify, never reinstall
+      try {
+        const mshPath = ensured?.status?.paths?.installedMshPath
+          || meshAgent.expectedBrandedInstallPaths?.()?.mshPath
+        const net = await networkGate.checkAgentNetworkGate({ mshPath, timeoutMs: 5000 })
+        if (!net.ok) {
+          log('network blocked', {
+            code: net.code,
+            host: net.endpoint?.host,
+            port: net.endpoint?.port,
+          })
+          return setPrepareState({
+            phase: PHASE.FAILED,
+            remoteReady: false,
+            clientId: cid,
+            agentName,
+            code: 'NETWORK_BLOCKED',
+            message: '本地服务已运行，但无法连接远程节点（网络受限）',
+            userMessage: '本地服务已就绪，但网络无法连通远程节点。请检查防火墙/公司网络后重试。',
+            gates: {
+              LOCAL_AGENT: 'PASS',
+              SERVICE: 'PASS',
+              NETWORK: 'FAIL',
+              NODE: 'FAIL',
+              BIND: 'WAIT',
+            },
+            network: {
+              ok: false,
+              code: net.code,
+              host: net.endpoint?.host || '',
+              port: net.endpoint?.port || 0,
+            },
+          })
+        }
+      } catch (netErr) {
+        log('network gate error', { message: String(netErr?.message || netErr) })
+      }
+
       // Optional quick status check after agent is confirmed running.
       try {
         if (remainingMs(deadlineMs) > 1500) {
@@ -407,12 +449,36 @@ async function ensureMeshReady(clientId, opts = {}) {
         }
 
         // 旧安装可能没有 agentName=WXQK-<clientId>：中途修复重装一次再继续等节点
+        // Never repair/reinstall when the failure is actually NETWORK_BLOCKED.
         const code = String(lastBind?.code || '')
         if (
           !repairedOnce
           && (code === 'MESH_NO_MATCH' || code === 'MESH_NODE_TIMEOUT' || code === 'MESH_NODE_MISSING' || code === 'MESH_AGENT_OFFLINE')
           && remainingMs(deadlineMs) > 5000
         ) {
+          try {
+            const mshPath = meshAgent.expectedBrandedInstallPaths().mshPath
+            const net = await networkGate.checkAgentNetworkGate({ mshPath, timeoutMs: 4000 })
+            if (!net.ok) {
+              return setPrepareState({
+                phase: PHASE.FAILED,
+                remoteReady: false,
+                clientId: cid,
+                agentName,
+                code: 'NETWORK_BLOCKED',
+                message: '本地服务已运行，但无法连接远程节点（网络受限）',
+                userMessage: '本地服务已就绪，但网络无法连通远程节点。请检查防火墙/公司网络后重试。',
+                gates: {
+                  LOCAL_AGENT: 'PASS',
+                  SERVICE: 'PASS',
+                  NETWORK: 'FAIL',
+                  NODE: 'FAIL',
+                  BIND: 'WAIT',
+                },
+              })
+            }
+          } catch { /* continue to agentName repair */ }
+
           repairedOnce = true
           setPrepareState({
             phase: PHASE.INSTALLING,

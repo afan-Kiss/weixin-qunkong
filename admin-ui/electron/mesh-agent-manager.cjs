@@ -12,8 +12,11 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const crypto = require('crypto')
 const { spawn, execFile } = require('child_process')
 const { promisify } = require('util')
+const serviceHealth = require('./mesh-service-health.cjs')
+const agentArtifact = require('./mesh-agent-artifact.cjs')
 
 const execFileAsync = promisify(execFile)
 
@@ -251,7 +254,7 @@ function installedAgentNeedsRepair(clientId) {
     const templatePath = resolveMeshAgentPaths().mshPath
     if (fileExists(templatePath)) {
       const tmpl = parseMshText(fsApi.readFileSync(templatePath, 'utf8'))
-      for (const key of ['MeshServer', 'ServerID', 'MeshID']) {
+      for (const key of ['MeshServer', 'ServerID', 'MeshID', 'MeshName']) {
         const want = String(tmpl.get(key) || '').trim()
         const got = String(parsed.get(key) || '').trim()
         if (want && want !== got) return true
@@ -930,7 +933,7 @@ async function getMeshAgentVersion() {
 }
 
 /**
- * Status based on INSTALLED brand files + real SCM ImagePath — never package-only presence.
+ * Status based on INSTALLED brand files + structured SCM health — never package-only presence.
  */
 async function getMeshAgentStatus() {
   const packaged = resolveMeshAgentPaths()
@@ -944,14 +947,44 @@ async function getMeshAgentStatus() {
   const installedExePresent = fileExists(installedExePath)
   const installedMshPresent = fileExists(installedMshPath)
 
-  const service = await queryServiceState()
-  let imagePath = ''
-  let imagePathOk = false
-  if (service.present) {
-    const qc = await queryServiceImagePath(SERVICE_NAME)
-    imagePath = qc.binaryPath || ''
-    imagePathOk = isBrandedImagePath(imagePath, expected.exePath)
+  let healthSvc
+  if (deps.serviceHealth) {
+    healthSvc = { ...deps.serviceHealth, name: SERVICE_NAME }
+  } else if (deps.serviceBinaryPath != null || deps.forceScServiceQuery) {
+    // Unit tests inject serviceBinaryPath + sc.exe mocks — keep locale-independent CIM for production.
+    const service = await queryServiceState()
+    let pathName = ''
+    if (service.present) {
+      const qc = await queryServiceImagePath(SERVICE_NAME)
+      pathName = qc.binaryPath || ''
+    }
+    if (typeof deps.serviceBinaryPath === 'string' && deps.serviceBinaryPath) {
+      pathName = normalizeServiceBinaryPath(deps.serviceBinaryPath)
+    }
+    healthSvc = {
+      present: service.present,
+      state: service.state,
+      startMode: deps.serviceStartMode || 'Auto',
+      pathName,
+      processId: service.state === 'running' ? 1 : 0,
+      name: SERVICE_NAME,
+      source: 'sc-test',
+    }
+  } else {
+    healthSvc = await serviceHealth.queryServiceHealth(SERVICE_NAME, {
+      platform: deps.platform || process.platform,
+      execFile: deps.execFile || execFile,
+    })
   }
+  const service = {
+    present: healthSvc.present,
+    state: healthSvc.state,
+  }
+  let imagePath = healthSvc.pathName || ''
+  if (typeof deps.serviceBinaryPath === 'string' && deps.serviceBinaryPath) {
+    imagePath = normalizeServiceBinaryPath(deps.serviceBinaryPath)
+  }
+  const imagePathOk = service.present ? isBrandedImagePath(imagePath, expected.exePath) : false
 
   const health = classifyBrandInstallHealth({
     installedExePresent,
@@ -961,11 +994,23 @@ async function getMeshAgentStatus() {
     imagePathOk,
   })
 
+  const packagedFp = packagedExePresent
+    ? agentArtifact.readPackagedArtifactFingerprint(packaged.root, packaged.exePath, { fs: deps.fs || fs })
+    : { sha256: '', source: 'missing', size: 0 }
+  const installedFp = installedExePresent
+    ? agentArtifact.readInstalledArtifactFingerprint(installedExePath, { fs: deps.fs || fs })
+    : { sha256: '', source: 'missing', size: 0 }
+  const outdated = agentArtifact.isArtifactOutdated(packagedFp, installedFp)
+
   let status = 'missing'
   if (health === 'stale_service') {
     status = 'stale_service'
   } else if (health === 'missing') {
     status = 'missing'
+  } else if (service.present && !serviceHealth.isAutomaticStartMode(healthSvc.startMode) && health === 'files_and_service_ok') {
+    status = 'service_config_broken'
+  } else if (outdated && health === 'files_and_service_ok') {
+    status = 'outdated_agent'
   } else if (service.state === 'running' && health === 'files_and_service_ok') {
     status = 'running'
   } else if ((service.state === 'stopped' || service.state === 'pending') && health === 'files_and_service_ok') {
@@ -993,8 +1038,14 @@ async function getMeshAgentStatus() {
     packagedMshPresent,
     servicePresent: service.present,
     serviceState: service.state,
+    startMode: healthSvc.startMode || '',
+    processId: healthSvc.processId || 0,
     imagePath,
     imagePathOk,
+    outdatedAgent: outdated,
+    packagedSha256: packagedFp.sha256 || '',
+    installedSha256: installedFp.sha256 || '',
+    serviceHealth: healthSvc,
     serviceName: SERVICE_NAME,
     serviceDisplayName: SERVICE_DISPLAY_NAME,
     version: versionInfo.version || '',
@@ -1304,13 +1355,135 @@ async function uninstallMeshAgent() {
 }
 
 /**
- * Lifecycle: healthy → noop; stale_service → reinstall; missing+owned legacy → migrate; else install/start/repair.
+ * Ensure StartMode=Automatic + failure recovery. Best-effort; never throws.
+ */
+async function hardenServiceConfig() {
+  try {
+    const result = await serviceHealth.ensureServiceAutoAndRecovery(SERVICE_NAME, runElevated)
+    log(result.ok ? 'INFO' : 'WARN', 'service auto+recovery harden', {
+      configOk: result.configOk,
+      failureOk: result.failureOk,
+    })
+    return result
+  } catch (err) {
+    log('WARN', 'service harden failed', { error: String(err && err.message || err) })
+    return { ok: false }
+  }
+}
+
+/**
+ * Upgrade installed WXQK.exe when packaged SHA differs. Backup → install → start; rollback on failure.
+ * Preserves clientId / agentName / MeshServer / ServerID / MeshID via stageMshForClient.
+ * @param {{ clientId?: string }} [options]
+ */
+async function upgradeMeshAgent(options = {}) {
+  const clientId = safeClientIdForAgent(options.clientId)
+  log('INFO', 'upgrading WXQK agent artifact', { clientId: clientId || undefined })
+  const expected = expectedBrandedInstallPaths()
+  const packaged = resolveMeshAgentPaths()
+  if (!fileExists(packaged.exePath) || !fileExists(packaged.mshPath)) {
+    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少发行包 Agent', status: await getMeshAgentStatus() }
+  }
+  const brandGate = await verifyBrandedAgentArtifact(packaged.exePath)
+  if (!brandGate.ok) {
+    return {
+      ok: false,
+      code: brandGate.code || 'MESH_BAD_ARTIFACT',
+      message: brandGate.message || '发行包 Agent 无效',
+      status: await getMeshAgentStatus(),
+    }
+  }
+
+  const fsApi = deps.fs || fs
+  const backupDir = path.join(os.tmpdir(), `wxqk-agent-bak-${deps.now()}`)
+  try {
+    fsApi.mkdirSync(backupDir, { recursive: true })
+    if (fileExists(expected.exePath)) fsApi.copyFileSync(expected.exePath, path.join(backupDir, EXE_NAME))
+    if (fileExists(expected.mshPath)) fsApi.copyFileSync(expected.mshPath, path.join(backupDir, MSH_NAME))
+  } catch (err) {
+    log('WARN', 'agent backup incomplete', { error: String(err && err.message || err) })
+  }
+
+  const restoreBackup = async () => {
+    if (!fileExists(path.join(backupDir, EXE_NAME))) return { ok: false }
+    log('WARN', 'rolling back agent upgrade from backup')
+    const bakExe = path.join(backupDir, EXE_NAME).replace(/'/g, "''")
+    const bakMsh = path.join(backupDir, MSH_NAME).replace(/'/g, "''")
+    const destExe = expected.exePath.replace(/'/g, "''")
+    const destMsh = expected.mshPath.replace(/'/g, "''")
+    const dirEsc = expected.dir.replace(/'/g, "''")
+    await runElevated('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+      [
+        `New-Item -ItemType Directory -Force -Path '${dirEsc}' | Out-Null`,
+        `Copy-Item -LiteralPath '${bakExe}' -Destination '${destExe}' -Force`,
+        `if (Test-Path -LiteralPath '${bakMsh}') { Copy-Item -LiteralPath '${bakMsh}' -Destination '${destMsh}' -Force }`,
+      ].join('; '),
+    ])
+    await hardenServiceConfig()
+    return startMeshAgent()
+  }
+
+  await stopMeshAgent()
+  const installed = await installMeshAgent({ clientId })
+  if (isElevationDenied(installed) || installed.code === 'MESH_ELEVATION_REQUIRED') {
+    await restoreBackup()
+    return {
+      ok: false,
+      code: 'MESH_ELEVATION_REQUIRED',
+      message: installed.message || '需要管理员权限才能升级服务',
+      status: await getMeshAgentStatus(),
+      rolledBack: true,
+    }
+  }
+  if (!installed.ok) {
+    const rolled = await restoreBackup()
+    return {
+      ok: false,
+      code: installed.code || 'MESH_UPGRADE_FAILED',
+      message: installed.message || 'Agent 升级失败已回滚',
+      status: rolled.status || (await getMeshAgentStatus()),
+      rolledBack: true,
+    }
+  }
+
+  await hardenServiceConfig()
+  const started = await startMeshAgent()
+  let after = started.status || (await getMeshAgentStatus())
+  // After upgrade SHA must match packaged; status must be running (not outdated_agent)
+  if (!started.ok || after.status !== 'running' || after.outdatedAgent) {
+    const rolled = await restoreBackup()
+    return {
+      ok: false,
+      code: 'MESH_UPGRADE_FAILED',
+      message: 'Agent 升级后验证失败，已回滚',
+      status: rolled.status || after,
+      rolledBack: true,
+    }
+  }
+  after = await getMeshAgentStatus()
+  log('INFO', 'agent upgrade ok', {
+    packagedSha: String(after.packagedSha256 || '').slice(0, 12),
+    installedSha: String(after.installedSha256 || '').slice(0, 12),
+  })
+  return {
+    ok: true,
+    code: 'OK',
+    action: 'upgrade',
+    message: '服务已升级',
+    status: after,
+    agentName: buildAgentName(clientId) || installed.agentName,
+  }
+}
+
+/**
+ * Lifecycle: healthy → noop; stale/outdated/config → repair/upgrade; missing+owned legacy → migrate.
  * @param {{ clientId?: string }} [options]
  */
 async function ensureMeshAgentRunning(options = {}) {
   const clientId = safeClientIdForAgent(options.clientId)
   log('INFO', 'ensureMeshAgentRunning', { clientId: clientId || undefined })
-  const before = await getMeshAgentStatus()
+  let before = await getMeshAgentStatus()
 
   if (before.status === 'stale_service') {
     log('WARN', 'detected STALE_SERVICE — auto repair', {
@@ -1319,7 +1492,10 @@ async function ensureMeshAgentRunning(options = {}) {
       installedMshPresent: before.installedMshPresent,
     })
     const repaired = await repairMeshAgent({ clientId })
-    if (repaired.ok) await cleanupOwnedLegacyAfterBrandHealthy({ clientId })
+    if (repaired.ok) {
+      await hardenServiceConfig()
+      await cleanupOwnedLegacyAfterBrandHealthy({ clientId })
+    }
     return {
       ok: repaired.ok,
       code: repaired.ok ? 'OK' : repaired.code,
@@ -1330,6 +1506,51 @@ async function ensureMeshAgentRunning(options = {}) {
     }
   }
 
+  if (before.status === 'service_config_broken') {
+    log('WARN', 'service StartMode not Automatic — hardening', { startMode: before.startMode })
+    const hard = await hardenServiceConfig()
+    if (isElevationDenied(hard) || hard.code === 'MESH_ELEVATION_REQUIRED') {
+      return {
+        ok: false,
+        code: 'MESH_ELEVATION_REQUIRED',
+        action: 'repair_service_config',
+        message: '需要管理员权限以修复服务启动类型',
+        status: await getMeshAgentStatus(),
+      }
+    }
+    before = await getMeshAgentStatus()
+    if (before.status === 'service_config_broken') {
+      const repaired = await repairMeshAgent({ clientId })
+      if (repaired.ok) await hardenServiceConfig()
+      return {
+        ok: repaired.ok,
+        code: repaired.ok ? 'OK' : repaired.code,
+        action: 'repair_service_config',
+        message: repaired.message,
+        status: repaired.status || (await getMeshAgentStatus()),
+        agentName: buildAgentName(clientId) || undefined,
+      }
+    }
+    // Fall through — may still be outdated/stopped/running
+  }
+
+  if (before.status === 'outdated_agent') {
+    log('WARN', 'detected OUTDATED_AGENT — upgrade', {
+      packagedSha: String(before.packagedSha256 || '').slice(0, 12),
+      installedSha: String(before.installedSha256 || '').slice(0, 12),
+    })
+    const upgraded = await upgradeMeshAgent({ clientId })
+    return {
+      ok: upgraded.ok,
+      code: upgraded.ok ? 'OK' : upgraded.code,
+      action: 'upgrade',
+      message: upgraded.message,
+      status: upgraded.status || (await getMeshAgentStatus()),
+      agentName: upgraded.agentName || buildAgentName(clientId) || undefined,
+      rolledBack: Boolean(upgraded.rolledBack),
+    }
+  }
+
   if (before.status === 'missing' || (before.status === 'installed_no_service' && !before.servicePresent)) {
     const legacy = await queryLegacyServiceState()
     const legacyFiles = resolveLegacyInstalledMeshAgentPaths()
@@ -1337,6 +1558,7 @@ async function ensureMeshAgentRunning(options = {}) {
       const ownership = isLegacyAgentOwnedByWxqk({ clientId })
       if (ownership.owned) {
         const migrated = await migrateLegacyMeshAgentToWxqk({ clientId })
+        if (migrated.ok) await hardenServiceConfig()
         return {
           ok: migrated.ok,
           code: migrated.code,
@@ -1359,6 +1581,7 @@ async function ensureMeshAgentRunning(options = {}) {
         expected: buildAgentName(clientId),
       })
       const repaired = await repairMeshAgent({ clientId })
+      if (repaired.ok) await hardenServiceConfig()
       return {
         ok: repaired.ok,
         code: repaired.ok ? 'OK' : repaired.code,
@@ -1368,6 +1591,7 @@ async function ensureMeshAgentRunning(options = {}) {
         agentName: buildAgentName(clientId),
       }
     }
+    // Healthy running — do not elevate on every ensure (UAC spam).
     return { ok: true, code: 'OK', action: 'noop', message: '服务已就绪', status: before }
   }
 
@@ -1376,6 +1600,7 @@ async function ensureMeshAgentRunning(options = {}) {
     if (!installed.ok) {
       return { ok: false, code: installed.code, action: 'install', message: installed.message, status: installed.status || before }
     }
+    await hardenServiceConfig()
     const started = await startMeshAgent()
     const ok = Boolean(started.ok && started.status && started.status.status === 'running' && isBrandedInstallHealthy(started.status))
     if (ok) await cleanupOwnedLegacyAfterBrandHealthy({ clientId })
@@ -1396,6 +1621,7 @@ async function ensureMeshAgentRunning(options = {}) {
       if (!installed.ok) {
         return { ok: false, code: installed.code, action: 'install', message: installed.message, status: installed.status || before }
       }
+      await hardenServiceConfig()
       const started = await startMeshAgent()
       const ok = Boolean(started.ok && started.status && started.status.status === 'running' && isBrandedInstallHealthy(started.status))
       return {
@@ -1413,6 +1639,7 @@ async function ensureMeshAgentRunning(options = {}) {
         expected: buildAgentName(clientId),
       })
       const repaired = await repairMeshAgent({ clientId })
+      if (repaired.ok) await hardenServiceConfig()
       return {
         ok: repaired.ok,
         code: repaired.ok ? 'OK' : repaired.code,
@@ -1423,17 +1650,20 @@ async function ensureMeshAgentRunning(options = {}) {
       }
     }
     const started = await startMeshAgent()
+    if (started.ok) await hardenServiceConfig()
     return {
       ok: started.ok,
       code: started.ok ? 'OK' : started.code,
       action: 'start',
       message: started.message,
       status: started.status,
+      agentName: buildAgentName(clientId) || undefined,
     }
   }
 
   const repaired = await repairMeshAgent({ clientId })
   if (repaired.ok) {
+    await hardenServiceConfig()
     await cleanupOwnedLegacyAfterBrandHealthy({ clientId })
   }
   return {
@@ -1519,6 +1749,8 @@ module.exports = {
   getMeshAgentStatus,
   getMeshAgentVersion,
   installMeshAgent,
+  upgradeMeshAgent,
+  hardenServiceConfig,
   startMeshAgent,
   stopMeshAgent,
   restartMeshAgent,

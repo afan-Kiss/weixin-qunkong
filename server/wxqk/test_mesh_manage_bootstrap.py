@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -183,6 +184,52 @@ class MeshManageBootstrapTest(unittest.TestCase):
                 second = self.mod._load_env_file(local)["WXQK_MESH_LOGIN_KEY"]
                 self.assertEqual(first, second)
                 self.assertEqual(first, key)
+
+    def test_production_identity_guard_fail_closed_marker_without_cert(self):
+        with tempfile.TemporaryDirectory() as folder:
+            here = Path(folder)
+            (here / "data").mkdir(parents=True)
+            (here / ".wxqk-production-mesh").write_text("2026-01-01", encoding="utf-8")
+            (here / "data" / "wxqk-mesh-production-identity.json").write_text("{}", encoding="utf-8")
+            with mock.patch.object(self.mod, "HERE", here), mock.patch.object(
+                self.mod, "PRODUCTION_MARKER", here / ".wxqk-production-mesh"
+            ), mock.patch.object(
+                self.mod, "PRODUCTION_MANIFEST", here / "data" / "wxqk-mesh-production-identity.json"
+            ):
+                ok, code = self.mod._production_identity_guard()
+                self.assertFalse(ok)
+                self.assertEqual(code, "MESH_PRODUCTION_IDENTITY_MISSING")
+
+    def test_production_identity_guard_ok_with_agentserver_cert(self):
+        with tempfile.TemporaryDirectory() as folder:
+            here = Path(folder)
+            (here / "data").mkdir(parents=True)
+            (here / ".wxqk-production-mesh").write_text("2026-01-01", encoding="utf-8")
+            (here / "data" / "agentserver-cert-public.crt").write_text("CERT", encoding="utf-8")
+            with mock.patch.object(self.mod, "HERE", here), mock.patch.object(
+                self.mod, "PRODUCTION_MARKER", here / ".wxqk-production-mesh"
+            ), mock.patch.object(
+                self.mod, "PRODUCTION_MANIFEST", here / "data" / "wxqk-mesh-production-identity.json"
+            ):
+                ok, code = self.mod._production_identity_guard()
+                self.assertTrue(ok)
+                self.assertEqual(code, "OK")
+
+    def test_tls_pins_required_when_production_marker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            here = Path(folder)
+            marker = here / ".wxqk-production-mesh"
+            marker.write_text("x", encoding="utf-8")
+            with mock.patch.object(self.mod, "PRODUCTION_MARKER", marker), mock.patch.object(
+                self.mod, "PRODUCTION_MANIFEST", here / "missing-manifest"
+            ), mock.patch.dict(os.environ, {"WXQK_TLS_SPKI_PINS": ""}, clear=False):
+                # Ensure pin file path does not exist on this lab machine path is absolute;
+                # empty env pins + marker → TLS_PINS_REQUIRED
+                ok, detail = self.mod._check_tls_spki_against_pins()
+                if Path("/etc/wxqk/le-ip-expected-spki.txt").exists():
+                    self.skipTest("host has pin file")
+                self.assertFalse(ok)
+                self.assertIn("TLS_PINS_REQUIRED", detail)
 
 
 if __name__ == "__main__":

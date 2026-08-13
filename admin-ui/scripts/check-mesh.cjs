@@ -31,6 +31,14 @@ if (!fs.existsSync(exePath)) {
     const size = fs.statSync(exePath).size
     if (size < 1024) {
       problems.push(`${EXE_NAME} too small (${size} bytes) — refuse packaging a broken agent`)
+    } else {
+      try {
+        const { writePackagedArtifactMeta } = require('../electron/mesh-agent-artifact.cjs')
+        const meta = writePackagedArtifactMeta(meshDir, exePath)
+        console.log(`[MESH] agent-artifact.json sha256=${String(meta.sha256).slice(0, 16)}… size=${meta.size}`)
+      } catch (err) {
+        warnings.push(`agent-artifact.json not written: ${err.message}`)
+      }
     }
   } catch (err) {
     problems.push(`cannot stat ${EXE_NAME}: ${err.message}`)

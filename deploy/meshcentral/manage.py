@@ -38,6 +38,8 @@ CFG_EXAMPLE = HERE / "config.example.json"
 WXQK_MESH_ENV_DEFAULT = Path("/etc/wxqk/mesh.env")
 WXQK_MESH_ENV_LOCAL = HERE / "wxqk-mesh.env"
 PINNED_VERSION = "1.2.4"
+PRODUCTION_MARKER = HERE / ".wxqk-production-mesh"
+PRODUCTION_MANIFEST = HERE / "data" / "wxqk-mesh-production-identity.json"
 
 
 def _run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -273,7 +275,7 @@ def cmd_backup(_: argparse.Namespace) -> int:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = HERE / "backups" / f"wxqk-mesh-{stamp}"
     dest.mkdir(parents=True, exist_ok=True)
-    for name in ("data", "files", "config.json", ".env", "wxqk-mesh.env"):
+    for name in ("data", "files", "config.json", ".env", "wxqk-mesh.env", ".wxqk-production-mesh"):
         src = HERE / name
         if not src.exists():
             continue
@@ -283,7 +285,303 @@ def cmd_backup(_: argparse.Namespace) -> int:
         else:
             shutil.copy2(src, target)
     print(f"[MESH] backup written to {dest}")
-    print("[MESH] Do not commit backups/ or .env")
+    print("[MESH] Do not commit backups/ or .env — contains MeshCentral identity (server-only)")
+    return 0
+
+
+def _leaf_spki_sha256_b64(pem_or_der: bytes) -> str:
+    """Compute sha256/<b64> SPKI pin for an X.509 leaf (openssl)."""
+    import tempfile
+
+    if not pem_or_der:
+        return ""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".crt") as tmp:
+        tmp.write(pem_or_der if b"BEGIN" in pem_or_der else pem_or_der)
+        tmp_path = tmp.name
+    try:
+        # Extract SPKI DER then sha256 → base64 (same as Electron service-tls)
+        spki = subprocess.run(
+            ["openssl", "x509", "-in", tmp_path, "-pubkey", "-noout"],
+            check=False,
+            capture_output=True,
+        )
+        if spki.returncode != 0:
+            return ""
+        der = subprocess.run(
+            ["openssl", "pkey", "-pubin", "-outform", "DER"],
+            input=spki.stdout,
+            check=False,
+            capture_output=True,
+        )
+        if der.returncode != 0 or not der.stdout:
+            return ""
+        digest = hashlib.sha256(der.stdout).digest()
+        import base64
+
+        return "sha256/" + base64.b64encode(digest).decode("ascii")
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _check_tls_spki_against_pins() -> tuple[bool, str]:
+    """
+    Compare live wxqk :8443 leaf SPKI against expected pin set.
+    Expected sources (any):
+      - /etc/wxqk/le-ip-expected-spki.txt (one pin per line)
+      - WXQK_TLS_SPKI_PINS env (comma-separated)
+    Lab without pins → pass with note.
+    Production marker present without pins → FAIL (never ship unpinned prod).
+    """
+    pin_file = Path("/etc/wxqk/le-ip-expected-spki.txt")
+    pins: list[str] = []
+    if pin_file.exists():
+        try:
+            for line in pin_file.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    pins.append(s if s.startswith("sha256/") else f"sha256/{s}")
+        except OSError:
+            pass
+    env_pins = (os.environ.get("WXQK_TLS_SPKI_PINS") or "").strip()
+    if env_pins:
+        for part in env_pins.split(","):
+            s = part.strip()
+            if s:
+                pins.append(s if s.startswith("sha256/") else f"sha256/{s}")
+    pins = list(dict.fromkeys(pins))
+    if not pins:
+        if PRODUCTION_MARKER.exists() or PRODUCTION_MANIFEST.exists():
+            return (
+                False,
+                "TLS_PINS_REQUIRED: production marker present but no pin file/env "
+                "(set /etc/wxqk/le-ip-expected-spki.txt or WXQK_TLS_SPKI_PINS CURRENT,NEXT)",
+            )
+        return True, "no expected pin file/env (lab OK; production should set le-ip-expected-spki.txt)"
+
+    cert_bytes = b""
+    try:
+        live = Path("/etc/letsencrypt/live")
+        if live.exists():
+            for child in sorted(live.iterdir()):
+                fullchain = child / "fullchain.pem"
+                if fullchain.exists():
+                    cert_bytes = fullchain.read_bytes()
+                    break
+    except OSError:
+        cert_bytes = b""
+    if not cert_bytes:
+        try:
+            host = (
+                os.environ.get("WXQK_TLS_PROBE_HOST")
+                or _load_env_file(HERE / ".env").get("WXQK_MESH_HOSTNAME")
+                or "127.0.0.1"
+            )
+            proc = subprocess.run(
+                [
+                    "openssl",
+                    "s_client",
+                    "-connect",
+                    f"{host}:8443",
+                    "-servername",
+                    host,
+                    "-showcerts",
+                ],
+                input=b"",
+                check=False,
+                capture_output=True,
+                timeout=8,
+            )
+            out = proc.stdout or b""
+            start = out.find(b"-----BEGIN CERTIFICATE-----")
+            end = out.find(b"-----END CERTIFICATE-----", start)
+            if start >= 0 and end > start:
+                cert_bytes = out[start : end + len(b"-----END CERTIFICATE-----")]
+        except Exception as exc:
+            return False, f"cannot read live cert: {type(exc).__name__}"
+
+    if not cert_bytes:
+        return False, "expected pins configured but live cert unreadable"
+
+    leaf = _leaf_spki_sha256_b64(cert_bytes)
+    if not leaf:
+        return False, "openssl SPKI compute failed"
+    if leaf in pins:
+        return True, f"leaf pin accepted ({leaf[:20]}… of {len(pins)} pin(s))"
+    return False, f"TLS_SPKI_MISMATCH leaf={leaf[:24]}… not in pin set ({len(pins)})"
+
+
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _read_agent_endpoint_hints() -> dict[str, Any]:
+    """Best-effort non-secret hints from env / packaged msh (fingerprints only)."""
+    hints: dict[str, Any] = {
+        "agentEndpoint": "",
+        "agentPort": 0,
+        "serverIdFingerprint": "",
+        "meshIdFingerprint": "",
+    }
+    mesh_group = (os.environ.get("WXQK_MESH_GROUP") or "").strip()
+    if mesh_group:
+        hints["meshIdFingerprint"] = _fingerprint(mesh_group)
+    agent_port = (os.environ.get("WXQK_AGENT_PORT") or os.environ.get("AgentPort") or "").strip()
+    if agent_port.isdigit():
+        hints["agentPort"] = int(agent_port)
+    # Optional local msh next to deploy (never commit production msh; ok if missing)
+    for cand in (
+        HERE / "WXQK.msh",
+        HERE.parent.parent / "admin-ui" / "resources" / "meshcentral" / "WXQK.msh",
+    ):
+        if not cand.exists():
+            continue
+        try:
+            text = cand.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("MeshServer="):
+                hints["agentEndpoint"] = line.split("=", 1)[1].strip()
+                try:
+                    # wss://host:4433/...
+                    from urllib.parse import urlparse
+
+                    raw = hints["agentEndpoint"].replace("wss://", "https://").replace("ws://", "http://")
+                    u = urlparse(raw)
+                    if u.hostname:
+                        hints["agentEndpoint"] = f"{u.hostname}:{u.port or 4433}"
+                    if u.port and not hints["agentPort"]:
+                        hints["agentPort"] = int(u.port)
+                except Exception:
+                    pass
+            elif line.startswith("ServerID=") and not hints["serverIdFingerprint"]:
+                hints["serverIdFingerprint"] = _fingerprint(line.split("=", 1)[1].strip())
+            elif line.startswith("MeshID=") and not hints["meshIdFingerprint"]:
+                hints["meshIdFingerprint"] = _fingerprint(line.split("=", 1)[1].strip())
+        break
+    return hints
+
+
+# Files that prove MeshCentral ServerID / agent TLS identity still exists on disk.
+_MESH_IDENTITY_FILES = (
+    "agentserver-cert-public.crt",
+    "agentserver-cert-private.key",
+    "server-cert-public.crt",
+    "server-cert-private.key",
+    "meshcentral.db",
+    "meshcentral.db.bak",
+)
+
+
+def _meshcentral_data_has_identity(data_dir: Path) -> bool:
+    """True when data/ still holds MeshCentral identity material (not just our manifest)."""
+    if not data_dir.exists():
+        return False
+    for name in _MESH_IDENTITY_FILES:
+        if (data_dir / name).is_file():
+            return True
+    try:
+        for p in data_dir.iterdir():
+            if p.name.startswith("."):
+                continue
+            if p.name == PRODUCTION_MANIFEST.name:
+                continue
+            if p.suffix.lower() in {".crt", ".key", ".db", ".bak"}:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _had_production_evidence() -> bool:
+    """Any durable signal that this host previously ran production MeshCentral."""
+    if PRODUCTION_MARKER.exists() or PRODUCTION_MANIFEST.exists():
+        return True
+    for env_path in (WXQK_MESH_ENV_LOCAL, WXQK_MESH_ENV_DEFAULT, HERE / ".env"):
+        try:
+            env = _load_env_file(env_path)
+        except Exception:
+            env = {}
+        key = (env.get("WXQK_MESH_LOGIN_KEY") or "").strip()
+        group = (env.get("WXQK_MESH_GROUP") or "").strip()
+        # Login key alone is weak (lab bootstrap); require group or marker above.
+        if group and len(key) >= 32:
+            return True
+    map_candidates = [
+        HERE.parent / "data" / "mesh_node_map.json",
+        Path("/opt/wxqk/data/mesh_node_map.json"),
+        Path("/var/lib/wxqk/mesh_node_map.json"),
+    ]
+    try:
+        map_candidates.append(HERE.parents[1] / "server" / "wxqk" / "data" / "mesh_node_map.json")
+    except IndexError:
+        pass
+    for cand in map_candidates:
+        try:
+            if cand.is_file() and cand.stat().st_size > 2:
+                return True
+        except OSError:
+            continue
+    backups = HERE / "backups"
+    if backups.is_dir():
+        try:
+            for child in backups.iterdir():
+                if child.is_dir() and child.name.startswith("wxqk-mesh-"):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def _production_identity_guard() -> tuple[bool, str]:
+    """Fail closed when production evidence exists but meshcentral-data identity was wiped."""
+    data_dir = HERE / "data"
+    had = _had_production_evidence()
+    has_identity = _meshcentral_data_has_identity(data_dir)
+    if had and not has_identity:
+        return False, "MESH_PRODUCTION_IDENTITY_MISSING"
+    return True, "OK"
+
+
+def _touch_production_marker() -> None:
+    PRODUCTION_MARKER.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ"), encoding="utf-8")
+    data_dir = HERE / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    hints = _read_agent_endpoint_hints()
+    manifest = {
+        "schemaVersion": 1,
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "serverIdFingerprint": hints.get("serverIdFingerprint") or "",
+        "meshIdFingerprint": hints.get("meshIdFingerprint") or "",
+        "agentEndpoint": hints.get("agentEndpoint") or "",
+        "agentPort": hints.get("agentPort") or 0,
+        "note": "fingerprints only — restore meshcentral-data from backup if wiped",
+    }
+    PRODUCTION_MANIFEST.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    src = Path(str(getattr(args, "from_dir", "") or "")).expanduser()
+    if not src.exists() or not src.is_dir():
+        print("[MESH] FAIL --from must be a backup directory")
+        return 1
+    print(f"[MESH] restoring MeshCentral identity from {src}")
+    for name in ("data", "files", "config.json", ".env", "wxqk-mesh.env", ".wxqk-production-mesh"):
+        item = src / name
+        if not item.exists():
+            continue
+        dest = HERE / name
+        if item.is_dir():
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(item, dest)
+        else:
+            shutil.copy2(item, dest)
+    print("[MESH] restore complete — run: python manage.py doctor && docker compose up -d")
+    print("[MESH] Old agents should reconnect without reinstall if ServerID/MeshID preserved")
     return 0
 
 
@@ -553,6 +851,13 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     Never rotates an existing login key unless --rotate-key (dangerous).
     """
     print("[MESH] bootstrap start")
+    ok_id, id_code = _production_identity_guard()
+    if not ok_id:
+        print(f"[MESH] FAIL {id_code}")
+        print("Production markers present but meshcentral-data is empty.")
+        print("Restore from backups/ — do NOT create a new ServerID / Mesh group.")
+        print("修复建议：python manage.py restore --from backups/wxqk-mesh-<stamp>")
+        return 1
     cmd_prepare(args)
     env_path = HERE / ".env"
     env = _load_env_file(env_path)
@@ -641,8 +946,20 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             f"fingerprint={_secret_fingerprint(login_key)}"
         )
 
+    # Never invent a new Mesh group: preserve WXQK_MESH_GROUP from .env / wxqk-mesh.env.
+    preserved_group = (
+        (env.get("WXQK_MESH_GROUP") or "").strip()
+        or (_load_env_file(WXQK_MESH_ENV_LOCAL).get("WXQK_MESH_GROUP") or "").strip()
+    )
+    if preserved_group:
+        env["WXQK_MESH_GROUP"] = preserved_group
+        print(f"[MESH] preserving WXQK_MESH_GROUP fingerprint={_fingerprint(preserved_group)}")
+    else:
+        print("[MESH] WARN WXQK_MESH_GROUP empty — set it before provisioning agents; bootstrap will NOT create a new MeshID")
+
     synced = _sync_wxqk_mesh_env(login_key, env)
     print(f"[MESH] wxqk mesh env synced → {synced}")
+    _touch_production_marker()
 
     # WXQK embed auto-connect patch (MeshCentral 1.2.4 only; idempotent)
     try:
@@ -806,6 +1123,48 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     if not agent_ok:
         failures += 1
+
+    ok_id, id_code = _production_identity_guard()
+    _print_check(
+        ok_id,
+        "Mesh production identity",
+        id_code if not ok_id else (
+            "identity files present"
+            if _meshcentral_data_has_identity(HERE / "data")
+            else ("no production marker (lab OK)" if not PRODUCTION_MARKER.exists() else "marker only")
+        ),
+        hint="python manage.py restore --from backups/... if MESH_PRODUCTION_IDENTITY_MISSING",
+    )
+    if not ok_id:
+        failures += 1
+
+    mesh_group = (wxqk_env.get("WXQK_MESH_GROUP") or env.get("WXQK_MESH_GROUP") or "").strip()
+    group_ok = bool(mesh_group) or not PRODUCTION_MARKER.exists()
+    _print_check(
+        group_ok,
+        "WXQK_MESH_GROUP preserved",
+        f"fingerprint={_fingerprint(mesh_group)}" if mesh_group else ("missing (lab OK)" if not PRODUCTION_MARKER.exists() else "MISSING"),
+        hint="Restore WXQK_MESH_GROUP from backup/.env — never create a replacement MeshID for production",
+    )
+    if not group_ok:
+        failures += 1
+
+    # TLS SPKI: fail closed when expected pin file / env pins disagree with live leaf
+    spki_ok, spki_detail = _check_tls_spki_against_pins()
+    _print_check(
+        spki_ok,
+        "TLS SPKI pin vs live cert",
+        spki_detail,
+        hint="Rotation: ship CURRENT+NEXT pin → wait rollout → swap cert → later drop old. Never WXQK_ALLOW_UNPINNED_TLS=1 in prod",
+    )
+    if not spki_ok:
+        failures += 1
+    _print_check(
+        True,
+        "TLS pin rotation policy",
+        "ship client CURRENT+NEXT pin → wait rollout → swap server cert → next release drop old pin",
+        hint="Never enable WXQK_ALLOW_UNPINNED_TLS in production",
+    )
 
     login_key = (wxqk_env.get("WXQK_MESH_LOGIN_KEY") or env.get("WXQK_MESH_LOGIN_KEY") or "").strip()
     key_ok = len(login_key) >= 64
@@ -1067,6 +1426,10 @@ def main() -> int:
     ):
         p = sub.add_parser(name)
         p.set_defaults(func=fn)
+
+    p_restore = sub.add_parser("restore", help="Restore MeshCentral identity from backups/ (server-only)")
+    p_restore.add_argument("--from", dest="from_dir", required=True, help="Backup directory path")
+    p_restore.set_defaults(func=cmd_restore)
 
     p_gen = sub.add_parser("gen-secret", help="Write candidate secret (no stdout secret by default)")
     p_gen.add_argument("--write", default="", help="Target env file (default: ./wxqk-mesh.env)")
