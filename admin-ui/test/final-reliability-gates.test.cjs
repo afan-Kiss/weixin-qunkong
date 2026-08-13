@@ -82,20 +82,159 @@ test('business DB migrates before marker and preserves row counts', () => {
   try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
 })
 
-test('business DB conflict does not overwrite non-empty stable', () => {
+test('business DB conflict does not overwrite when BOTH have meaningful business', () => {
   const root = mkdtempSync(path.join(tmpdir(), 'biz-conflict-'))
   const stable = path.join(root, 'stable')
   const legacy = path.join(root, 'legacy')
-  makeDb(path.join(legacy, 'data', 'wechat-control.sqlite'), { task: true })
-  makeDb(path.join(stable, 'data', 'wechat-control.sqlite'), { settings: { keep: 1 } })
+  makeDb(path.join(legacy, 'data', 'wechat-control.sqlite'), { task: true, instance: true })
+  makeDb(path.join(stable, 'data', 'wechat-control.sqlite'), { task: true, qr: true })
   const result = migrateLegacyBusinessDataIfNeeded({
     stableUserDataDir: stable,
     legacyPortableUserDataDir: legacy,
   })
   assert.equal(result.code, 'LEGACY_DATA_CONFLICT')
   const stableInfo = inspectSqliteDb(path.join(stable, 'data', 'wechat-control.sqlite'))
-  assert.ok(stableInfo.counts.app_settings >= 1)
-  assert.equal(stableInfo.counts.tasks, 0)
+  assert.ok(stableInfo.counts.tasks >= 1)
+  assert.ok(stableInfo.counts.qr_items >= 1)
+  // Legacy untouched
+  assert.ok(existsSync(path.join(legacy, 'data', 'wechat-control.sqlite')))
+  try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
+})
+
+test('v1.99 bootstrap-only stable yields to meaningful legacy (logs+settings noise)', () => {
+  const {
+    classifyBusinessDb,
+    BUSINESS_MIGRATION_MARKER_V2,
+  } = require('../electron/wxqk-business-migration.cjs')
+  const root = mkdtempSync(path.join(tmpdir(), 'biz-v199-'))
+  const stable = path.join(root, 'stable')
+  const legacy = path.join(root, 'legacy')
+
+  // Legacy: real business
+  const legacyDb = path.join(legacy, 'data', 'wechat-control.sqlite')
+  makeDb(legacyDb, { instance: true, task: true, qr: true })
+  const ldb = new DatabaseSync(legacyDb)
+  for (let i = 0; i < 5; i += 1) {
+    ldb.prepare('INSERT INTO contacts(wxid,source_instance_id,updated_at) VALUES(?,?,?)')
+      .run(`wx${i}`, 'inst-1', new Date().toISOString())
+  }
+  for (let i = 0; i < 20; i += 1) {
+    ldb.prepare('INSERT INTO logs(time,level,message) VALUES(?,?,?)')
+      .run(new Date().toISOString(), 'INFO', `legacy-log-${i}`)
+  }
+  ldb.close()
+
+  // Stable: v1.99 bootstrap noise only
+  const stableDb = path.join(stable, 'data', 'wechat-control.sqlite')
+  makeDb(stableDb, { settings: { general: { lang: 'zh' } } })
+  const sdb = new DatabaseSync(stableDb)
+  for (let i = 0; i < 50; i += 1) {
+    sdb.prepare('INSERT INTO logs(time,level,message) VALUES(?,?,?)')
+      .run(new Date().toISOString(), 'INFO', `boot-${i}`)
+  }
+  sdb.close()
+
+  const legacyClass = classifyBusinessDb(legacyDb)
+  const stableClass = classifyBusinessDb(stableDb)
+  assert.equal(legacyClass.classification, 'meaningful_business')
+  assert.equal(stableClass.classification, 'bootstrap_only')
+  assert.ok(stableClass.bootstrapRows > 0)
+  assert.equal(stableClass.meaningfulRows, 0)
+
+  // Old v2 marker must NOT permanently block recovery
+  writeFileSync(path.join(stable, BUSINESS_MIGRATION_MARKER_V2), JSON.stringify({
+    at: '2026-01-01T00:00:00.000Z',
+    skipped: 'stable_identity_exists',
+  }), 'utf8')
+
+  const result = migrateLegacyBusinessDataIfNeeded({
+    stableUserDataDir: stable,
+    legacyPortableUserDataDir: legacy,
+  })
+  assert.equal(result.migrated, true)
+  assert.equal(result.code, 'OK')
+  assert.equal(result.stableBeforeClassification, 'bootstrap_only')
+  assert.equal(result.legacyClassification, 'meaningful_business')
+  assert.ok(result.backupDir)
+  assert.ok(existsSync(path.join(stable, BUSINESS_MIGRATION_MARKER)))
+
+  const after = classifyBusinessDb(path.join(stable, 'data', 'wechat-control.sqlite'))
+  assert.equal(after.classification, 'meaningful_business')
+  assert.ok(after.businessCounts.wechat_instances >= 1)
+  assert.ok(after.businessCounts.tasks >= 1)
+  assert.ok(after.businessCounts.qr_items >= 1)
+  assert.ok(after.businessCounts.contacts >= 5)
+
+  const marker = JSON.parse(readFileSync(path.join(stable, BUSINESS_MIGRATION_MARKER), 'utf8'))
+  assert.equal(marker.schema, 3)
+  assert.equal(marker.status, 'migrated')
+  assert.equal(marker.verified, true)
+
+  // Verified marker → idempotent skip
+  const second = migrateLegacyBusinessDataIfNeeded({
+    stableUserDataDir: stable,
+    legacyPortableUserDataDir: legacy,
+  })
+  assert.equal(second.reason, 'already_migrated')
+
+  try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
+})
+
+test('stable only logs (no settings) still migrates meaningful legacy', () => {
+  const { classifyBusinessDb } = require('../electron/wxqk-business-migration.cjs')
+  const root = mkdtempSync(path.join(tmpdir(), 'biz-logs-only-'))
+  const stable = path.join(root, 'stable')
+  const legacy = path.join(root, 'legacy')
+  makeDb(path.join(legacy, 'data', 'wechat-control.sqlite'), { instance: true, task: true })
+  makeDb(path.join(stable, 'data', 'wechat-control.sqlite'), {})
+  const sdb = new DatabaseSync(path.join(stable, 'data', 'wechat-control.sqlite'))
+  for (let i = 0; i < 100; i += 1) {
+    sdb.prepare('INSERT INTO logs(time,level,message) VALUES(?,?,?)')
+      .run(new Date().toISOString(), 'INFO', `n-${i}`)
+  }
+  sdb.close()
+  assert.equal(classifyBusinessDb(path.join(stable, 'data', 'wechat-control.sqlite')).classification, 'bootstrap_only')
+  const result = migrateLegacyBusinessDataIfNeeded({
+    stableUserDataDir: stable,
+    legacyPortableUserDataDir: legacy,
+  })
+  assert.equal(result.migrated, true)
+  const after = classifyBusinessDb(path.join(stable, 'data', 'wechat-control.sqlite'))
+  assert.ok(after.businessCounts.wechat_instances >= 1)
+  assert.ok(after.businessCounts.tasks >= 1)
+  try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
+})
+
+test('migration copy failure rolls back bootstrap stable and does not write success marker', () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'biz-rollback-'))
+  const stable = path.join(root, 'stable')
+  const legacy = path.join(root, 'legacy')
+  makeDb(path.join(legacy, 'data', 'wechat-control.sqlite'), { instance: true })
+  makeDb(path.join(stable, 'data', 'wechat-control.sqlite'), { settings: { x: 1 } })
+  const sdb = new DatabaseSync(path.join(stable, 'data', 'wechat-control.sqlite'))
+  sdb.prepare('INSERT INTO logs(time,level,message) VALUES(?,?,?)')
+    .run(new Date().toISOString(), 'INFO', 'keep-me')
+  sdb.close()
+
+  let copyCalls = 0
+  const result = migrateLegacyBusinessDataIfNeeded({
+    stableUserDataDir: stable,
+    legacyPortableUserDataDir: legacy,
+    copyFileSync: (src, dest) => {
+      copyCalls += 1
+      // Allow backup copies, fail when staging the main legacy sqlite
+      if (String(dest).includes('.wxqk-migrate-staging') && String(src).endsWith('wechat-control.sqlite')) {
+        throw new Error('simulated copy fail')
+      }
+      return require('node:fs').copyFileSync(src, dest)
+    },
+  })
+  assert.equal(result.code, 'LEGACY_MIGRATION_FAILED_ROLLED_BACK')
+  assert.equal(existsSync(path.join(stable, BUSINESS_MIGRATION_MARKER)), false)
+  const stableAfter = inspectSqliteDb(path.join(stable, 'data', 'wechat-control.sqlite'))
+  assert.ok(stableAfter.counts.app_settings >= 1)
+  assert.equal(stableAfter.counts.wechat_instances || 0, 0)
+  assert.ok(copyCalls >= 1)
   try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
 })
 
