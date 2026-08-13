@@ -1,4 +1,4 @@
-'use strict'
+﻿'use strict'
 
 /**
  * TEST ONLY flags. Production packages MUST keep failBeforeReady=false.
