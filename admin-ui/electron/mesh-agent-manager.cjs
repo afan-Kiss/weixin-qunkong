@@ -728,6 +728,42 @@ async function getMeshAgentStatus() {
 }
 
 /**
+ * Install WXQK as a branded Windows service under Program Files\\WXQK.
+ * MeshCentral -fullinstall still embeds legacy "Mesh Agent" paths in many builds,
+ * so WXQK uses New-Service + type=own (non-interactive) after copying files.
+ * @param {{ exePath: string, mshPath: string }} files
+ */
+async function installBrandedWindowsService(files) {
+  const pf = process.env.ProgramFiles || 'C:\\Program Files'
+  const installDir = path.join(pf, 'WXQK')
+  const destExe = path.join(installDir, EXE_NAME)
+  const destMsh = path.join(installDir, MSH_NAME)
+  const srcExe = String(files.exePath).replace(/'/g, "''")
+  const srcMsh = String(files.mshPath).replace(/'/g, "''")
+  const dirEsc = installDir.replace(/'/g, "''")
+  const exeEsc = destExe.replace(/'/g, "''")
+  const mshEsc = destMsh.replace(/'/g, "''")
+  const svc = SERVICE_NAME.replace(/'/g, "''")
+  const display = SERVICE_DISPLAY_NAME.replace(/'/g, "''")
+  const ps = [
+    `$ErrorActionPreference = 'Stop'`,
+    `New-Item -ItemType Directory -Force -Path '${dirEsc}' | Out-Null`,
+    `Copy-Item -LiteralPath '${srcExe}' -Destination '${exeEsc}' -Force`,
+    `Copy-Item -LiteralPath '${srcMsh}' -Destination '${mshEsc}' -Force`,
+    `$svc = Get-Service -Name '${svc}' -ErrorAction SilentlyContinue`,
+    `if ($null -eq $svc) {`,
+    `  New-Service -Name '${svc}' -BinaryPathName '"${exeEsc}"' -DisplayName '${display}' -Description '${display}' -StartupType Automatic | Out-Null`,
+    `}`,
+    `sc.exe config '${svc}' type= own | Out-Null`,
+    `sc.exe config '${svc}' binPath= '"${exeEsc}"' | Out-Null`,
+    `$svc2 = Get-Service -Name '${svc}' -ErrorAction SilentlyContinue`,
+    `if ($null -ne $svc2 -and $svc2.Status -ne 'Running') { Start-Service -Name '${svc}' }`,
+    `Get-Service -Name '${svc}' | Select-Object -ExpandProperty Status`,
+  ].join('; ')
+  return runElevated('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps])
+}
+
+/**
  * Install branded WXQK agent as a Windows service when possible.
  * Elevates only for install.
  * When clientId is provided, installs from a staged msh with agentName=WXQK-<clientId>.
@@ -745,6 +781,7 @@ async function installMeshAgent(options = {}) {
   }
 
   let installExe = paths.exePath
+  let installMsh = paths.mshPath
   let agentName = ''
   let stagingDir = ''
   if (clientId) {
@@ -754,6 +791,7 @@ async function installMeshAgent(options = {}) {
       return { ok: false, code: staged.code, message: staged.message }
     }
     installExe = staged.exePath
+    installMsh = staged.mshPath
     agentName = staged.agentName
     stagingDir = staged.stagingDir
     log('INFO', 'installing WXQK agent from staging', { agentName })
@@ -761,13 +799,14 @@ async function installMeshAgent(options = {}) {
     log('INFO', 'installing WXQK agent service')
   }
 
-  const elevateOpts = stagingDir ? { cwd: stagingDir } : {}
-  let result = await runElevated(installExe, ['-fullinstall'], elevateOpts)
+  let result = await installBrandedWindowsService({ exePath: installExe, mshPath: installMsh })
   if (!result.ok) {
-    result = await runElevated(installExe, ['-install'], elevateOpts)
-  }
-  if (!result.ok) {
-    result = await runElevated(installExe, ['Mesh', 'Service', 'install'], elevateOpts)
+    // Fallback for older MeshCentral agents that still honor -fullinstall branding
+    const elevateOpts = stagingDir ? { cwd: stagingDir } : {}
+    result = await runElevated(installExe, ['-fullinstall'], elevateOpts)
+    if (!result.ok) {
+      result = await runElevated(installExe, ['-install'], elevateOpts)
+    }
   }
 
   let mshSync = null
@@ -776,6 +815,9 @@ async function installMeshAgent(options = {}) {
     mshSync = await syncInstalledMsh(stagedMsh)
     log(mshSync.ok ? 'INFO' : 'WARN', 'post-install msh sync', mshSync)
   }
+
+  // Ensure service is own-process (interactive TYPE 110 breaks outbound for some builds)
+  await runElevated('sc.exe', ['config', SERVICE_NAME, 'type=', 'own'])
 
   const after = await getMeshAgentStatus()
   const ok = result.ok || after.servicePresent || after.status === 'running'

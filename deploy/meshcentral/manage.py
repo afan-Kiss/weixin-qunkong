@@ -698,7 +698,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         agent_detail = str(exc)[:80]
     else:
         agent_detail = f"127.0.0.1:{agent_port} open"
-    _print_check(agent_ok, "Agent endpoint", agent_detail, hint="Ensure WXQK_MESH_AGENT_PORT is published")
+    _print_check(
+        agent_ok,
+        "Agent Listener",
+        (agent_detail + " — TCP accept only, not Windows agent online") if agent_ok else agent_detail,
+        hint="Ensure WXQK_MESH_AGENT_PORT is published; does not prove agents are connected",
+    )
     if not agent_ok:
         failures += 1
 
@@ -712,6 +717,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     if not key_ok:
         failures += 1
+
+    # Online agent count only (never print node/client identifiers)
+    online_detail = "skip"
+    try:
+        import sys as _sys
+
+        for candidate in (Path("/opt/wxqk"), HERE.parent.parent / "server" / "wxqk"):
+            if candidate.exists() and str(candidate) not in _sys.path:
+                _sys.path.insert(0, str(candidate))
+        for k, v in {**env, **wxqk_env}.items():
+            if isinstance(k, str) and k.startswith("WXQK_MESH_") and v:
+                os.environ.setdefault(k, str(v))
+        os.environ.setdefault("WXQK_MESH_ENABLED", "1")
+        from meshcentral_client import node_is_online, sync_nodes_via_control  # type: ignore
+
+        _nodes = (sync_nodes_via_control() or {}).get("nodes") or []
+        _online = sum(1 for n in _nodes if node_is_online(n))
+        online_detail = f"online={_online} total={len(_nodes)}"
+    except Exception as exc:  # pragma: no cover - best-effort diagnostic
+        online_detail = f"skip ({type(exc).__name__})"
+    _print_check(True, "Online Agents", online_detail, hint="Count only; identifiers not printed")
 
     mesh_url_ok = bool(str(wxqk_env.get("WXQK_MESH_URL") or env.get("WXQK_MESH_URL") or "").strip())
     enabled = str(wxqk_env.get("WXQK_MESH_ENABLED") or env.get("WXQK_MESH_ENABLED") or "").strip().lower() in (
@@ -826,6 +852,84 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor_agent(args: argparse.Namespace) -> int:
+    """Server-side agent connectivity diagnostics (no secrets / no device IDs)."""
+    env = _load_env_file(HERE / ".env")
+    wxqk_env = _load_env_file(WXQK_MESH_ENV_LOCAL)
+    if WXQK_MESH_ENV_DEFAULT.exists():
+        wxqk_env = {**wxqk_env, **_load_env_file(WXQK_MESH_ENV_DEFAULT)}
+    failures = 0
+
+    agent_port = int(env.get("WXQK_MESH_AGENT_PORT") or wxqk_env.get("WXQK_MESH_AGENT_PORT") or "4433")
+    agent_ok = False
+    agent_detail = ""
+    try:
+        import socket
+
+        with socket.create_connection(("127.0.0.1", agent_port), timeout=3):
+            agent_ok = True
+            agent_detail = f"127.0.0.1:{agent_port} open — TCP accept only"
+    except Exception as exc:
+        agent_detail = str(exc)[:80]
+        failures += 1
+    _print_check(agent_ok, "Server listener", agent_detail)
+
+    public_host = (
+        (wxqk_env.get("WXQK_MESH_PUBLIC_HOST") or env.get("WXQK_MESH_PUBLIC_HOST") or "").strip()
+        or (env.get("WXQK_MESH_CERT") or wxqk_env.get("WXQK_MESH_CERT") or "").strip()
+    )
+    if public_host:
+        dns_ok = True
+        try:
+            import socket
+
+            infos = socket.getaddrinfo(public_host, agent_port, type=socket.SOCK_STREAM)
+            addrs = sorted({i[4][0] for i in infos})
+            dns_detail = f"{public_host} → {','.join(addrs[:4])}"
+        except Exception as exc:
+            dns_ok = False
+            dns_detail = f"{public_host} ({type(exc).__name__})"
+            failures += 1
+        _print_check(dns_ok, "DNS target", dns_detail)
+    else:
+        _print_check(True, "DNS target", "skip (no public host in env)")
+
+    _print_check(True, "TLS endpoint", "listener TCP only — agent TLS verified by MeshAgent runtime, not CERT_NONE bypass")
+
+    control_ok = False
+    control_detail = "skip"
+    online_detail = "skip"
+    try:
+        for candidate in (Path("/opt/wxqk"), HERE.parent.parent / "server" / "wxqk"):
+            if candidate.exists() and str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+        for k, v in {**env, **wxqk_env}.items():
+            if isinstance(k, str) and k.startswith("WXQK_MESH_") and v:
+                os.environ.setdefault(k, str(v))
+        os.environ.setdefault("WXQK_MESH_ENABLED", "1")
+        from meshcentral_client import node_is_online, sync_nodes_via_control  # type: ignore
+
+        synced = sync_nodes_via_control() or {}
+        control_ok = bool(synced.get("ok"))
+        control_detail = str(synced.get("code") or ("OK" if control_ok else "FAIL"))[:40]
+        nodes = synced.get("nodes") or []
+        online = sum(1 for n in nodes if isinstance(n, dict) and node_is_online(n))
+        online_detail = f"online={online} total={len(nodes)}"
+    except Exception as exc:
+        control_detail = type(exc).__name__
+        failures += 1
+    if not control_ok:
+        failures += 1
+    _print_check(control_ok, "control channel", control_detail)
+    _print_check(True, "online nodes", online_detail)
+
+    if failures:
+        print(f"[MESH] doctor-agent FAIL ({failures})")
+        return 1
+    print("[MESH] doctor-agent PASS")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="WXQK MeshCentral deploy helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -863,6 +967,9 @@ def main() -> int:
     p_doc.add_argument("--allow-health-fail", action="store_true")
     p_doc.add_argument("--wxqk-health-url", default="", help="Optional wxqk /api/mesh/health URL to probe")
     p_doc.set_defaults(func=cmd_doctor)
+
+    p_da = sub.add_parser("doctor-agent", help="Agent listener / TLS / control / online-count diagnostics")
+    p_da.set_defaults(func=cmd_doctor_agent)
 
     args = parser.parse_args()
     return int(args.func(args) or 0)

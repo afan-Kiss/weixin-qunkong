@@ -807,21 +807,27 @@ def match_node_for_client(
         if host_hint and (name == host_hint or host == host_hint or agent_field == host_hint):
             by_hostname.append(node)
 
-    if len(by_agent) == 1:
-        return by_agent[0], ""
-    if len(by_agent) > 1:
-        return None, "MESH_AMBIGUOUS"
+    def _prefer_online(
+        candidates: list[dict[str, Any]],
+        *,
+        ambiguous_code: str,
+    ) -> tuple[Optional[dict[str, Any]], str]:
+        """When reinstall leaves duplicate names, prefer the single online node."""
+        if len(candidates) == 1:
+            return candidates[0], ""
+        online = [n for n in candidates if node_is_online(n)]
+        if len(online) == 1:
+            return online[0], ""
+        return None, ambiguous_code
 
-    if len(by_client_id) == 1:
-        return by_client_id[0], ""
-    if len(by_client_id) > 1:
-        return None, "MESH_AMBIGUOUS"
+    if by_agent:
+        return _prefer_online(by_agent, ambiguous_code="MESH_AMBIGUOUS")
 
-    if allow_hostname_fallback and host_hint:
-        if len(by_hostname) == 1:
-            return by_hostname[0], ""
-        if len(by_hostname) > 1:
-            return None, "MESH_HOSTNAME_AMBIGUOUS"
+    if by_client_id:
+        return _prefer_online(by_client_id, ambiguous_code="MESH_AMBIGUOUS")
+
+    if allow_hostname_fallback and host_hint and by_hostname:
+        return _prefer_online(by_hostname, ambiguous_code="MESH_HOSTNAME_AMBIGUOUS")
 
     return None, "MESH_NO_MATCH"
 
@@ -986,16 +992,16 @@ def auto_bind_client(
         present = find_node_by_id(nodes, existing_nid)
         if present is not None:
             online = node_is_online(present)
-            sync_device_mapping(
-                data_dir,
-                client_id=cid,
-                mesh_node_id=existing_nid,
-                mesh_agent_status="online" if online else "bound",
-                mesh_last_seen=_utcnow_iso(),
-                owner_username=owner_username,
-            )
-            mapping = get_mapping(data_dir, cid) or existing
             if online:
+                sync_device_mapping(
+                    data_dir,
+                    client_id=cid,
+                    mesh_node_id=existing_nid,
+                    mesh_agent_status="online",
+                    mesh_last_seen=_utcnow_iso(),
+                    owner_username=owner_username,
+                )
+                mapping = get_mapping(data_dir, cid) or existing
                 return _bind_result_payload(
                     ok=True,
                     code="OK",
@@ -1008,6 +1014,36 @@ def auto_bind_client(
                     online=True,
                     verified=True,
                 )
+            # Stale offline mapping: if a newer duplicate agentName node is online, remapping.
+            if matched and node_is_online(matched) and node_id_of(matched) != existing_nid:
+                mapping = _persist_matched_mapping(
+                    data_dir,
+                    client_id=cid,
+                    matched=matched,
+                    owner_username=owner_username,
+                )
+                new_nid = node_id_of(matched)
+                return _bind_result_payload(
+                    ok=True,
+                    code="OK",
+                    message="remapped from offline duplicate",
+                    user_message="服务已就绪",
+                    remote_state=REMOTE_STATE_READY,
+                    mapping=mapping,
+                    mesh_node_id=new_nid,
+                    agent_name=expected_agent,
+                    online=True,
+                    verified=True,
+                )
+            sync_device_mapping(
+                data_dir,
+                client_id=cid,
+                mesh_node_id=existing_nid,
+                mesh_agent_status="bound",
+                mesh_last_seen=_utcnow_iso(),
+                owner_username=owner_username,
+            )
+            mapping = get_mapping(data_dir, cid) or existing
             return _bind_result_payload(
                 ok=False,
                 code="MESH_AGENT_OFFLINE",
@@ -1285,6 +1321,34 @@ def resolve_live_device_status(
         return payload
 
     online = node_is_online(present)
+    if not online:
+        # Offline mapped node may be a reinstall duplicate — heal onto online agentName match.
+        remapped = auto_bind_client(
+            data_dir,
+            cid,
+            owner_username=owner_username,
+            userid=userid,
+            hostname=hostname,
+        )
+        if remapped.get("ready"):
+            payload = {
+                "ok": True,
+                "code": "OK",
+                "message": "服务已就绪",
+                "userMessage": "服务已就绪",
+                "clientId": cid,
+                "bound": True,
+                "online": True,
+                "ready": True,
+                "verified": True,
+                "remoteState": REMOTE_STATE_READY,
+                "mapping": remapped.get("mapping") or get_mapping(data_dir, cid),
+                "meshNodeId": str(remapped.get("meshNodeId") or ""),
+                "config": config_snapshot(),
+            }
+            _live_cache_set(cache_key, payload)
+            return payload
+
     sync_device_mapping(
         data_dir,
         client_id=cid,

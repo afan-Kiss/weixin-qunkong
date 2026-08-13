@@ -23,6 +23,7 @@ resources/meshcentral/WXQK.exe
 resources/meshcentral/WXQK.msh
 resources/meshcentral/meshagent.exe
 resources/meshcentral/meshagent.msh
+resources/meshcentral/meshagent.legacy.exe
 scripts/_*.ps1
 scripts/_tmp*
 

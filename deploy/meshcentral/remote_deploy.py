@@ -37,7 +37,11 @@ def connect() -> paramiko.SSHClient:
     if not host or not password:
         raise SystemExit("WXQK_SSH_HOST and WXQK_SSH_PASSWORD required")
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.load_system_host_keys()
+    kh = Path.home() / ".ssh" / "known_hosts"
+    if kh.exists():
+        client.load_host_keys(str(kh))
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
     client.connect(host, username=user, password=password, timeout=30, allow_agent=False, look_for_keys=False)
     return client
 

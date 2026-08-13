@@ -216,6 +216,37 @@ class MeshCentralClientTest(unittest.TestCase):
             self.assertEqual(result.get("code"), "MESH_NO_MATCH")
             self.assertEqual(mc.get_mapping(data_dir, "c1")["mesh_node_id"], "stale")
 
+    def test_auto_bind_prefers_online_duplicate_agent_name(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            mc.sync_device_mapping(data_dir, client_id="c1", mesh_node_id="offline-dup")
+            with mock.patch.object(
+                mc,
+                "sync_nodes_via_control",
+                return_value={
+                    "ok": True,
+                    "code": "OK",
+                    "nodes": [
+                        {"_id": "offline-dup", "name": "WXQK-c1", "conn": None},
+                        {"_id": "online-node", "name": "WXQK-c1", "conn": 1, "meshid": "g"},
+                    ],
+                },
+            ):
+                result = mc.auto_bind_client(data_dir, "c1")
+            self.assertTrue(result.get("ready"))
+            self.assertEqual(result.get("meshNodeId"), "online-node")
+            self.assertEqual(mc.get_mapping(data_dir, "c1")["mesh_node_id"], "online-node")
+
+    def test_match_node_prefers_single_online_among_duplicates(self):
+        nodes = [
+            {"_id": "a", "name": "WXQK-c1", "conn": None},
+            {"_id": "b", "name": "WXQK-c1", "conn": 1},
+            {"_id": "c", "name": "WXQK-c1"},
+        ]
+        matched, err = mc.match_node_for_client(nodes, "c1")
+        self.assertEqual(err, "")
+        self.assertEqual(mc.node_id_of(matched), "b")
+
     def test_auto_bind_remaps_when_old_node_gone(self):
         with tempfile.TemporaryDirectory() as folder:
             data_dir = Path(folder)

@@ -142,10 +142,24 @@ async function main() {
     if (exeInfo.bytes < 1024) fail(`agent exe too small (${exeInfo.bytes} bytes)`)
     if (mshInfo.bytes < 16) fail(`msh too small (${mshInfo.bytes} bytes)`)
 
+    const buf = fs.readFileSync(exePath)
+    if (buf.length < 1024 * 100 || buf[0] !== 0x4d || buf[1] !== 0x5a) {
+      fail('agent exe is not a valid Windows PE (MZ) binary — refusing to keep HTML/error page')
+    }
+    const head = buf.slice(0, 64).toString('utf8').toLowerCase()
+    if (head.includes('<!doctype') || head.includes('<html') || head.includes('login')) {
+      fail('agent download looks like an HTML login/error page')
+    }
+
     const mshText = fs.readFileSync(mshPath, 'utf8')
-    if (!/MeshServer|ServerID|MeshID/i.test(mshText)) {
+    if (/<!doctype|<html|login/i.test(mshText.slice(0, 200))) {
+      fail('msh download looks like an HTML login/error page')
+    }
+    if (!/MeshServer=/i.test(mshText) || !/ServerID=/i.test(mshText) || !/MeshID=/i.test(mshText)) {
       fail('msh content does not look like a MeshCentral pairing file (missing MeshServer/ServerID/MeshID)')
     }
+    // Never invent ServerID/MeshID here — only validate official download content.
+    console.log('[MESH] msh fields present (official download only; this script does not compute ServerID)')
 
     const expectExe = String(process.env.WXQK_MESH_AGENT_SHA256 || '').trim().toLowerCase()
     const expectMsh = String(process.env.WXQK_MESH_MSH_SHA256 || '').trim().toLowerCase()
@@ -158,8 +172,9 @@ async function main() {
       if (got !== expectMsh) fail(`msh sha256 mismatch: got ${got}`)
     }
 
-    console.log(`[MESH] OK agent=${exeInfo.bytes}B msh=${mshInfo.bytes}B → ${EXE_NAME} / ${MSH_NAME}`)
-    console.log('[MESH] Do NOT commit WXQK.msh or WXQK.exe to public git. Keep ServerID from your own server.')
+    console.log(`[MESH] OK agent=${exeInfo.bytes}B msh=${mshInfo.bytes}B sha256=${sha256File(exePath).slice(0, 16)}… → ${EXE_NAME} / ${MSH_NAME}`)
+    console.log('[MESH] Do NOT commit WXQK.msh or WXQK.exe to public git.')
+    console.log('[MESH] On Mesh host prefer: python3 deploy/meshcentral/provision_official_agent.py')
   } catch (err) {
     cleanupPartial(exePath)
     cleanupPartial(mshPath)
