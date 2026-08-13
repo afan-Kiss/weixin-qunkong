@@ -1,3 +1,11 @@
+'use strict'
+
+/**
+ * Device identity — machine-bound via Windows safeStorage (DPAPI) when available.
+ * Never recreate identity when decrypt fails (DEVICE_IDENTITY_UNREADABLE).
+ * Legacy portable clones must not inherit another PC's clientId.
+ */
+
 const { createHash, generateKeyPairSync, randomBytes, sign, createPrivateKey } = require('crypto')
 const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('fs')
 const path = require('path')
@@ -6,16 +14,46 @@ const { getProtocol, getBuildIdPrefix, getAgentWsPath } = require('./secure-conf
 const packageInfo = require('../package.json')
 const VERSION = packageInfo.version
 const BUILD_ID = `${getBuildIdPrefix()}${VERSION}`
-/** 与服务端 releaseSequence 对齐；由 bump-version.cjs 在打包时递增（兼容旧字段名） */
 const RELEASE_SEQUENCE = String(packageInfo.releaseSequence || '1')
 const PROTOCOL = getProtocol()
+const IDENTITY_SCHEMA_VERSION = 2
 
 let safeStorageRef = null
 try {
-  // electron 在非 electron 进程 require 会失败；测试环境跳过加密
   safeStorageRef = require('electron').safeStorage
 } catch {
   safeStorageRef = null
+}
+
+/** @type {{ readInstalledAgentName?: () => string, fs?: typeof import('fs') }} */
+let identityDeps = {}
+
+function setIdentityDepsForTest(overrides = {}) {
+  identityDeps = { ...identityDeps, ...overrides }
+}
+
+function resetIdentityDepsForTest() {
+  identityDeps = {}
+}
+
+/** @type {import('electron').SafeStorage | null | undefined} */
+let safeStorageOverride = undefined
+
+/**
+ * Inject safeStorage double for unit tests (undefined = use electron module).
+ * @param {import('electron').SafeStorage | null | undefined} store
+ */
+function setSafeStorageForTest(store) {
+  safeStorageOverride = store
+}
+
+function resetSafeStorageForTest() {
+  safeStorageOverride = undefined
+}
+
+function activeSafeStorage() {
+  if (safeStorageOverride !== undefined) return safeStorageOverride
+  return safeStorageRef
 }
 
 function b64(buf) {
@@ -44,16 +82,97 @@ function decryptPem(store, encoded) {
   }
 }
 
+function encryptionAvailable(store = safeStorageRef) {
+  try {
+    return Boolean(store && store.isEncryptionAvailable && store.isEncryptionAvailable())
+  } catch {
+    return false
+  }
+}
+
 /**
- * 加载或创建设备身份；私钥优先走 OS safeStorage，启动时迁移旧明文。
- * 已有身份文件时绝不会因解密失败而覆盖成新设备（避免客户机变成“新机器”）。
+ * Read agentName from installed branded WXQK.msh (local ownership evidence).
+ * @returns {string}
+ */
+function readInstalledWxqkAgentName() {
+  if (typeof identityDeps.readInstalledAgentName === 'function') {
+    return String(identityDeps.readInstalledAgentName() || '').trim()
+  }
+  const pf = process.env.ProgramFiles || 'C:\\Program Files'
+  const candidates = [
+    path.join(pf, 'WXQK', 'WXQK.msh'),
+    path.join(pf, 'WXQK', 'WXQK', 'WXQK.msh'),
+  ]
+  const fsApi = identityDeps.fs || { existsSync, readFileSync }
+  for (const msh of candidates) {
+    try {
+      if (!fsApi.existsSync(msh)) continue
+      const text = fsApi.readFileSync(msh, 'utf8')
+      const m = String(text).match(/^agentName=(.+)$/im)
+      if (m) return String(m[1] || '').trim()
+    } catch { /* continue */ }
+  }
+  return ''
+}
+
+/**
+ * Whether a legacy identity row may be adopted on this machine (anti-clone).
+ * @param {Record<string, unknown>} raw
+ * @param {string} privateKeyPem
+ * @param {boolean} decryptedViaDpapi
+ */
+function canAdoptLegacyIdentity(raw, privateKeyPem, decryptedViaDpapi) {
+  if (!privateKeyPem || !raw?.publicKeyB64 || !raw?.deviceId) return { ok: false, reason: 'incomplete' }
+  if (decryptedViaDpapi) return { ok: true, reason: 'dpapi' }
+
+  // Plaintext-only legacy: require local Agent msh to already claim this clientId
+  const clientId = String(raw.clientId || raw.deviceId || '').trim()
+  if (!clientId) return { ok: false, reason: 'no_client_id' }
+  const agentName = readInstalledWxqkAgentName()
+  const expected = `WXQK-${clientId}`
+  if (agentName && agentName === expected) {
+    return { ok: true, reason: 'local_msh_agentName_match' }
+  }
+  return { ok: false, reason: 'clone_rejected' }
+}
+
+/**
+ * Persist identity without long-lived plaintext when DPAPI is available.
+ * @param {string} file
+ * @param {Record<string, unknown>} row
+ * @param {string} privateKeyPem
+ */
+function writeIdentityFile(file, row, privateKeyPem) {
+  const store = activeSafeStorage()
+  const enc = encryptPem(store, privateKeyPem)
+  const out = {
+    schemaVersion: IDENTITY_SCHEMA_VERSION,
+    publicKeyB64: row.publicKeyB64,
+    deviceId: row.deviceId,
+    clientId: row.clientId || row.deviceId,
+    createdAt: row.createdAt || new Date().toISOString(),
+    migratedAt: row.migratedAt || undefined,
+    machineBindingVersion: 1,
+  }
+  if (enc) {
+    out.privateKeyEnc = enc
+    // Do NOT persist privateKeyPem when encryption works (anti portable-folder clone)
+  } else {
+    // Test / non-electron environments without DPAPI
+    out.privateKeyPem = privateKeyPem
+  }
+  writeFileSync(file, JSON.stringify(out, null, 2), 'utf8')
+  return out
+}
+
+/**
  * @param {string} userDataDir
  */
 function loadOrCreate(userDataDir) {
   const dir = path.join(userDataDir, 'security')
   mkdirSync(dir, { recursive: true })
   const file = path.join(dir, 'device-identity.json')
-  const store = safeStorageRef
+  const store = activeSafeStorage()
   if (existsSync(file)) {
     let raw = null
     try {
@@ -63,64 +182,134 @@ function loadOrCreate(userDataDir) {
     }
     if (raw && typeof raw === 'object') {
       let privateKeyPem = ''
+      let decryptedViaDpapi = false
       if (raw.privateKeyEnc) {
         privateKeyPem = decryptPem(store, raw.privateKeyEnc)
+        decryptedViaDpapi = Boolean(privateKeyPem)
       }
-      // 解密失败时仍可用明文备份；迁移成功后暂保留明文一档，避免个别机器 DPAPI 异常丢身份
+
       if (!privateKeyPem && raw.privateKeyPem) {
+        if (raw.privateKeyEnc && encryptionAvailable(store) && !decryptedViaDpapi) {
+          // Enc present but undecryptable — never fall back to plaintext
+          const err = new Error('设备身份暂时无法读取，请稍后重试或联系客服（不会自动重置）')
+          err.code = 'DEVICE_IDENTITY_UNREADABLE'
+          throw err
+        }
+        // Local stable plaintext (legacy format): allow once, then rewrite encrypted without plaintext
         privateKeyPem = String(raw.privateKeyPem)
       }
+
       if (privateKeyPem && raw.publicKeyB64 && raw.deviceId) {
-        const enc = encryptPem(store, privateKeyPem)
-        if (enc && !raw.privateKeyEnc) {
-          try {
-            writeFileSync(file, JSON.stringify({
-              privateKeyEnc: enc,
-              // 保留明文备份：仅当系统加密可用时仍双写，防止偶发解密失败丢掉设备
-              privateKeyPem,
-              publicKeyB64: raw.publicKeyB64,
-              deviceId: raw.deviceId,
-              clientId: raw.clientId || raw.deviceId,
-              createdAt: raw.createdAt || new Date().toISOString(),
-              migratedAt: new Date().toISOString(),
-            }, null, 2), 'utf8')
-          } catch { /* ignore */ }
-        } else if (!raw.clientId) {
-          try {
-            writeFileSync(file, JSON.stringify({ ...raw, clientId: raw.deviceId }, null, 2), 'utf8')
-          } catch { /* ignore */ }
-        }
+        try {
+          writeIdentityFile(file, {
+            publicKeyB64: raw.publicKeyB64,
+            deviceId: raw.deviceId,
+            clientId: raw.clientId || raw.deviceId,
+            createdAt: raw.createdAt || new Date().toISOString(),
+            migratedAt: new Date().toISOString(),
+          }, privateKeyPem)
+        } catch { /* ignore rewrite failures; still return usable identity */ }
         return {
           privateKeyPem,
           publicKeyB64: raw.publicKeyB64,
           deviceId: raw.deviceId,
           clientId: raw.clientId || raw.deviceId,
           createdAt: raw.createdAt,
+          schemaVersion: IDENTITY_SCHEMA_VERSION,
         }
       }
     }
-    // 已有身份文件时绝不能覆盖成新设备（含 JSON 损坏、解密失败、字段残缺）
     const err = new Error('设备身份暂时无法读取，请稍后重试或联系客服（不会自动重置）')
     err.code = 'DEVICE_IDENTITY_UNREADABLE'
     throw err
   }
+
+  // Fresh identity
   const { privateKey, publicKey } = generateKeyPairSync('ed25519')
   const pubDer = publicKey.export({ type: 'spki', format: 'der' })
   const pubRaw = pubDer.subarray(pubDer.length - 32)
   const publicKeyB64 = b64(pubRaw)
   const deviceId = createHash('sha256').update(pubRaw).digest('hex')
   const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' })
-  const enc = encryptPem(store, privateKeyPem)
-  const row = {
+  writeIdentityFile(file, {
     publicKeyB64,
     deviceId,
     clientId: deviceId,
     createdAt: new Date().toISOString(),
+  }, privateKeyPem)
+  return {
     privateKeyPem,
+    publicKeyB64,
+    deviceId,
+    clientId: deviceId,
+    createdAt: new Date().toISOString(),
+    schemaVersion: IDENTITY_SCHEMA_VERSION,
   }
-  if (enc) row.privateKeyEnc = enc
-  writeFileSync(file, JSON.stringify(row, null, 2), 'utf8')
-  return { ...row, privateKeyPem }
+}
+
+/**
+ * Try importing a staged legacy identity file into stable security dir with clone checks.
+ * @param {string} userDataDir stable userData
+ * @param {string} legacyIdentityPath
+ */
+function tryImportLegacyIdentityFile(userDataDir, legacyIdentityPath) {
+  const fsApi = identityDeps.fs || { existsSync, readFileSync, mkdirSync, writeFileSync }
+  if (!legacyIdentityPath || !fsApi.existsSync(legacyIdentityPath)) {
+    return { ok: false, code: 'NO_LEGACY', message: 'no legacy identity' }
+  }
+  const destDir = path.join(userDataDir, 'security')
+  const dest = path.join(destDir, 'device-identity.json')
+  if (fsApi.existsSync(dest)) {
+    return { ok: false, code: 'STABLE_EXISTS', message: 'stable identity already present' }
+  }
+  let raw
+  try {
+    raw = JSON.parse(fsApi.readFileSync(legacyIdentityPath, 'utf8'))
+  } catch {
+    return { ok: false, code: 'LEGACY_CORRUPT', message: 'legacy identity unreadable' }
+  }
+  let privateKeyPem = ''
+  let viaDpapi = false
+  if (raw.privateKeyEnc) {
+    privateKeyPem = decryptPem(activeSafeStorage(), raw.privateKeyEnc)
+    viaDpapi = Boolean(privateKeyPem)
+  }
+  if (!privateKeyPem && raw.privateKeyEnc && encryptionAvailable(activeSafeStorage())) {
+    // Encrypted identity from another machine / corrupted DPAPI — never fall back to plaintext clone
+    if (raw.privateKeyPem) {
+      return {
+        ok: false,
+        code: 'DEVICE_IDENTITY_UNREADABLE',
+        message: 'legacy privateKeyEnc 无法在本机解密，拒绝用明文克隆',
+      }
+    }
+    return {
+      ok: false,
+      code: 'DEVICE_IDENTITY_UNREADABLE',
+      message: 'legacy privateKeyEnc 无法在本机解密',
+    }
+  }
+  if (!privateKeyPem && raw.privateKeyPem) {
+    privateKeyPem = String(raw.privateKeyPem)
+  }
+  const adopt = canAdoptLegacyIdentity(raw, privateKeyPem, viaDpapi)
+  if (!adopt.ok) {
+    return { ok: false, code: 'DEVICE_IDENTITY_CLONE_REJECTED', reason: adopt.reason, message: '拒绝导入可能克隆的设备身份' }
+  }
+  fsApi.mkdirSync(destDir, { recursive: true })
+  writeIdentityFile(dest, {
+    publicKeyB64: raw.publicKeyB64,
+    deviceId: raw.deviceId,
+    clientId: raw.clientId || raw.deviceId,
+    createdAt: raw.createdAt || new Date().toISOString(),
+    migratedAt: new Date().toISOString(),
+  }, privateKeyPem)
+  return {
+    ok: true,
+    code: 'OK',
+    reason: adopt.reason,
+    clientId: String(raw.clientId || raw.deviceId),
+  }
 }
 
 function signRaw(identity, message) {
@@ -158,7 +347,6 @@ function authHeaders(identity, method, reqPath, bodyBuf) {
   }
 }
 
-/** WS 握手路径（与服务端一致，字面量不落源码） */
 function agentWsRequestPath() {
   return getAgentWsPath()
 }
@@ -168,9 +356,19 @@ module.exports = {
   VERSION,
   RELEASE_SEQUENCE,
   PROTOCOL,
+  IDENTITY_SCHEMA_VERSION,
   loadOrCreate,
+  tryImportLegacyIdentityFile,
+  canAdoptLegacyIdentity,
+  readInstalledWxqkAgentName,
+  encryptionAvailable,
+  writeIdentityFile,
   signRaw,
   authHeaders,
   bodyHash,
   agentWsRequestPath,
+  setIdentityDepsForTest,
+  resetIdentityDepsForTest,
+  setSafeStorageForTest,
+  resetSafeStorageForTest,
 }

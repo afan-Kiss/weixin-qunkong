@@ -34,12 +34,16 @@ async function main() {
     process.exit(3)
   }
   fs.mkdirSync(coldDir, { recursive: true })
+  const localApp = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+  const stableId = path.join(localApp, 'WXQK', 'security', 'device-identity.json')
   const sessionBin = path.join(coldDir, 'WXQK-Data', 'account-session.bin')
   console.log(JSON.stringify({
     phase: 'preflight',
     exe,
     coldDir,
     accountSessionExists: fs.existsSync(sessionBin),
+    stableIdentityExists: fs.existsSync(stableId),
+    stableIdentityPath: stableId,
     programFilesWxqk: fs.existsSync('C:\\Program Files\\WXQK\\WXQK.exe'),
     serviceQuery: run('sc.exe', ['query', 'WXQK']).includes('1060') ? 'missing' : 'present',
   }, null, 2))

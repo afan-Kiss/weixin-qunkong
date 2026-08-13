@@ -852,7 +852,25 @@ async function applyUpdate(options) {
 }
 
 /**
+ * Refuse updater cleanup paths that could hit Program Files\\WXQK or stable identity.
+ * @param {string} targetPath
+ */
+function isSafeUpdaterCleanupPath(targetPath) {
+  const raw = String(targetPath || '').trim()
+  if (!raw) return false
+  try {
+    const { isProtectedWxqkPath } = require('./wxqk-data-paths.cjs')
+    if (isProtectedWxqkPath(raw)) return false
+  } catch { /* ignore */ }
+  const normalized = raw.replace(/\//g, '\\').toLowerCase()
+  if (normalized.includes('\\program files\\wxqk')) return false
+  if (normalized.includes('\\program files (x86)\\wxqk')) return false
+  return true
+}
+
+/**
  * 新进程启动后清理旧版回收站文件。
+ * Never touch installed Mesh Agent under Program Files\\WXQK or device identity.
  */
 function cleanupUpdateTrashBestEffort() {
   try {
@@ -861,13 +879,15 @@ function cleanupUpdateTrashBestEffort() {
       String(process.env[LEGACY_UPDATE_OLD_TRASH_ENV] || '').trim(),
     ].filter(Boolean)
     for (const trash of candidates) {
+      if (!isSafeUpdaterCleanupPath(trash)) continue
       try { if (existsSync(trash)) unlinkSync(trash) } catch { /* ignore */ }
     }
     const dir = path.dirname(resolvePortableExePath())
+    if (!isSafeUpdaterCleanupPath(dir)) return
     const trashDirs = [UPDATE_TRASH_DIR, ...getLegacyTrashDirNames()]
     for (const name of trashDirs) {
       const trashDir = path.join(dir, name)
-      if (!existsSync(trashDir)) continue
+      if (!existsSync(trashDir) || !isSafeUpdaterCleanupPath(trashDir)) continue
       try {
         if (!readdirSync(trashDir).length) rmSync(trashDir, { recursive: true, force: true })
       } catch { /* ignore */ }
@@ -1054,6 +1074,7 @@ module.exports = {
   markStartupUpdateDone,
   setAllowUnsignedForTest,
   cleanupUpdateTrashBestEffort,
+  isSafeUpdaterCleanupPath,
   ipcCheckClientUpdate,
   ipcApplyClientUpdate,
 }

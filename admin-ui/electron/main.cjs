@@ -3,19 +3,17 @@ const path = require('path')
 const { existsSync } = require('fs')
 
 /**
- * Portable single-instance identity MUST be stable across launches.
- * electron-builder portable unpacks to a temp dir each run; default userData would
- * be unique per unpack → requestSingleInstanceLock would NOT serialize instances.
+ * Machine-stable userData (%LOCALAPPDATA%\WXQK) — NOT portable EXE directory.
+ * Keeps single-instance lock + device identity stable across move/rename/upgrade.
  * Keep this BEFORE requestSingleInstanceLock / heavy init.
  */
-;(function pinPortableUserData() {
+const { pinStableUserData, migrateLegacyPortableUserDataIfNeeded } = require('./wxqk-data-paths.cjs')
+const __wxqkDataPaths = (() => {
   try {
-    const portableDir = String(process.env.PORTABLE_EXECUTABLE_DIR || '').trim()
-    if (!portableDir) return
-    const dataDir = path.join(portableDir, 'WXQK-Data')
-    app.setPath('userData', dataDir)
-    try { app.setPath('sessionData', path.join(dataDir, 'session')) } catch { /* older electron */ }
-  } catch { /* ignore */ }
+    return pinStableUserData(app)
+  } catch {
+    return { stableUserDataDir: '', legacyPortableUserDataDir: '' }
+  }
 })()
 
 /** 轻量启动计时；额外写 %TEMP%\wxqk-startup-marks.json（单次很小，便于外部测速） */
@@ -52,8 +50,9 @@ function markStartup(label) {
 }
 markStartup('process start')
 
-// Single-instance lock as early as possible (after portable userData pin).
+// Single-instance lock as early as possible (after stable userData pin).
 // Second instances must not continue loading storage/backend/tray modules.
+// Same Windows user → one WXQK app, regardless of which folder the portable EXE lives in.
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) {
   try { app.quit() } catch { /* ignore */ }
@@ -92,6 +91,7 @@ const { resolveIpcApiTimeout } = require('./ipc-api-timeout.cjs')
 const { buildHistoryImagePageSql } = require('./qr-history-pagination.cjs')
 const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
 const meshRemote = require('./mesh-remote-bridge.cjs')
+const meshAgentWatchdog = require('./mesh-agent-watchdog.cjs')
 const softwareAuth = require('./software-auth.cjs')
 const { safeFolderName, classifyQrText, qrTypeLabel, contentHash, messageTableName, rowsFromApi, valueOf, fieldString, existingImagePath, cdnDownloadRequest, downloadRequest, decodeNativeImages, accurateFileName, prepareHistoryMessageRow, yieldMain, normalizeQrText } = require('./qr-collector.cjs')
 const {
@@ -5822,6 +5822,34 @@ app.whenReady().then(async () => {
   try {
     initStorage(app.getPath('userData'))
     markStartup('storage initialized')
+    // One-shot: copy legacy <portable>\WXQK-Data into stable dir if needed; identity import is clone-checked
+    try {
+      const mig = migrateLegacyPortableUserDataIfNeeded({
+        stableUserDataDir: __wxqkDataPaths.stableUserDataDir || app.getPath('userData'),
+        legacyPortableUserDataDir: __wxqkDataPaths.legacyPortableUserDataDir,
+      })
+      if (mig.migrated || mig.reason === 'copied') {
+        appLog('INFO', '[IDENTITY] legacy portable data staged', { reason: mig.reason, copied: mig.copied?.length || 0 })
+      }
+      try {
+        const { tryImportLegacyIdentityFile } = require('./device-identity.cjs')
+        const legacyId = require('path').join(
+          String(__wxqkDataPaths.legacyPortableUserDataDir || ''),
+          'security',
+          'device-identity.json',
+        )
+        const imported = tryImportLegacyIdentityFile(app.getPath('userData'), legacyId)
+        if (imported.ok) {
+          appLog('INFO', '[IDENTITY] legacy identity imported', { reason: imported.reason })
+        } else if (imported.code === 'DEVICE_IDENTITY_CLONE_REJECTED') {
+          appLog('WARN', '[IDENTITY] legacy identity clone rejected', { reason: imported.reason })
+        }
+      } catch (idErr) {
+        appLog('WARN', '[IDENTITY] legacy identity import skipped', { error: rawErrorMessage(idErr) })
+      }
+    } catch (migErr) {
+      appLog('WARN', '[IDENTITY] portable data migration skipped', { error: rawErrorMessage(migErr) })
+    }
     softwareAuth.initSoftwareAuth(app.getPath('userData'))
     markStartup('auth initialized')
     // 尽早注册 IPC：后续步骤失败时登录页仍能拿到 auth:login 等通道
@@ -5852,6 +5880,24 @@ app.whenReady().then(async () => {
     // Local WXQK Agent：与账号 session / 业务 WSS 解耦；不 await，不挡主界面
     startLocalMeshPrepareOnStartup('cold_boot')
     markStartup('mesh prepare requested')
+
+    try {
+      meshAgentWatchdog.startLocalAgentWatchdog({
+        intervalMs: 45000,
+        resolveClientId: () => resolveLocalClientId(),
+        onNetworkRecovered: (cid) => meshRemote.ensureMeshReady(cid, { force: true }),
+        log: (msg, extra) => appLog('INFO', msg, extra || {}),
+      })
+      try {
+        const { powerMonitor } = require('electron')
+        powerMonitor.on('resume', () => {
+          appLog('INFO', '[MESH-WATCHDOG] power resume — health kick')
+          void meshAgentWatchdog.kickLocalAgentWatchdog('power_resume')
+        })
+      } catch { /* older electron */ }
+    } catch (wdErr) {
+      appLog('WARN', '[MESH-WATCHDOG] start failed', { error: rawErrorMessage(wdErr) })
+    }
 
     // 非首屏必需：窗口创建后再跑，避免同步磁盘 IO / SQL / 托盘挡住首屏
     setImmediate(() => {
@@ -5952,6 +5998,8 @@ app.on('before-quit', () => {
     runtimeCacheCleanupTimer = null
   }
   try { stopUpdateScheduler() } catch {}
+  try { meshAgentWatchdog.stopLocalAgentWatchdog() } catch {}
+  // Business WSS only — do NOT stopMeshAgent(); Windows Service stays Automatic/RUNNING
   stopRemoteAgent()
   tray?.destroy()
   tray = null

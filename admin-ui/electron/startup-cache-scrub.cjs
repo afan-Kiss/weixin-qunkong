@@ -26,6 +26,10 @@ const CHROMIUM_CACHE_DIR_NAMES = Object.freeze([
 function removePathBestEffort(target) {
   if (!target || !existsSync(target)) return false
   try {
+    const { isProtectedWxqkPath } = require('./wxqk-data-paths.cjs')
+    if (isProtectedWxqkPath(target)) return false
+  } catch { /* ignore */ }
+  try {
     rmSync(target, { recursive: true, force: true })
     return true
   } catch {

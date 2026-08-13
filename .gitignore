@@ -16,6 +16,7 @@ admin-ui/test-results/
 
 # Hook source dump at repo root (use admin-ui/resources/hook)
 /4.1.8.27/
+/_hook_extract/
 /_har_提取/
 /_har_extract/
 

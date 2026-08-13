@@ -76,11 +76,18 @@ test('cold boot starts local Mesh prepare without softwareAuth.session', () => {
 
 test('application uses an operating system single-instance lock', () => {
   const source = readFileSync(path.join(__dirname, '..', 'electron', 'main.cjs'), 'utf8')
-  assert.match(source, /PORTABLE_EXECUTABLE_DIR/)
-  assert.match(source, /app\.setPath\('userData'/)
-  const pinPos = source.indexOf('pinPortableUserData')
+  assert.match(source, /pinStableUserData/)
+  assert.match(source, /migrateLegacyPortableUserDataIfNeeded/)
+  assert.match(source, /%LOCALAPPDATA%\\\\WXQK|LOCALAPPDATA/)
+  const pinPos = source.indexOf('pinStableUserData')
   const lockPos = source.indexOf('app.requestSingleInstanceLock()')
-  assert.ok(pinPos >= 0 && lockPos > pinPos, 'portable userData must be pinned before single-instance lock')
+  assert.ok(pinPos >= 0 && lockPos > pinPos, 'stable userData must be pinned before single-instance lock')
+  assert.doesNotMatch(source, /pinPortableUserData/)
+  // Must not pin userData under portable EXE dir (legacy WXQK-Data next to exe)
+  assert.doesNotMatch(source, /PORTABLE_EXECUTABLE_DIR[\s\S]{0,120}WXQK-Data/)
+  const pathsSrc = readFileSync(path.join(__dirname, '..', 'electron', 'wxqk-data-paths.cjs'), 'utf8')
+  assert.match(pathsSrc, /appLike\.setPath\('userData'/)
+  assert.match(pathsSrc, /LOCALAPPDATA/)
   assert.match(source, /app\.requestSingleInstanceLock\(\)/)
   assert.match(source, /if \(!hasSingleInstanceLock\) \{\s*try \{ app\.quit\(\)/)
   assert.match(source, /process\.exit\(0\)/)
@@ -90,6 +97,11 @@ test('application uses an operating system single-instance lock', () => {
   assert.match(source, /pendingSecondInstanceFocus/)
   assert.match(source, /shouldActivateOnSecondInstance/)
   assert.match(source, /\[WINDOW\] second-instance/)
+  // logout must not stop Mesh Agent Windows service
+  assert.match(source, /auth:logout[\s\S]*stopRemoteAgent/)
+  assert.doesNotMatch(source, /auth:logout[\s\S]{0,200}stopMeshAgent/)
+  assert.match(source, /startLocalAgentWatchdog|meshAgentWatchdog\.start/)
+  assert.match(source, /powerMonitor|power resume/)
 })
 
 test('portable package uses splashImage, useZip, and trimmed electronLanguages', () => {
