@@ -144,21 +144,28 @@ select.input{padding-right:28px}
 .log-table-wrap{max-height:640px;overflow:auto}
 .log-row{padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;line-height:1.5}
 .log-row .t{color:var(--text-secondary);font-size:12px;margin-right:8px;font-variant-numeric:tabular-nums;white-space:nowrap;min-width:11.5em;display:inline-block}
-.desktop-layout{display:grid;grid-template-columns:260px 1fr 240px;gap:16px;min-height:520px}
-.desktop-list{padding:12px;max-height:600px;overflow:auto}
+.desktop-layout{display:grid;grid-template-columns:240px minmax(0,1fr) 220px;gap:16px;min-height:560px;align-items:stretch}
+.desktop-list{padding:12px;max-height:none;overflow:auto}
 .desktop-client{padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:4px}
 .desktop-client:hover{background:#f8fafc}
 .desktop-client.active{background:var(--primary-soft);border-color:#bfdbfe}
-.desktop-stage{background:#000;border-radius:10px;min-height:400px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
+.desktop-main{padding:0;overflow:hidden;display:flex;flex-direction:column;min-height:560px;min-width:0}
+.desktop-main-head{padding:10px 14px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:baseline;flex-shrink:0}
+.desktop-main-head strong{font-size:15px}
+.desktop-stage{background:#0b1220;border-radius:0;min-height:0;flex:1;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
 .desktop-stage video,.desktop-stage canvas{width:100%;height:100%;object-fit:contain;background:#111;cursor:default;display:none}
 .desktop-stage.has-video video{display:block}
 .desktop-stage.has-canvas canvas{display:block}
 .desktop-stage img{display:none !important}
 .desktop-stage #deskHint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#94a3b8;pointer-events:none;padding:16px;text-align:center;z-index:1}
-.desktop-stage iframe{width:100%;height:100%;min-height:480px;border:0;display:none;background:#111}
+.desktop-stage iframe{width:100%;height:100%;min-height:0;border:0;display:none;background:#0b1220}
 .desktop-stage.has-frame iframe{display:block}
 .desktop-stage.has-frame{display:block;padding:0}
 .desktop-stage.has-frame #deskHint{display:none}
+.desktop-stage #deskInputShield{display:none;position:absolute;inset:0;z-index:5;background:transparent;cursor:default}
+.desktop-stage.is-viewonly.has-frame #deskInputShield{display:block}
+.desktop-stage #deskViewHint{display:none;position:absolute;left:50%;top:14px;transform:translateX(-50%);z-index:6;padding:6px 12px;border-radius:999px;font-size:12px;color:#e2e8f0;background:rgba(15,23,42,.72);pointer-events:none;white-space:nowrap}
+.desktop-stage.is-viewonly.has-frame #deskViewHint{display:block}
 .desktop-stage #deskRelayStatus{display:none;position:absolute;left:12px;right:12px;bottom:12px;z-index:4;padding:10px 12px;border-radius:8px;font-size:13px;font-weight:600;text-align:center;color:#fff;background:rgba(15,23,42,.82)}
 .desktop-stage #deskRelayStatus.is-visible{display:block}
 .desktop-stage #deskRelayStatus.is-ok{background:rgba(21,128,61,.88)}
@@ -168,10 +175,22 @@ select.input{padding-right:28px}
 .desktop-stats{position:absolute;bottom:0;left:0;right:0;padding:4px 10px;font-size:11px;color:#cbd5e1;background:rgba(0,0,0,.55);font-variant-numeric:tabular-nums;z-index:2;display:none;gap:12px;flex-wrap:wrap}
 .desktop-stage.is-live .desktop-stats{display:flex}
 .desktop-stage.fs{position:fixed;inset:0;z-index:2000;border-radius:0;min-height:100vh}
-.desktop-stage.fs video,.desktop-stage.fs canvas{max-width:100vw;max-height:100vh}
+.desktop-stage.fs video,.desktop-stage.fs canvas,.desktop-stage.fs iframe{max-width:100vw;max-height:100vh}
 .desktop-fs-close{display:none;position:absolute;top:16px;right:16px;z-index:2001;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);cursor:pointer;font-size:22px;line-height:38px;padding:0}
 .desktop-stage.fs .desktop-fs-close{display:block}
+.desktop-bottom-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;border-top:1px solid var(--border);background:#fff;flex-shrink:0;min-height:44px}
+.desktop-bottom-bar .desk-check{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--text-main);cursor:pointer;user-select:none;padding:4px 2px}
+.desktop-bottom-bar .desk-check input{width:16px;height:16px;accent-color:var(--primary);cursor:pointer}
+.desktop-bottom-bar .desk-check.is-disabled{opacity:.45;cursor:not-allowed}
+.desktop-bottom-bar #deskConnStatus{font-size:12px;color:var(--text-secondary);min-width:4.5em}
+.desktop-bottom-bar #deskConnStatus.is-ok{color:var(--success);font-weight:600}
+.desktop-bottom-bar #deskConnStatus.is-busy{color:var(--warning)}
+.desktop-bottom-bar #deskConnStatus.is-err{color:var(--danger)}
+.desktop-toast{position:fixed;left:50%;bottom:72px;transform:translateX(-50%);z-index:2100;padding:8px 14px;border-radius:8px;font-size:13px;color:#fff;background:rgba(15,23,42,.88);opacity:0;pointer-events:none;transition:opacity .2s}
+.desktop-toast.is-show{opacity:1}
 .desktop-info{padding:16px;font-size:13px;background:var(--panel-bg)}
+.desktop-info .desk-side-actions{display:flex;flex-direction:column;gap:8px;margin-top:14px}
+.desktop-info .desk-side-actions .btn{width:100%;justify-content:center}
 .tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:10px}
 .tab-btn{padding:8px 14px;border:none;background:none;cursor:pointer;color:var(--text-secondary);font-weight:500;border-bottom:2px solid transparent;margin-bottom:-1px}
 .tab-btn.active{color:var(--primary);border-bottom-color:var(--primary)}
@@ -320,6 +339,10 @@ const state = {
   desktopSelectedId: '',
   desktopClientId: '',
   desktopSession: 0,
+  desktopSessionMode: '', // 'desktop' | 'files'
+  desktopInputEnabled: false,
+  desktopConnState: 'idle', // idle|connecting|connected|error
+  _wxqkRelayMsgBound: false,
   announceMode: 'clients',
   announceSelected: new Set(),
   announceResults: [],
@@ -1069,19 +1092,99 @@ async function sendBatchAnnounce() {
 }
 
 /* ===== MeshCentral remote (admin console) ===== */
+function showDeskToast(msg) {
+  let el = document.getElementById('deskToast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'deskToast';
+    el.className = 'desktop-toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = String(msg || '');
+  el.classList.add('is-show');
+  clearTimeout(showDeskToast._t);
+  showDeskToast._t = setTimeout(() => el.classList.remove('is-show'), 1800);
+}
+function setDeskConnStatus(text, kind) {
+  const el = document.getElementById('deskConnStatus');
+  if (!el) return;
+  el.textContent = String(text || '未连接');
+  el.classList.remove('is-ok', 'is-busy', 'is-err');
+  if (kind === 'ok') el.classList.add('is-ok');
+  else if (kind === 'busy') el.classList.add('is-busy');
+  else if (kind === 'err') el.classList.add('is-err');
+}
+function postDeskInputToFrame(enabled) {
+  const frame = document.getElementById('deskFrame');
+  if (!frame || !frame.contentWindow) return;
+  try {
+    frame.contentWindow.postMessage(
+      { source: 'wxqk', kind: 'desktop-input', type: 'desktop-input', enabled: !!enabled },
+      '*'
+    );
+  } catch (_) { /* cross-origin until loaded */ }
+}
+function applyDesktopInputMode(enabled, { toast } = {}) {
+  const allow = !!enabled;
+  state.desktopInputEnabled = allow;
+  const stage = document.getElementById('deskStage');
+  const cb = document.getElementById('deskAllowInput');
+  const hint = document.getElementById('deskViewHint');
+  if (cb && cb.checked !== allow) cb.checked = allow;
+  if (stage) {
+    const isDesktop = state.desktopSessionMode === 'desktop' && !!state.desktopSession;
+    stage.classList.toggle('is-viewonly', isDesktop && !allow);
+  }
+  if (hint) {
+    hint.textContent = allow ? '' : '当前为仅观看模式 · 勾选下方后可操作鼠标键盘';
+  }
+  postDeskInputToFrame(allow);
+  // Retry a few times — Mesh page may still be booting DeskControl
+  if (state.desktopSessionMode === 'desktop' && state.desktopSession) {
+    [400, 1200, 2500].forEach((ms) => setTimeout(() => postDeskInputToFrame(allow), ms));
+  }
+  if (toast) showDeskToast(allow ? '已开启远程控制' : '当前为仅观看模式');
+}
+function syncDesktopBottomBar() {
+  const hasSel = !!state.desktopSelectedId;
+  const hasSession = !!state.desktopSession;
+  const isDesktop = state.desktopSessionMode === 'desktop';
+  const map = {
+    deskOpenDesktop: hasSel && !hasSession,
+    deskOpenFiles: hasSel && !hasSession,
+    deskReconnect: hasSession,
+    deskRefreshFrame: hasSession,
+    deskFullscreen: hasSession,
+    deskClose: hasSession,
+  };
+  Object.keys(map).forEach((id) => {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = !map[id];
+  });
+  const wrap = document.getElementById('deskAllowInputWrap');
+  const cb = document.getElementById('deskAllowInput');
+  if (wrap) wrap.classList.toggle('is-disabled', !(hasSession && isDesktop));
+  if (cb) {
+    cb.disabled = !(hasSession && isDesktop);
+    if (!(hasSession && isDesktop)) cb.checked = false;
+  }
+}
 async function stopDesktop() {
   const frame = document.getElementById('deskFrame');
   const stage = document.getElementById('deskStage');
   if (frame) {
     try { frame.src = 'about:blank'; } catch (_) {}
   }
-  if (stage) stage.classList.remove('has-frame', 'fs');
+  if (stage) stage.classList.remove('has-frame', 'fs', 'is-viewonly');
   state.desktopSession = 0;
+  state.desktopSessionMode = '';
+  state.desktopInputEnabled = false;
+  state.desktopConnState = 'idle';
   setDeskRelayStatus('');
-  const closeBtn = document.getElementById('deskClose');
-  const fsBtn = document.getElementById('deskFullscreen');
-  if (closeBtn) closeBtn.disabled = true;
-  if (fsBtn) fsBtn.disabled = true;
+  setDeskConnStatus('未连接');
+  syncDesktopBottomBar();
+  const title = document.getElementById('deskTitle');
+  if (title) title.textContent = '远程桌面';
 }
 function setDeskRelayStatus(text, kind) {
   const el = document.getElementById('deskRelayStatus');
@@ -1103,21 +1206,33 @@ function onWxqkMeshRelayMessage(ev) {
   try {
     const data = ev && ev.data;
     if (!data || data.source !== 'wxqk') return;
-    // Only accept messages while an embed session is open
     if (!state.desktopSession) return;
-    const kind = String(data.kind || '');
+    const kind = String(data.kind || data.type || '');
     const st = String(data.state || '');
+    if (kind === 'desktop-input') {
+      // Mesh acknowledged input mode — keep parent checkbox in sync if needed
+      return;
+    }
     if (kind !== 'desktop' && kind !== 'files') return;
     if (st === 'page_loaded' || st === 'connecting') {
+      state.desktopConnState = 'connecting';
+      setDeskConnStatus('连接中', 'busy');
       setDeskRelayStatus(kind === 'files' ? '正在连接文件…' : '正在连接桌面…');
     } else if (st === 'connected') {
+      state.desktopConnState = 'connected';
+      setDeskConnStatus('已连接', 'ok');
       setDeskRelayStatus(kind === 'files' ? '文件已连接' : '桌面已连接', 'ok');
-      // Auto-hide success banner after a moment so it does not cover the canvas
+      if (kind === 'desktop') {
+        // Enforce default view-only (or current checkbox) via Mesh DeskControl
+        applyDesktopInputMode(!!state.desktopInputEnabled, { toast: false });
+      }
       setTimeout(() => {
         const el = document.getElementById('deskRelayStatus');
         if (el && /已连接/.test(el.textContent || '')) setDeskRelayStatus('');
-      }, 2500);
+      }, 2200);
     } else if (st === 'failed') {
+      state.desktopConnState = 'error';
+      setDeskConnStatus('连接失败', 'err');
       setDeskRelayStatus(kind === 'files' ? '文件连接失败，请重试' : '桌面连接失败，请重试', 'err');
     }
   } catch (_) { /* ignore */ }
@@ -1129,23 +1244,36 @@ function renderDesktopShell() {
     + '<input id="deskSearch" class="input grow" placeholder="搜索账号 / IP"/>'
     + '<button class="btn btn-secondary btn-sm" id="deskRefreshList">刷新</button></div>'
     + '<div id="deskClientList" class="muted">加载中…</div></div>'
-    + '<div class="card" style="padding:0;overflow:hidden;display:flex;flex-direction:column;min-height:520px">'
-    + '<div style="padding:10px 12px;border-bottom:1px solid var(--border,#e2e8f0);display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-    + '<strong id="deskTitle">远程桌面</strong><span class="muted" id="deskSub">选择左侧客户端</span>'
+    + '<div class="card desktop-main">'
+    + '<div class="desktop-main-head">'
+    + '<strong id="deskTitle">远程桌面</strong>'
+    + '<span class="muted" id="deskSub">选择左侧客户端</span></div>'
+    + '<div class="desktop-stage is-viewonly" id="deskStage">'
+    + '<iframe id="deskFrame" title="mesh-desktop" allow="clipboard-read; clipboard-write; fullscreen" tabindex="-1"></iframe>'
+    + '<div id="deskInputShield" title="仅观看模式"></div>'
+    + '<div id="deskViewHint">当前为仅观看模式 · 勾选下方后可操作鼠标键盘</div>'
+    + '<div id="deskHint">选择左侧在线客户端，在下方点击「打开桌面」查看画面。<br/>默认仅观看，勾选「允许操作鼠标键盘」后才能控制远端。</div>'
+    + '<div id="deskRelayStatus" class="desk-relay-status" hidden></div>'
+    + '<button type="button" class="desktop-fs-close" id="deskFsExit" title="退出全屏">×</button></div>'
+    + '<div class="desktop-bottom-bar" id="deskBottomBar">'
+    + '<label class="desk-check is-disabled" id="deskAllowInputWrap">'
+    + '<input type="checkbox" id="deskAllowInput" disabled/>'
+    + '<span>允许操作鼠标键盘</span></label>'
+    + '<span id="deskConnStatus">未连接</span>'
     + '<span class="grow"></span>'
     + '<button class="btn btn-primary btn-sm" id="deskOpenDesktop" disabled>打开桌面</button>'
     + '<button class="btn btn-secondary btn-sm" id="deskOpenFiles" disabled>文件管理</button>'
-    + '<button class="btn btn-secondary btn-sm" id="deskAutoBind" disabled>重新绑定</button>'
-    + '<button class="btn btn-ghost btn-sm" id="deskOpenTab" disabled>新窗口</button>'
+    + '<button class="btn btn-secondary btn-sm" id="deskReconnect" disabled>重连</button>'
+    + '<button class="btn btn-ghost btn-sm" id="deskRefreshFrame" disabled>刷新</button>'
     + '<button class="btn btn-ghost btn-sm" id="deskFullscreen" disabled>全屏</button>'
-    + '<button class="btn btn-ghost btn-sm" id="deskClose" disabled>关闭画面</button></div>'
-    + '<div class="desktop-stage" id="deskStage">'
-    + '<iframe id="deskFrame" title="mesh-desktop" allow="clipboard-read; clipboard-write; fullscreen"></iframe>'
-    + '<div id="deskHint">选择左侧在线客户端 →「打开桌面」查看画面并操作键鼠；「文件管理」用于传文件。若内嵌失败请点「新窗口」。</div>'
-    + '<div id="deskRelayStatus" class="desk-relay-status" hidden></div></div></div>'
+    + '<button class="btn btn-ghost btn-sm" id="deskClose" disabled>断开</button>'
+    + '</div></div>'
     + '<div class="card desktop-info"><h3 style="margin:0 0 10px;font-size:14px">设备状态</h3>'
     + '<div id="deskInfo" class="muted">未选择</div>'
-    + '<p class="muted" style="margin-top:16px;font-size:12px;line-height:1.6">画面、键鼠与文件由远程维护通道提供。</p></div></div>';
+    + '<div class="desk-side-actions">'
+    + '<button class="btn btn-secondary btn-sm" id="deskAutoBind" disabled>重新绑定</button>'
+    + '<button class="btn btn-ghost btn-sm" id="deskOpenTab" disabled>浏览器新窗口</button></div>'
+    + '<p class="muted" style="margin-top:16px;font-size:12px;line-height:1.6">默认仅观看远程画面；勾选下方「允许操作鼠标键盘」后才会向远端发送键鼠。</p></div></div>';
 }
 function deskFilteredClients(data) {
   const rows = (data && data.online) || [];
@@ -1185,10 +1313,18 @@ async function selectDesktopClient(clientId) {
   state.desktopClientId = cid;
   patchDesktopPage(state.overview);
   const enabled = !!cid;
-  ['deskOpenDesktop', 'deskOpenFiles', 'deskAutoBind', 'deskOpenTab'].forEach(id => {
+  const side = ['deskAutoBind', 'deskOpenTab'];
+  side.forEach(id => {
     const btn = document.getElementById(id);
     if (btn) btn.disabled = !enabled;
   });
+  syncDesktopBottomBar();
+  if (enabled && !state.desktopSession) {
+    const od = document.getElementById('deskOpenDesktop');
+    const of = document.getElementById('deskOpenFiles');
+    if (od) od.disabled = false;
+    if (of) of.disabled = false;
+  }
   const online = findOnlineByClientId(cid) || {};
   const sub = document.getElementById('deskSub');
   if (sub) {
@@ -1315,6 +1451,9 @@ async function openMeshSession(mode, { forceTab } = {}) {
       return;
     }
     state.desktopSession = Date.now();
+    state.desktopSessionMode = mode === 'files' ? 'files' : 'desktop';
+    state.desktopInputEnabled = false;
+    state.desktopConnState = 'connecting';
     const url = String(data.embedUrl);
     if (forceTab) {
       window.open(url, '_blank', 'noopener');
@@ -1326,15 +1465,22 @@ async function openMeshSession(mode, { forceTab } = {}) {
       window.open(url, '_blank', 'noopener');
       return;
     }
+    setDeskConnStatus('连接中', 'busy');
     setDeskRelayStatus(mode === 'files' ? '正在连接文件…' : '正在连接桌面…');
     // Tear down previous relay before attaching a new clean session
     try { frame.src = 'about:blank'; } catch (_) {}
     frame.src = url;
     stage.classList.add('has-frame');
-    const closeBtn = document.getElementById('deskClose');
-    const fsBtn = document.getElementById('deskFullscreen');
-    if (closeBtn) closeBtn.disabled = false;
-    if (fsBtn) fsBtn.disabled = false;
+    // Default view-only for desktop; files has no KVM input gate
+    if (mode === 'desktop') {
+      stage.classList.add('is-viewonly');
+      const cb = document.getElementById('deskAllowInput');
+      if (cb) cb.checked = false;
+      applyDesktopInputMode(false, { toast: false });
+    } else {
+      stage.classList.remove('is-viewonly');
+    }
+    syncDesktopBottomBar();
     const title = document.getElementById('deskTitle');
     if (title) title.textContent = label;
     await refreshDesktopMeshStatus();
@@ -1385,18 +1531,59 @@ function bindDesktopPageEvents() {
   const bind = document.getElementById('deskAutoBind');
   if (bind) bind.onclick = () => autoBindDesktopClient();
   const tab = document.getElementById('deskOpenTab');
-  if (tab) tab.onclick = () => openMeshSession('desktop', { forceTab: true });
+  if (tab) tab.onclick = () => openMeshSession(state.desktopSessionMode === 'files' ? 'files' : 'desktop', { forceTab: true });
+  const recon = document.getElementById('deskReconnect');
+  if (recon) recon.onclick = () => {
+    const mode = state.desktopSessionMode === 'files' ? 'files' : 'desktop';
+    if (!state.desktopSelectedId) return;
+    openMeshSession(mode);
+  };
+  const refreshFrame = document.getElementById('deskRefreshFrame');
+  if (refreshFrame) refreshFrame.onclick = () => {
+    const frame = document.getElementById('deskFrame');
+    if (!frame || !state.desktopSession) return;
+    try {
+      const u = frame.src;
+      frame.src = 'about:blank';
+      setTimeout(() => { frame.src = u; applyDesktopInputMode(!!state.desktopInputEnabled, { toast: false }); }, 50);
+      setDeskConnStatus('连接中', 'busy');
+    } catch (e) { alert(e.message || '刷新失败'); }
+  };
   const fs = document.getElementById('deskFullscreen');
   if (fs) fs.onclick = () => {
     const stage = document.getElementById('deskStage');
     setDeskFullscreen(!(stage && stage.classList.contains('fs')));
   };
+  const fsExit = document.getElementById('deskFsExit');
+  if (fsExit) fsExit.onclick = () => setDeskFullscreen(false);
   const close = document.getElementById('deskClose');
   if (close) close.onclick = () => stopDesktop();
+  const allow = document.getElementById('deskAllowInput');
+  if (allow) {
+    allow.onchange = () => {
+      if (allow.disabled) return;
+      applyDesktopInputMode(!!allow.checked, { toast: true });
+    };
+  }
+  // Block keyboard reaching iframe while view-only (Mesh DeskControl is primary gate)
+  if (!state._deskViewKeyGuard) {
+    document.addEventListener('keydown', (ev) => {
+      if (!state.desktopSession || state.desktopSessionMode !== 'desktop') return;
+      if (state.desktopInputEnabled) return;
+      const frame = document.getElementById('deskFrame');
+      if (!frame) return;
+      if (document.activeElement === frame) {
+        try { frame.blur(); } catch (_) {}
+        ev.preventDefault();
+      }
+    }, true);
+    state._deskViewKeyGuard = true;
+  }
   if (!state._wxqkRelayMsgBound) {
     window.addEventListener('message', onWxqkMeshRelayMessage);
     state._wxqkRelayMsgBound = true;
   }
+  syncDesktopBottomBar();
   if (state.desktopSelectedId) selectDesktopClient(state.desktopSelectedId);
 }
 

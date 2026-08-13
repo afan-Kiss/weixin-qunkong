@@ -3,7 +3,10 @@
    Activate when:
      - #wxqkauto=desktop|files or ?wxqkauto=... is present, OR
      - page is framed (WXQK iframe) and server-baked viewmode is 11/13
-   Normal top-level MeshCentral admin is not auto-connected. */
+   Normal top-level MeshCentral admin is not auto-connected.
+
+   Also: WXQK parent postMessage {source:'wxqk', kind:'desktop-input', enabled:bool}
+   drives MeshCentral DeskControl (official Input checkbox) for real view-only. */
 (function () {
   try {
     if (window.__wxqkAutoConnectInstalled) return;
@@ -25,7 +28,6 @@
     } catch (eH) { /* ignore */ }
 
     // Handlebars substitutes {{viewmode}} at render time (survives login URL cleanup).
-    // Note: MeshCentral login redirect strips #hash and unknown query args, so prefer baked viewmode.
     var bakedView = parseInt('{{viewmode}}', 10);
     var inFrame = false;
     try { inFrame = !!(window.parent && window.parent !== window); } catch (eF) { inFrame = true; }
@@ -34,13 +36,11 @@
         if (typeof urlargs !== 'undefined' && urlargs && urlargs.hide != null) return parseInt(urlargs.hide, 10);
       } catch (eU) { /* ignore */ }
       try {
-        var hm = String(window.location.search || '').match(/[?&]hide=(\d+)\b/);
-        if (hm) return parseInt(hm[1], 10);
+        var hm2 = String(window.location.search || '').match(/[?&]hide=(\d+)\b/);
+        if (hm2) return parseInt(hm2[1], 10);
       } catch (eH2) { /* ignore */ }
       return NaN;
     }
-    // Product embed uses hide=63. Framed WXQK iframe also qualifies.
-    // Do NOT auto-connect plain top-level MeshCentral admin (no hide / hide!=63 / not framed).
     if (!mode && (bakedView === 11 || bakedView === 13) && (inFrame || hideMask() === 63)) {
       mode = bakedView === 11 ? 'desktop' : 'files';
     }
@@ -53,6 +53,8 @@
     var maxConnectTries = 3;
     var nextConnectAt = 0;
     var finished = false;
+    // WXQK product default: view-only until parent enables input
+    var wantInput = false;
 
     function postState(kind, state, detail) {
       try {
@@ -79,7 +81,6 @@
 
     function isConnected() {
       var t = mode === 'desktop' ? statusText('deskstatus') : statusText('p13Status');
-      // MeshCentral en: Connected / zh-chs: 已连接 (exclude Disconnected / 已断开)
       if (/已断开|Disconnected/i.test(t)) return false;
       return /(^|\s)Connected/i.test(t) || /Connected,/i.test(t) || /已连接/.test(t);
     }
@@ -89,15 +90,90 @@
       return /Connecting|Setup/i.test(t) || /正在连接|正在设置|准备/.test(t);
     }
 
+    function injectWxqkChromeCss() {
+      if (document.getElementById('wxqk-embed-chrome')) return;
+      var s = document.createElement('style');
+      s.id = 'wxqk-embed-chrome';
+      s.textContent = [
+        '/* Hide MeshCentral desktop chrome; WXQK supplies product toolbar */',
+        '#DeskControlSpan,#DeskControl,#deskkeys,#DeskTools,#DeskRefreshButton,',
+        '#DeskRecordButton,#DeskRecordButtonImage,#DeskClipButton,#DeskSaveButton,',
+        '#p11progress,#deskProgress{display:none!important}',
+        '#deskarea3x{height:100vh!important;max-height:100vh!important}',
+        'body.fullscreen #deskarea3x,html.fullscreen #deskarea3x{height:100vh!important}'
+      ].join('');
+      (document.head || document.documentElement).appendChild(s);
+    }
+
+    function setWxqkDeskInput(enabled) {
+      wantInput = !!enabled;
+      try {
+        if (typeof Q !== 'function') return false;
+        var el = Q('DeskControl');
+        if (!el) return false;
+        el.checked = !!enabled;
+        if (typeof putstore === 'function') putstore('DeskControl', enabled ? 1 : 0);
+        try {
+          if (typeof QS === 'function' && Q('DeskControlSpan')) {
+            QS('DeskControlSpan').color = enabled ? null : 'red';
+          }
+        } catch (eC) { /* ignore */ }
+        // Official helper updates store + color from checkbox
+        try {
+          if (typeof toggleKvmControl === 'function') toggleKvmControl();
+        } catch (eT) { /* ignore */ }
+        // toggleKvmControl may re-read checkbox — ensure still desired
+        el.checked = !!enabled;
+        if (typeof putstore === 'function') putstore('DeskControl', enabled ? 1 : 0);
+        return true;
+      } catch (eS) {
+        return false;
+      }
+    }
+
+    function enforceDefaultViewOnly() {
+      if (mode !== 'desktop') return;
+      setWxqkDeskInput(wantInput);
+    }
+
+    // Parent → iframe input gate
+    window.addEventListener('message', function (ev) {
+      try {
+        var d = ev && ev.data;
+        if (!d || d.source !== 'wxqk') return;
+        var k = String(d.kind || d.type || '');
+        if (k !== 'desktop-input') return;
+        if (mode !== 'desktop') return;
+        var ok = setWxqkDeskInput(!!d.enabled);
+        postState('desktop-input', d.enabled ? 'on' : 'off', ok ? 'ok' : 'pending');
+      } catch (eM) { /* ignore */ }
+    });
+
+    injectWxqkChromeCss();
+    // Prefer view-only before Mesh restores DeskControl=1 from local store
+    try {
+      if (mode === 'desktop' && typeof putstore === 'function') putstore('DeskControl', 0);
+    } catch (eP) { /* ignore */ }
+
     postState(mode, 'page_loaded', 'baked=' + bakedView);
 
     var timer = setInterval(function () {
       if (finished) return;
       attempt += 1;
       try {
+        injectWxqkChromeCss();
+        if (mode === 'desktop') enforceDefaultViewOnly();
         if (isConnected()) {
           finished = true;
           clearInterval(timer);
+          enforceDefaultViewOnly();
+          // Keep enforcing briefly — updateDesktopButtons may reset from store
+          var guard = 0;
+          var guardTimer = setInterval(function () {
+            guard += 1;
+            enforceDefaultViewOnly();
+            if (guard >= 20) clearInterval(guardTimer);
+          }, 500);
           postState(mode, 'connected', '');
           return;
         }
@@ -130,11 +206,11 @@
         }
         if (mode === 'desktop') {
           if (typeof connectDesktop !== 'function') return;
+          // Ensure view-only before first connectDesktop so Input starts unchecked
+          enforceDefaultViewOnly();
           connectTries += 1;
           nextConnectAt = attempt + 10;
           postState(mode, 'connecting', 'connectDesktop');
-          // Official Connect button uses contype 3 (session enum on Windows).
-          // Fallback to contype 1 if still idle (matches MeshCentral autoConnectDesktop).
           if (connectTries <= 2) connectDesktop(null, 3);
           else connectDesktop(null, 1);
         } else {

@@ -13,7 +13,10 @@ build
 release
 release-v19
 release-v19-*
+release-bench*
+release-fix*
 **/win-unpacked/
+**/builder-debug.yml
 test-results
 dist-ssr
 *.local

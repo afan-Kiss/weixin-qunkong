@@ -30,6 +30,9 @@ class WxqkPatchTest(unittest.TestCase):
         self.assertIn("connectFiles(null, 1)", snip)
         self.assertIn("hideMask", snip)
         self.assertIn("wxqkauto=(desktop|files)", snip)
+        self.assertIn("desktop-input", snip)
+        self.assertIn("DeskControl", snip)
+        self.assertIn("putstore('DeskControl'", snip)
 
     def test_inject_inserts_once_and_is_idempotent(self):
         snip = read_snippet()
