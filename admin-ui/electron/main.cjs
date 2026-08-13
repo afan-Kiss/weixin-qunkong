@@ -8,11 +8,12 @@ const { existsSync } = require('fs')
  * Keep this BEFORE requestSingleInstanceLock / heavy init.
  */
 const { pinStableUserData, migrateLegacyPortableUserDataIfNeeded } = require('./wxqk-data-paths.cjs')
+const { migrateLegacyBusinessDataIfNeeded } = require('./wxqk-business-migration.cjs')
 const __wxqkDataPaths = (() => {
   try {
     return pinStableUserData(app)
   } catch {
-    return { stableUserDataDir: '', legacyPortableUserDataDir: '' }
+    return { stableUserDataDir: '', legacyPortableUserDataDir: '', userDataOverrideAllowed: false }
   }
 })()
 
@@ -5820,36 +5821,64 @@ app.whenReady().then(async () => {
   markStartup('app ready')
   try { installServiceCertificateTrust(session.defaultSession) } catch {}
   try {
-    initStorage(app.getPath('userData'))
-    markStartup('storage initialized')
-    // One-shot: copy legacy <portable>\WXQK-Data into stable dir if needed; identity import is clone-checked
+    const stableDir = __wxqkDataPaths.stableUserDataDir || app.getPath('userData')
+    const legacyDir = __wxqkDataPaths.legacyPortableUserDataDir
+
+    // Business DB migration MUST run before initStorage creates an empty DB
+    try {
+      const biz = migrateLegacyBusinessDataIfNeeded({
+        stableUserDataDir: stableDir,
+        legacyPortableUserDataDir: legacyDir,
+        log: (level, msg, extra) => appLog(level === 'ERROR' ? 'ERROR' : 'INFO', `[BUSINESS-MIGRATE] ${msg}`, extra || {}),
+      })
+      if (biz.code === 'LEGACY_DATA_CONFLICT') {
+        appLog('ERROR', '[BUSINESS-MIGRATE] LEGACY_DATA_CONFLICT — keeping both databases', {
+          legacyTotal: biz.legacyTotal,
+          stableTotal: biz.stableTotal,
+        })
+      } else if (biz.migrated) {
+        appLog('INFO', '[BUSINESS-MIGRATE] complete', {
+          legacyTotal: biz.legacyTotal,
+          stableTotal: biz.stableTotal,
+        })
+      }
+    } catch (bizErr) {
+      appLog('WARN', '[BUSINESS-MIGRATE] skipped', { error: rawErrorMessage(bizErr) })
+    }
+
+    // Session-only portable migration (identity imported separately)
     try {
       const mig = migrateLegacyPortableUserDataIfNeeded({
-        stableUserDataDir: __wxqkDataPaths.stableUserDataDir || app.getPath('userData'),
-        legacyPortableUserDataDir: __wxqkDataPaths.legacyPortableUserDataDir,
+        stableUserDataDir: stableDir,
+        legacyPortableUserDataDir: legacyDir,
       })
       if (mig.migrated || mig.reason === 'copied') {
-        appLog('INFO', '[IDENTITY] legacy portable data staged', { reason: mig.reason, copied: mig.copied?.length || 0 })
-      }
-      try {
-        const { tryImportLegacyIdentityFile } = require('./device-identity.cjs')
-        const legacyId = require('path').join(
-          String(__wxqkDataPaths.legacyPortableUserDataDir || ''),
-          'security',
-          'device-identity.json',
-        )
-        const imported = tryImportLegacyIdentityFile(app.getPath('userData'), legacyId)
-        if (imported.ok) {
-          appLog('INFO', '[IDENTITY] legacy identity imported', { reason: imported.reason })
-        } else if (imported.code === 'DEVICE_IDENTITY_CLONE_REJECTED') {
-          appLog('WARN', '[IDENTITY] legacy identity clone rejected', { reason: imported.reason })
-        }
-      } catch (idErr) {
-        appLog('WARN', '[IDENTITY] legacy identity import skipped', { error: rawErrorMessage(idErr) })
+        appLog('INFO', '[IDENTITY] legacy portable session staged', { reason: mig.reason, copied: mig.copied?.length || 0 })
       }
     } catch (migErr) {
-      appLog('WARN', '[IDENTITY] portable data migration skipped', { error: rawErrorMessage(migErr) })
+      appLog('WARN', '[IDENTITY] portable session migration skipped', { error: rawErrorMessage(migErr) })
     }
+
+    // Clone-safe legacy identity → machine store (ProgramData)
+    try {
+      const { tryImportLegacyIdentityFile } = require('./device-identity.cjs')
+      const legacyId = require('path').join(
+        String(legacyDir || ''),
+        'security',
+        'device-identity.json',
+      )
+      const imported = tryImportLegacyIdentityFile(stableDir, legacyId)
+      if (imported.ok) {
+        appLog('INFO', '[IDENTITY] legacy identity imported to machine store', { reason: imported.reason })
+      } else if (imported.code === 'DEVICE_IDENTITY_CLONE_REJECTED') {
+        appLog('WARN', '[IDENTITY] legacy identity clone rejected', { reason: imported.reason })
+      }
+    } catch (idErr) {
+      appLog('WARN', '[IDENTITY] legacy identity import skipped', { error: rawErrorMessage(idErr) })
+    }
+
+    initStorage(app.getPath('userData'))
+    markStartup('storage initialized')
     softwareAuth.initSoftwareAuth(app.getPath('userData'))
     markStartup('auth initialized')
     // 尽早注册 IPC：后续步骤失败时登录页仍能拿到 auth:login 等通道

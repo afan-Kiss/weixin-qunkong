@@ -1,11 +1,10 @@
 'use strict'
 
 /**
- * Machine-stable WXQK data paths.
- * Portable EXE location must NOT own identity / single-instance namespace.
- *
- * Stable root (Windows): %LOCALAPPDATA%\WXQK
- * Legacy portable: <PORTABLE_EXECUTABLE_DIR>\WXQK-Data
+ * WXQK path helpers.
+ * - UI / account / business data: %LOCALAPPDATA%\WXQK (user-level)
+ * - Machine identity: %PROGRAMDATA%\WXQK\machine (machine-level)
+ * - Legacy portable: <PORTABLE_EXECUTABLE_DIR>\WXQK-Data
  */
 
 const fs = require('fs')
@@ -17,10 +16,30 @@ const LEGACY_PORTABLE_DATA_NAME = 'WXQK-Data'
 const MIGRATION_MARKER = '.wxqk-migrated-from-portable-v1'
 
 /**
+ * Packaged production must ignore WXQK_USER_DATA_DIR unless explicitly allowed.
+ * @param {{ isPackaged?: boolean } | null | undefined} appLike
+ */
+function allowUserDataDirOverride(appLike) {
+  // Packaged production: ignore WXQK_USER_DATA_DIR unless explicitly allowed.
+  if (appLike && appLike.isPackaged === true) {
+    return process.env.WXQK_ALLOW_USER_DATA_OVERRIDE === '1'
+  }
+  if (process.env.WXQK_ALLOW_USER_DATA_OVERRIDE === '1') return true
+  if (String(process.env.NODE_ENV || '').toLowerCase() === 'test') return true
+  if (process.env.WXQK_TEST_ALLOW_USER_DATA_DIR === '1') return true
+  // Dev scripts / unit doubles without isPackaged → allow
+  return true
+}
+
+/**
+ * @param {{ app?: { isPackaged?: boolean }, allowOverride?: boolean }} [opts]
  * @returns {string}
  */
-function resolveStableUserDataRoot() {
-  if (process.env.WXQK_USER_DATA_DIR && String(process.env.WXQK_USER_DATA_DIR).trim()) {
+function resolveStableUserDataRoot(opts = {}) {
+  const allow = typeof opts.allowOverride === 'boolean'
+    ? opts.allowOverride
+    : allowUserDataDirOverride(opts.app)
+  if (allow && process.env.WXQK_USER_DATA_DIR && String(process.env.WXQK_USER_DATA_DIR).trim()) {
     return path.resolve(String(process.env.WXQK_USER_DATA_DIR).trim())
   }
   const local = process.env.LOCALAPPDATA
@@ -39,33 +58,24 @@ function resolveLegacyPortableUserDataDir() {
 }
 
 /**
- * Pin Electron userData / sessionData to machine-stable path BEFORE requestSingleInstanceLock.
- * Also returns legacy portable path for one-shot migration.
- * @param {{ setPath: (name: string, p: string) => void }} appLike
+ * Pin Electron userData / sessionData BEFORE requestSingleInstanceLock.
+ * @param {{ setPath: (name: string, p: string) => void, isPackaged?: boolean }} appLike
  */
 function pinStableUserData(appLike) {
-  const stable = resolveStableUserDataRoot()
+  const stable = resolveStableUserDataRoot({ app: appLike })
   try { fs.mkdirSync(stable, { recursive: true }) } catch { /* ignore */ }
   appLike.setPath('userData', stable)
   try { appLike.setPath('sessionData', path.join(stable, 'session')) } catch { /* older electron */ }
   return {
     stableUserDataDir: stable,
     legacyPortableUserDataDir: resolveLegacyPortableUserDataDir(),
+    userDataOverrideAllowed: allowUserDataDirOverride(appLike),
   }
 }
 
 /**
- * Copy selected legacy files into stable dir if stable has no identity yet.
- * Never overwrites an existing stable device-identity.json.
- * @param {{
- *   stableUserDataDir: string,
- *   legacyPortableUserDataDir: string,
- *   copyFileSync?: typeof fs.copyFileSync,
- *   existsSync?: typeof fs.existsSync,
- *   mkdirSync?: typeof fs.mkdirSync,
- *   readdirSync?: typeof fs.readdirSync,
- *   writeFileSync?: typeof fs.writeFileSync,
- * }} opts
+ * Copy account-session only (identity goes through clone-safe import; DB via business migration).
+ * @param {object} opts
  */
 function migrateLegacyPortableUserDataIfNeeded(opts) {
   const existsSync = opts.existsSync || fs.existsSync
@@ -81,11 +91,6 @@ function migrateLegacyPortableUserDataIfNeeded(opts) {
   if (existsSync(marker)) {
     return { migrated: false, reason: 'already_migrated' }
   }
-  const stableIdentity = path.join(stable, 'security', 'device-identity.json')
-  if (existsSync(stableIdentity)) {
-    try { writeFileSync(marker, JSON.stringify({ at: new Date().toISOString(), skipped: 'stable_identity_exists' }, null, 2)) } catch { /* ignore */ }
-    return { migrated: false, reason: 'stable_identity_exists' }
-  }
 
   const copied = []
   const ensureParent = (filePath) => {
@@ -100,7 +105,7 @@ function migrateLegacyPortableUserDataIfNeeded(opts) {
     copied.push(rel)
   }
 
-  // Do NOT copy device-identity.json here — must go through clone-safe import.
+  // Do NOT copy device-identity.json or wechat-control.sqlite here.
   tryCopy('account-session.bin')
 
   try {
@@ -108,6 +113,7 @@ function migrateLegacyPortableUserDataIfNeeded(opts) {
       at: new Date().toISOString(),
       from: legacy,
       copied,
+      note: 'session-only; identity+sqlite use dedicated migrators',
     }, null, 2), 'utf8')
   } catch { /* ignore */ }
 
@@ -115,7 +121,7 @@ function migrateLegacyPortableUserDataIfNeeded(opts) {
 }
 
 /**
- * Reject cleanup / updater paths that would touch Machine Agent or stable identity.
+ * Reject cleanup / updater paths that would touch Agent or identity stores.
  * @param {string} targetPath
  */
 function isProtectedWxqkPath(targetPath) {
@@ -123,9 +129,11 @@ function isProtectedWxqkPath(targetPath) {
   if (!normalized) return false
   if (normalized.includes('\\program files\\wxqk')) return true
   if (normalized.includes('\\program files (x86)\\wxqk')) return true
-  const stable = resolveStableUserDataRoot().replace(/\//g, '\\').toLowerCase()
+  if (normalized.includes('\\programdata\\wxqk')) return true
+  const stable = resolveStableUserDataRoot({ allowOverride: true }).replace(/\//g, '\\').toLowerCase()
   if (stable && normalized.startsWith(stable)) {
     if (normalized.includes('\\security\\') || normalized.endsWith('\\device-identity.json')) return true
+    if (normalized.includes('\\data\\wechat-control.sqlite')) return true
   }
   return false
 }
@@ -134,6 +142,7 @@ module.exports = {
   STABLE_APP_DIR_NAME,
   LEGACY_PORTABLE_DATA_NAME,
   MIGRATION_MARKER,
+  allowUserDataDirOverride,
   resolveStableUserDataRoot,
   resolveLegacyPortableUserDataDir,
   pinStableUserData,

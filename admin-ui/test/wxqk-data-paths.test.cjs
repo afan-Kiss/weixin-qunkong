@@ -68,6 +68,15 @@ test('legacy portable migration copies session but not identity overwrite', () =
   try { rmSync(legacy, { recursive: true, force: true }) } catch { /* ignore */ }
 })
 
+test('packaged app ignores WXQK_USER_DATA_DIR override', () => {
+  const evil = mkdtempSync(path.join(tmpdir(), 'evil-'))
+  process.env.WXQK_USER_DATA_DIR = evil
+  const root = resolveStableUserDataRoot({ app: { isPackaged: true } })
+  assert.notEqual(path.resolve(root), path.resolve(evil))
+  delete process.env.WXQK_USER_DATA_DIR
+  try { rmSync(evil, { recursive: true, force: true }) } catch { /* ignore */ }
+})
+
 test('isProtectedWxqkPath blocks Program Files agent and security identity', () => {
   assert.equal(isProtectedWxqkPath('C:\\Program Files\\WXQK\\WXQK.exe'), true)
   assert.equal(isProtectedWxqkPath('C:\\Temp\\foo.tmp'), false)
