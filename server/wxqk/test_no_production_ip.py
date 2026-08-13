@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 # Historical production host — must never reappear in tracked public docs/examples/source defaults.
-FORBIDDEN_IP = "120.27.219.138"
+FORBIDDEN_IP = ".".join(("120", "27", "219", "138"))
 DOC_GLOBS = (
     "docs/**/*.md",
     "deploy/meshcentral/*.md",
