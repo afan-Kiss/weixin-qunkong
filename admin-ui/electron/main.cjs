@@ -74,7 +74,7 @@ const net = require('net')
 const http = require('http')
 const https = require('https')
 // path + existsSync already required above for portable userData pin
-const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, releaseFriendDailyAttempt, releaseQrJoinDailyAttempt, updateTaskItemInstanceId, migrateDirectorySnapshotToInstance, rebindChatAddCandidatesForAccount, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms, markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, loadDirectoryExcludedRoomIdSetForInstance, listBlockedChatrooms, hasQrContentHash } = require('./storage.cjs')
+const { initStorage, flushDatabaseCheckpoint, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, releaseFriendDailyAttempt, releaseQrJoinDailyAttempt, updateTaskItemInstanceId, migrateDirectorySnapshotToInstance, rebindChatAddCandidatesForAccount, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms, markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, loadDirectoryExcludedRoomIdSetForInstance, listBlockedChatrooms, hasQrContentHash } = require('./storage.cjs')
 const { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, hasFrequentEvidence, isVerifiedSuccess, buildAddFriendRequest, evaluateFriendAddResult, isRetryableFriendCredentialFailure } = require('./protocol.cjs')
 const { createSerialExecutor, parseInjectorOutput, decodeInjectorChunks, waitForInjectorClose } = require('./instance-runtime.cjs')
 const { rawErrorMessage, toUserErrorMessage } = require('./user-error.cjs')
@@ -168,6 +168,10 @@ const {
   resolvePortableExePath,
   setHighestSeenUserData,
   setDefaultDrainHooks,
+  canAcceptNewWork,
+  emitNewVersionReadyAck,
+  parseUpdateCliArgs,
+  endUpdateDrain,
 } = require('./client-updater.cjs')
 const { safeCloneForIpc } = require('./ipc-safe.cjs')
 const {
@@ -178,6 +182,40 @@ const {
 const secondInstanceGate = createSecondInstanceGate()
 /** 首次 ready-to-show 完成前，second-instance 不得抢焦点 */
 let mainWindowFirstShowDone = false
+/** After-update READY ACK gates */
+let afterUpdateStorageReady = false
+let afterUpdateTasksRecovered = false
+let afterUpdateWindowReady = false
+let afterUpdateRendererReady = false
+let afterUpdateReadyEmitted = false
+
+function tryEmitAfterUpdateReadyAck(reason = '') {
+  if (afterUpdateReadyEmitted) return
+  const cli = parseUpdateCliArgs(process.argv)
+  if (!cli.afterUpdate) return
+  if (!afterUpdateStorageReady || !afterUpdateTasksRecovered || !afterUpdateWindowReady || !afterUpdateRendererReady) {
+    return
+  }
+  try {
+    const result = emitNewVersionReadyAck({
+      userDataPath: app.getPath('userData'),
+      version: VERSION,
+      buildId: BUILD_ID,
+      releaseSequence: RELEASE_SEQUENCE,
+      exePath: resolvePortableExePath(),
+      force: false,
+    })
+    afterUpdateReadyEmitted = Boolean(result?.ok)
+    appLog(result?.ok ? 'INFO' : 'WARN', '[UPDATE] NEW_VERSION_READY_ACK', {
+      reason,
+      ok: Boolean(result?.ok),
+      code: result?.reason || '',
+      updateId: result?.ready?.updateId || '',
+    })
+  } catch (error) {
+    appLog('ERROR', '[UPDATE] NEW_VERSION_READY_ACK failed', { error: rawErrorMessage(error) })
+  }
+}
 // Primary process already holds the lock (acquired at process start). Register activator only.
 app.on('second-instance', () => {
   // 便携版连续双击会产生多个延迟启动器，随后陆续触发；节流避免持续抢前台
@@ -4497,6 +4535,8 @@ async function runTask(taskId) {
 
 function createLocalTask(payload) {
   try {
+    const admission = canAcceptNewWork()
+    if (!admission.ok) throw new Error(admission.message || 'UPDATE_DRAINING')
     if (payload == null) throw new Error('任务数据无法传输（可能勾选对象过多），请减少数量或重启软件后重试')
     const allowed = new Set(['SEND_TEXT_TO_FRIEND', 'SEND_TEXT_TO_GROUP', 'SEND_IMAGE_TO_FRIEND', 'SEND_IMAGE_TO_GROUP', 'SEND_MIXED_TO_FRIEND', 'SEND_MIXED_TO_GROUP', 'QR_SCAN', 'ADD_FRIEND', 'KICKED_GROUP_CLEANUP'])
     if (!payload || !allowed.has(payload.type)) throw new Error('不支持的任务类型')
@@ -5149,10 +5189,11 @@ function registerIpc() {
     clientId: String(resolveLocalClientId() || ''),
     userDataPath: app.getPath('userData'),
   }))
-  ipcMain.handle('update:apply', async (event) => {
-    const sendProgress = (payload) => {
-      try { event.sender.send('update:progress', payload) } catch { /* ignore */ }
-      safeBroadcast('update:progress', payload)
+  ipcMain.handle('update:apply', async (event, payload = {}) => {
+    const opts = payload && typeof payload === 'object' ? payload : {}
+    const sendProgress = (row) => {
+      try { event.sender.send('update:progress', row) } catch { /* ignore */ }
+      safeBroadcast('update:progress', row)
     }
     sendProgress({ phase: 'download', downloaded: 0, total: 0, percent: 0 })
     const result = await ipcApplyClientUpdate({
@@ -5164,8 +5205,16 @@ function registerIpc() {
       isPackaged: app.isPackaged,
       clientId: String(resolveLocalClientId() || ''),
       userDataPath: app.getPath('userData'),
+      forceDrainConfirm: Boolean(opts.forceDrainConfirm),
       drainHooks: {
         getRunningTasks: () => listTasks().filter((task) => ['RUNNING', 'QUEUED', 'COOLING_DOWN', 'WAITING_CONFIRMATION', 'PAUSED'].includes(String(task.status || ''))),
+        getCriticalLabels: () => {
+          const labels = []
+          if (historyCollectRunning) labels.push('historyCollectRunning')
+          if (runningTasks.size > 0) labels.push(`runningTasks:${runningTasks.size}`)
+          return labels
+        },
+        flushDatabase: () => flushDatabaseCheckpoint(),
       },
       onLog: (level, message, details) => appLog(level, message, details),
       onProgress: (downloaded, total) => {
@@ -5194,6 +5243,15 @@ function registerIpc() {
     return result
   })
   ipcMain.handle('update:mark-done', (_event, reason) => { markStartupUpdateDone(reason); return true })
+  ipcMain.handle('update:runtime-ready', () => {
+    afterUpdateRendererReady = true
+    tryEmitAfterUpdateReadyAck('renderer-handshake')
+    return { ok: true }
+  })
+  ipcMain.handle('update:cancel-drain', () => {
+    try { endUpdateDrain() } catch { /* ignore */ }
+    return { ok: true }
+  })
   ipcMain.handle('app:quit', () => {
     quitting = true
     try { app.quit() } catch { try { app.exit(0) } catch { /* ignore */ } }
@@ -5715,6 +5773,8 @@ function createWindow() {
     win.show()
     win.focus()
     mainWindowFirstShowDone = true
+    afterUpdateWindowReady = true
+    tryEmitAfterUpdateReadyAck('ready-to-show')
     if (pendingSecondInstanceFocus) {
       pendingSecondInstanceFocus = false
       activateMainWindow()
@@ -5894,6 +5954,7 @@ app.whenReady().then(async () => {
     }
 
     initStorage(app.getPath('userData'))
+    afterUpdateStorageReady = true
     markStartup('storage initialized')
     softwareAuth.initSoftwareAuth(app.getPath('userData'))
     markStartup('auth initialized')
@@ -5968,8 +6029,13 @@ app.whenReady().then(async () => {
       try {
         recoverInterruptedTasks()
         markStartup('tasks recovered')
+        afterUpdateTasksRecovered = true
+        tryEmitAfterUpdateReadyAck('tasks-recovered')
       } catch (error) {
         appLog('ERROR', '恢复中断任务失败', { error: rawErrorMessage(error) })
+        // Still allow READY if recovery throws — but prefer recovered first
+        afterUpdateTasksRecovered = true
+        tryEmitAfterUpdateReadyAck('tasks-recovered-error')
       }
       try {
         loadApiContracts()
@@ -5993,6 +6059,17 @@ app.whenReady().then(async () => {
     try {
       setDefaultDrainHooks({
         getRunningTasks: () => listTasks().filter((task) => ['RUNNING', 'QUEUED', 'COOLING_DOWN', 'WAITING_CONFIRMATION', 'PAUSED'].includes(String(task.status || ''))),
+        getCriticalLabels: () => {
+          const labels = []
+          try {
+            if (typeof historyCollectRunning !== 'undefined' && historyCollectRunning) labels.push('historyCollectRunning')
+          } catch { /* ignore */ }
+          try {
+            if (runningTasks && runningTasks.size > 0) labels.push(`runningTasks:${runningTasks.size}`)
+          } catch { /* ignore */ }
+          return labels
+        },
+        flushDatabase: () => flushDatabaseCheckpoint(),
       })
     } catch { /* ignore */ }
     startUpdateScheduler({

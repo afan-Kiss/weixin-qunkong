@@ -40,7 +40,14 @@ const {
   DRAIN_STATE,
   collectActiveCriticalWork,
   waitForUpdateDrain,
+  beginUpdateDrain,
+  endUpdateDrain,
+  canAcceptNewWork,
+  isUpdateDrainActive,
+  setUpdateDrainActive,
 } = require('./update-drain.cjs')
+const updateState = require('./update-state.cjs')
+const updateHandoff = require('./update-handoff.cjs')
 
 const DEFAULT_BASE = getServiceBase()
 const BUILTIN_PUBLISH_PUBLIC_KEY_B64 = getPublishPublicKeyB64()
@@ -335,9 +342,9 @@ function needsUpgrade(man, currentSeq, currentBuild, currentVersion = '', client
   if (!man) return false
   if (!isManifestTargetedToClient(man, clientId)) return false
   const latest = Number(man.releaseSequence || 0) || 0
-  const seen = loadHighestSeenReleaseSequence(userDataPath || highestSeenUserData)
-  // 反降级：拒绝低于本机曾见过的最高序号
-  if (latest > 0 && seen > 0 && latest < seen) return false
+  // Anti-downgrade uses COMMITTED only — never download/check-time "seen"
+  const committed = updateState.loadHighestCommittedReleaseSequence(userDataPath || highestSeenUserData)
+  if (latest > 0 && committed > 0 && latest < committed) return false
   const minSeq = Number(man.minimumReleaseSequence || 0) || 0
   const cur = Number(currentSeq || 0) || 0
   if (minSeq > 0 && cur < minSeq) return true
@@ -475,8 +482,18 @@ async function checkForUpdate(options) {
   const clientId = String(options.clientId || '')
   const userDataPath = String(options.userDataPath || highestSeenUserData || '')
   const { manifest } = await fetchManifest(options.baseUrl || DEFAULT_BASE, clientId)
-  const remoteSeq = Number(manifest.releaseSequence || 0) || 0
-  if (remoteSeq > 0) recordHighestSeenReleaseSequence(remoteSeq, userDataPath)
+  // Do NOT bump anti-downgrade on mere check/download — only after COMMITTED
+  const blocked = updateState.isFailedUpdateBlocked(manifest, userDataPath)
+  if (blocked.blocked) {
+    return {
+      needUpdate: false,
+      mandatory: false,
+      policy: POLICY.OPTIONAL,
+      manifest,
+      code: 'FAILED_UPDATE_BACKOFF',
+      message: `近期同一更新包启动失败，请 ${Math.ceil((blocked.remainMs || 0) / 60000)} 分钟后再试`,
+    }
+  }
   const portablePath = options.portablePath || resolvePortableExePath()
   if (await packageFileMatchesManifest(portablePath, manifest)) {
     return { needUpdate: false, mandatory: false, policy: POLICY.OPTIONAL, manifest, code: 'CURRENT_PACKAGE_MATCH' }
@@ -944,19 +961,12 @@ async function childDiedWithin(pid, windowMs) {
  * @param {string} finalPath
  * @param {Record<string, unknown>} man
  */
-function writePortableReadyMarkers(installDir, finalPath, man) {
-  const readyPath = path.join(installDir, PORTABLE_READY_MARKER)
-  const currentPath = path.join(installDir, PORTABLE_CURRENT_MARKER)
-  const payload = {
-    currentPortableExePath: path.resolve(finalPath),
-    buildId: String(man.buildId || ''),
-    version: String(man.version || ''),
-    sha256: String(man.sha256 || ''),
-    releaseSequence: Number(man.releaseSequence || 0) || 0,
-    readyAt: new Date().toISOString(),
-  }
-  writeFileSync(readyPath, JSON.stringify(payload, null, 2))
-  writeFileSync(currentPath, JSON.stringify(payload, null, 2))
+/**
+ * @deprecated Old API wrote false READY. Use updateHandoff / update-state PREPARED only.
+ * Kept as no-op so callers never mark READY from the old process.
+ */
+function writePortableReadyMarkers(_installDir, _finalPath, _man) {
+  return { ok: false, reason: 'deprecated_use_prepared_not_ready' }
 }
 
 /**
@@ -984,49 +994,20 @@ function writeSupersededRedirect(oldExe, newExe) {
 }
 
 /**
- * 由独立进程等待当前程序退出后替换便携 EXE，规避 Windows 对运行中 EXE 的文件锁。
- * 不在此函数内退出当前进程；调用方应在 drain 后优雅退出。
- * @returns {number} helper pid
+ * @deprecated Prefer schedulePortableHandoff — kept for tests that probe export name.
  */
-function schedulePortableReplacement({ currentExe, finalPath, downloadPath, expectedSha256, readyMarkerPath }) {
-  const workDir = path.dirname(downloadPath)
-  const helperPath = path.join(workDir, `install-${Date.now()}-${process.pid}.ps1`)
-  const logPath = path.join(workDir, 'install.log')
-  const marker = String(readyMarkerPath || path.join(path.dirname(finalPath), PORTABLE_READY_MARKER))
-  const script = [
-    'param([int]$ParentPid,[string]$CurrentExe,[string]$FinalPath,[string]$DownloadPath,[string]$ExpectedSha256,[string]$LogPath,[string]$ReadyMarker)',
-    "$ErrorActionPreference = 'Stop'",
-    'function Log([string]$Message) { Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value ((Get-Date -Format o) + " " + $Message) }',
-    'Log "等待旧版退出 parent=$ParentPid current=$CurrentExe final=$FinalPath"',
-    'try { Wait-Process -Id $ParentPid -Timeout 120 -ErrorAction SilentlyContinue } catch {}',
-    'for ($i = 0; $i -lt 120; $i++) {',
-    '  try { if (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500; continue }; break } catch { break }',
-    '}',
-    'try {',
-    '  if (-not (Test-Path -LiteralPath $FinalPath)) { throw "新版文件不存在" }',
-    '  if ($ReadyMarker -and -not (Test-Path -LiteralPath $ReadyMarker)) { throw "ready marker missing" }',
-    "  $actual = (Get-FileHash -LiteralPath $FinalPath -Algorithm SHA256).Hash.ToLowerInvariant()",
-    "  if ($actual -ne $ExpectedSha256.ToLowerInvariant()) { throw 'SHA256 mismatch after install' }",
-    '  $env:PORTABLE_EXECUTABLE_FILE = $FinalPath',
-    '  $env:PORTABLE_EXECUTABLE_DIR = Split-Path -Parent $FinalPath',
-    '  $env:APP_UPDATE_OLD_TRASH = $CurrentExe',
-    "  Start-Process -FilePath $FinalPath -ArgumentList '--after-update' -WorkingDirectory (Split-Path -Parent $FinalPath) -ErrorAction Stop",
-    '  Log "新版启动命令成功"',
-    '  Remove-Item -LiteralPath $DownloadPath -Force -ErrorAction SilentlyContinue',
-    '} catch {',
-    '  Log ("更新启动失败: " + $_.Exception.Message)',
-    '  try { Start-Process -FilePath $CurrentExe -WorkingDirectory (Split-Path -Parent $CurrentExe) } catch {}',
-    '  exit 1',
-    '}',
-  ].join('\r\n')
-  writeFileSync(helperPath, `\uFEFF${script}`, 'utf8')
-  const child = spawn('powershell.exe', [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helperPath,
-    process.pid.toString(), currentExe, finalPath, downloadPath, String(expectedSha256 || ''), logPath, marker,
-  ], { detached: true, stdio: 'ignore', windowsHide: true })
-  child.unref()
-  if (!child.pid) throw new Error('无法启动独立更新器')
-  return child.pid
+function schedulePortableReplacement(opts) {
+  return updateHandoff.schedulePortableHandoff({
+    ...opts,
+    userDataPath: opts.userDataPath || highestSeenUserData,
+    manifest: opts.manifest || {
+      sha256: opts.expectedSha256,
+      version: opts.version,
+      buildId: opts.buildId,
+      releaseSequence: opts.releaseSequence,
+    },
+    electronExe: opts.electronExe || process.execPath,
+  }).helperPid
 }
 
 /**
@@ -1139,23 +1120,26 @@ async function applyUpdate(options) {
     }
     copyFileSync(downloadPath, finalPath)
     await verifyPackageFile(finalPath, man)
-    writePortableReadyMarkers(installDir, finalPath, man)
-    writeSupersededRedirect(currentExe, finalPath)
-    try { options.app?.releaseSingleInstanceLock?.() } catch { /* ignore */ }
-    const helperPid = schedulePortableReplacement({
+    // PREPARED only — NEVER write NEW_VERSION_READY here (old process)
+    const handoff = updateHandoff.schedulePortableHandoff({
       currentExe,
       finalPath,
       downloadPath,
       expectedSha256: String(man.sha256 || ''),
-      readyMarkerPath: path.join(installDir, PORTABLE_READY_MARKER),
+      userDataPath: options.userDataPath || highestSeenUserData,
+      manifest: man,
+      electronExe: process.execPath,
+      readyTimeoutMs: Number(options.readyTimeoutMs || 90_000) || 90_000,
     })
-    recordHighestSeenReleaseSequence(man.releaseSequence, options.userDataPath || highestSeenUserData)
+    try { options.app?.releaseSingleInstanceLock?.() } catch { /* ignore */ }
     return {
       ok: true,
       pendingHelper: true,
-      helperPid,
+      phase: 'PREPARED',
+      helperPid: handoff.helperPid,
+      updateId: handoff.updateId,
       finalPath,
-      message: `新版已就绪，等待旧进程退出后启动：${destName}`,
+      message: `新版已就绪（PREPARED），等待旧进程退出后由助手确认 NEW_VERSION_READY：${destName}`,
     }
   } finally {
     applying = false
@@ -1229,47 +1213,30 @@ function maybeRelaunchSupersededPortable(options = {}) {
 }
 
 /**
- * 新进程启动后清理旧版回收站文件。
- * Never touch installed Mesh Agent under Program Files\\WXQK or device identity.
- * 仅在 ready marker / current marker 指向本进程 exe 时删除旧包。
+ * Cleanup after COMMIT only. Never delete old EXE based on PREPARED / false ready markers.
  */
-function cleanupUpdateTrashBestEffort() {
+function cleanupUpdateTrashBestEffort(userDataPath) {
   try {
+    const ud = String(userDataPath || highestSeenUserData || '')
+    const phase = String(updateState.getPhase(ud).phase || '')
+    const committed = updateState.readCommitted(ud)
+    if (phase !== updateState.PHASE.COMMITTED && !committed) return
     const installDir = path.dirname(resolvePortableExePath())
-    const readyPath = path.join(installDir, PORTABLE_READY_MARKER)
-    const currentPath = path.join(installDir, PORTABLE_CURRENT_MARKER)
-    let newReady = false
-    try {
-      if (existsSync(currentPath)) {
-        const row = JSON.parse(readFileSync(currentPath, 'utf8'))
-        const marked = String(row?.currentPortableExePath || '').trim()
-        if (marked && path.resolve(marked) === path.resolve(resolvePortableExePath())) newReady = true
-      }
-    } catch { /* ignore */ }
-    if (!newReady && existsSync(readyPath)) newReady = true
-    if (!newReady && !process.argv.includes('--after-update')) return
-
+    const current = updateState.readInstallCurrent(installDir)
+    const marked = String(current?.currentPortableExePath || '').trim()
+    if (!marked || path.resolve(marked) !== path.resolve(resolvePortableExePath())) return
+    // Old trash env cleanup is intentionally limited — finalizeCommit already rewrote launch entries
     const candidates = [
       String(process.env[UPDATE_OLD_TRASH_ENV] || '').trim(),
       String(process.env[LEGACY_UPDATE_OLD_TRASH_ENV] || '').trim(),
     ].filter(Boolean)
     for (const trash of candidates) {
       if (!isSafeUpdaterCleanupPath(trash)) continue
-      // 新版未就绪前不删旧 exe
-      if (!newReady) continue
+      // Do not delete if it is the stable launcher or current committed path
+      if (path.resolve(trash) === path.resolve(resolvePortableExePath())) continue
+      if (path.basename(trash) === updateState.STABLE_LAUNCHER_NAME) continue
       try { if (existsSync(trash)) unlinkSync(trash) } catch { /* ignore */ }
     }
-    const dir = installDir
-    if (!isSafeUpdaterCleanupPath(dir)) return
-    const trashDirs = [UPDATE_TRASH_DIR, ...getLegacyTrashDirNames()]
-    for (const name of trashDirs) {
-      const trashDir = path.join(dir, name)
-      if (!existsSync(trashDir) || !isSafeUpdaterCleanupPath(trashDir)) continue
-      try {
-        if (!readdirSync(trashDir).length) rmSync(trashDir, { recursive: true, force: true })
-      } catch { /* ignore */ }
-    }
-    try { if (existsSync(readyPath)) unlinkSync(readyPath) } catch { /* ignore */ }
   } catch { /* ignore */ }
 }
 
@@ -1301,12 +1268,24 @@ function clearSchedulerTimers() {
  * }} options
  */
 function startUpdateScheduler(options) {
-  if (process.argv.includes('--after-update')) {
-    cleanupUpdateTrashBestEffort()
+  const cli = updateHandoff.parseUpdateCliArgs(process.argv)
+  if (cli.afterUpdate) {
+    // Cleanup only after COMMITTED — not on mere --after-update
+    cleanupUpdateTrashBestEffort(options.userDataPath || highestSeenUserData)
+  }
+  if (cli.updateRollback) {
+    // After rollback, skip immediate auto-apply of the same failed release (backoff file handles it)
+    markStartupUpdateDone('UPDATE_ROLLBACK')
   }
   try {
-    const redirected = maybeRelaunchSupersededPortable({ app: options.app })
-    if (redirected.redirected) return
+    if (updateState.isUpdateApplying(options.userDataPath || highestSeenUserData)) {
+      // Secondary launch during APPLYING: prefer redirect to pending/current
+      const redirected = maybeRelaunchSupersededPortable({ app: options.app })
+      if (redirected.redirected) return
+    } else {
+      const redirected = maybeRelaunchSupersededPortable({ app: options.app })
+      if (redirected.redirected) return
+    }
   } catch { /* ignore */ }
   if (options.userDataPath) setHighestSeenUserData(options.userDataPath)
   if (options.drainHooks) setDefaultDrainHooks(options.drainHooks)
@@ -1474,6 +1453,7 @@ async function ipcApplyClientUpdate(options) {
     isEmergency,
     isRemote: allowRemote,
     isMandatory,
+    forceAfterConfirm: Boolean(options.forceDrainConfirm),
     hooks,
     onState: (state, detail) => {
       log('INFO', `更新排空：${state}`, { module: '软件更新', ...(detail || {}) })
@@ -1484,13 +1464,22 @@ async function ipcApplyClientUpdate(options) {
       module: '软件更新',
       state: drain.state,
       items: drain.items,
+      needsConfirm: Boolean(drain.needsConfirm),
     })
+    // Keep admission closed only while waiting for user force; remote pending clears drain
+    if (drain.pending || !drain.needsConfirm) {
+      endUpdateDrain()
+    }
     return {
       ok: false,
-      pending: drain.state === DRAIN_STATE.TIMEOUT_PENDING,
-      message: allowRemote
-        ? '远端更新已下载前排空超时，有任务仍在运行，已暂缓'
-        : '有任务仍在运行，请稍后再更新',
+      pending: Boolean(drain.pending || drain.state === DRAIN_STATE.TIMEOUT_PENDING),
+      needsConfirm: Boolean(drain.needsConfirm),
+      code: drain.code || drain.state,
+      message: drain.needsConfirm
+        ? '当前仍有任务执行中。现在更新可能中断任务，请确认是否强制更新。'
+        : (allowRemote
+          ? '远端更新排空超时，有任务仍在运行，已暂缓'
+          : '有任务仍在运行，请稍后再更新'),
       drain,
     }
   }
@@ -1508,8 +1497,10 @@ async function ipcApplyClientUpdate(options) {
       onProgress: options.onProgress,
     })
     if (applied.ok) {
-      log('INFO', applied.message || '更新助手已调度，即将优雅退出', { module: '软件更新', pendingHelper: true })
-      // 给 helper 启动与渲染层进度展示留出时间，不再 250ms 强杀
+      log('INFO', applied.message || '更新助手已调度，即将优雅退出', { module: '软件更新', pendingHelper: true, updateId: applied.updateId })
+      updateState.setPhase(options.userDataPath || highestSeenUserData, updateState.PHASE.WAITING_OLD_EXIT, {
+        updateId: applied.updateId,
+      })
       const exitDelay = Math.max(2_500, Number(options.exitDelayMs || 3_500) || 3_500)
       setTimeout(() => {
         try { options.app.quit() } catch {
@@ -1518,9 +1509,11 @@ async function ipcApplyClientUpdate(options) {
       }, exitDelay)
       return applied
     }
+    endUpdateDrain()
     if (!allowRemote) markStartupUpdateDone('APPLY_FAILED')
     return applied
   } catch (error) {
+    endUpdateDrain()
     if (!allowRemote) markStartupUpdateDone('APPLY_FAILED')
     log('ERROR', `更新失败：${error.message || error}`, { module: '软件更新' })
     return { ok: false, message: String(error?.message || error) }
@@ -1568,20 +1561,29 @@ module.exports = {
   setDefaultDrainHooks,
   loadHighestSeenReleaseSequence,
   recordHighestSeenReleaseSequence,
+  loadHighestCommittedReleaseSequence: updateState.loadHighestCommittedReleaseSequence,
+  recordHighestCommittedReleaseSequence: updateState.recordHighestCommittedReleaseSequence,
   cleanupUpdateTrashBestEffort,
   isSafeUpdaterCleanupPath,
   ipcCheckClientUpdate,
   ipcApplyClientUpdate,
   resolveUpdatePolicy,
   isForcedPolicy,
-  normalizeTargetClientIds,
-  mergeIntervals,
-  completedUniqueBytes,
-  normalizeRanges,
+  canAcceptNewWork,
+  isUpdateDrainActive,
+  beginUpdateDrain,
+  endUpdateDrain,
+  emitNewVersionReadyAck: updateHandoff.emitNewVersionReadyAck,
+  parseUpdateCliArgs: updateHandoff.parseUpdateCliArgs,
+  schedulePortableHandoff: updateHandoff.schedulePortableHandoff,
+  updateState,
+  DRAIN_STATE,
   collectActiveCriticalWork,
   waitForUpdateDrain,
-  DRAIN_STATE,
-  // test/debug
+  completedUniqueBytes,
+  mergeIntervals,
+  normalizeRanges,
+  normalizeTargetClientIds,
   childDiedWithin,
   prepareUpdateOldTrashPath,
   writeSupersededRedirect,

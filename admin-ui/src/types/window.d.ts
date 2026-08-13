@@ -86,8 +86,16 @@ declare global {
         policy?: string
         mandatory?: boolean
       }>
-      applyClientUpdate: () => Promise<{ ok: boolean; message?: string; deferred?: boolean; pending?: boolean }>
+      applyClientUpdate: (opts?: { forceDrainConfirm?: boolean }) => Promise<{
+        ok: boolean
+        message?: string
+        deferred?: boolean
+        pending?: boolean
+        needsConfirm?: boolean
+      }>
       markStartupUpdateDone: (reason?: string) => Promise<boolean>
+      notifyUpdateRuntimeReady: () => Promise<{ ok: boolean }>
+      cancelUpdateDrain: () => Promise<{ ok: boolean }>
       quitApp: () => Promise<boolean>
       onUpdateStartupCheck: (listener: (payload?: { reason?: string }) => void) => () => void
       onUpdateProgress: (listener: (payload: {

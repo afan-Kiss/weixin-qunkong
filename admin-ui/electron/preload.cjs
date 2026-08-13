@@ -90,8 +90,10 @@ contextBridge.exposeInMainWorld('wxControl', {
   selectWeixinExecutable: (defaultPath) => ipcRenderer.invoke('files:select-weixin', defaultPath),
   detectWeixinInstall: () => ipcRenderer.invoke('weixin:detect'),
   checkClientUpdate: () => ipcRenderer.invoke('update:check'),
-  applyClientUpdate: () => ipcRenderer.invoke('update:apply'),
+  applyClientUpdate: (opts) => ipcRenderer.invoke('update:apply', opts || {}),
   markStartupUpdateDone: (reason) => ipcRenderer.invoke('update:mark-done', reason == null ? '' : String(reason)),
+  notifyUpdateRuntimeReady: () => ipcRenderer.invoke('update:runtime-ready'),
+  cancelUpdateDrain: () => ipcRenderer.invoke('update:cancel-drain'),
   quitApp: () => ipcRenderer.invoke('app:quit'),
   onUpdateStartupCheck: (listener) => {
     const handler = (_event, payload) => listener(payload || {})

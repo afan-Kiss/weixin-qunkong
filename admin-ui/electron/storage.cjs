@@ -205,6 +205,16 @@ function database() {
   return db
 }
 
+/** Best-effort WAL flush before update apply / exit. */
+function flushDatabaseCheckpoint() {
+  try {
+    database().exec('PRAGMA wal_checkpoint(PASSIVE);')
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) }
+  }
+}
+
 function saveSetting(key, value) {
   database().prepare('INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at').run(key, JSON.stringify(value), new Date().toISOString())
 }
@@ -1683,7 +1693,7 @@ function listOwnedChatrooms(instanceId) {
 }
 
 module.exports = {
-  initStorage, database, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts,
+  initStorage, database, flushDatabaseCheckpoint, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts,
   saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, sanitizeApiSampleValue, saveEvent, listMessageEventsForKickScan, recordMemberJoin, listMemberJoins, listFriendAddStatuses,
   createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks,
   repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, releaseFriendDailyAttempt, releaseQrJoinDailyAttempt, updateTaskItemInstanceId, migrateDirectorySnapshotToInstance, rebindChatAddCandidatesForAccount, hasDeliveredContent, recordDeliveredContent,

@@ -174,7 +174,16 @@ async function runClientUpdateModal(
 
   const stopProgress = window.wxControl?.onUpdateProgress?.(onProgress)
   try {
-    const res = await applyFn()
+    let res = await applyFn()
+    if (!res?.ok && (res as { needsConfirm?: boolean })?.needsConfirm) {
+      const force = window.confirm('当前仍有任务执行中。现在更新可能中断任务。\n\n确定强制更新？\n（取消=继续等待/放弃本次）')
+      if (!force) {
+        try { await window.wxControl?.cancelUpdateDrain?.() } catch { /* ignore */ }
+        el.setAttribute('hidden', '')
+        return { ok: false as const, deferred: true as const, message: '已取消强制更新，任务可继续' }
+      }
+      res = await window.wxControl!.applyClientUpdate({ forceDrainConfirm: true })
+    }
     if (!res?.ok) {
       onProgress({ phase: 'error', message: res?.message || '更新失败', percent: 0 })
       await new Promise((resolve) => setTimeout(resolve, 2200))
@@ -201,6 +210,7 @@ export async function bootstrapClientUpdate() {
   if (bootstrapStarted) return
   bootstrapStarted = true
   if (!window.wxControl?.checkClientUpdate) return
+  try { await window.wxControl?.notifyUpdateRuntimeReady?.() } catch { /* ignore */ }
 
   let pageReloadGuard = false
   try { pageReloadGuard = sessionStorage.getItem(STARTUP_UPDATE_KEY) === '1' } catch { /* ignore */ }

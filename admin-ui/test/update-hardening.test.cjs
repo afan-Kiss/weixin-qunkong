@@ -24,8 +24,6 @@ const {
   verifyManifestSignature,
   needsUpgrade,
   setHighestSeenUserData,
-  recordHighestSeenReleaseSequence,
-  loadHighestSeenReleaseSequence,
 } = require('../electron/client-updater.cjs')
 const { getLegacyManifestDefaults, getServiceBase } = require('../electron/secure-config.cjs')
 
@@ -140,11 +138,15 @@ test('canonical v2 includes control fields and verifies', () => {
   assert.equal(verifyManifestSignature(manV1, sign(null, canonicalManifestBytesV1(manV1), privateKey).toString('hex'), pubRaw.toString('base64')), true)
 })
 
-test('anti-downgrade via highestSeenReleaseSequence', () => {
+test('anti-downgrade via highestCommittedReleaseSequence', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'upd-seen-'))
   setHighestSeenUserData(dir)
-  recordHighestSeenReleaseSequence(10, dir)
-  assert.equal(loadHighestSeenReleaseSequence(dir), 10)
+  const {
+    recordHighestCommittedReleaseSequence,
+    loadHighestCommittedReleaseSequence,
+  } = require('../electron/client-updater.cjs')
+  recordHighestCommittedReleaseSequence(10, dir)
+  assert.equal(loadHighestCommittedReleaseSequence(dir), 10)
   assert.equal(
     needsUpgrade(sampleManifest({ releaseSequence: 8, version: '1.0' }), 5, 'old', '1.0.0', '', dir),
     false,
