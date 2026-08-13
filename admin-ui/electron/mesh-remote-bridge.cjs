@@ -129,6 +129,12 @@ function resetMeshPrepareStateForTest() {
 
 function userMessageForCode(code, fallback) {
   const c = String(code || '')
+  if (c === 'MESH_ELEVATION_REQUIRED') {
+    return '需要管理员权限以修复远程服务'
+  }
+  if (c === 'MESH_STALE_SERVICE' || c === 'MESH_BAD_ARTIFACT' || c === 'MESH_BAD_ARTIFACT_NAME') {
+    return '远程服务安装损坏，正在尝试修复…'
+  }
   if (c === 'MESH_AGENT_FILES_MISSING' || c === 'MESH_INSTALL_FAILED' || c === 'MSH_IDENTITY_INCOMPLETE') {
     return '远程服务安装失败'
   }

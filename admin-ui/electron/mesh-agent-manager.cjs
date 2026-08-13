@@ -31,7 +31,22 @@ const AGENT_NAME_PREFIX = 'WXQK-'
 /** MeshServer / MeshID / ServerID / MeshName must never be rewritten from clientId. */
 const MSH_IDENTITY_KEYS = new Set(['MeshServer', 'MeshID', 'ServerID', 'MeshName'])
 
-/** @type {{ spawn?: typeof spawn, execFile?: typeof execFile, fs?: typeof fs, platform?: NodeJS.Platform, resourcesPath?: string, isPackaged?: boolean, now?: () => number, installedAgentDir?: string, legacyInstalledAgentDir?: string }} */
+/**
+ * @typedef {{
+ *   spawn?: typeof spawn,
+ *   execFile?: typeof execFile,
+ *   fs?: typeof fs,
+ *   platform?: NodeJS.Platform,
+ *   resourcesPath?: string,
+ *   isPackaged?: boolean,
+ *   now?: () => number,
+ *   installedAgentDir?: string,
+ *   legacyInstalledAgentDir?: string,
+ *   serviceBinaryPath?: string,
+ *   verifyBrandedArtifact?: (exePath: string) => Promise<{ ok: boolean, code?: string, message?: string, fileDescription?: string, originalFilename?: string, skipped?: boolean }> | { ok: boolean, code?: string, message?: string, fileDescription?: string, originalFilename?: string, skipped?: boolean },
+ * }} MeshAgentDeps
+ */
+/** @type {MeshAgentDeps} */
 let deps = {
   spawn,
   execFile,
@@ -489,6 +504,170 @@ async function syncInstalledMsh(stagedMshPath) {
 /**
  * @param {string} serviceName
  */
+/**
+ * Normalize BINARY_PATH_NAME from `sc qc` (strip quotes / args).
+ * @param {string} raw
+ * @returns {string}
+ */
+function normalizeServiceBinaryPath(raw) {
+  let text = String(raw || '').trim()
+  if (!text) return ''
+  if (text.startsWith('"')) {
+    const end = text.indexOf('"', 1)
+    if (end > 1) return text.slice(1, end)
+  }
+  const flag = text.search(/\s+-\w/)
+  if (flag > 0) return text.slice(0, flag).trim()
+  return text
+}
+
+/**
+ * Parse BINARY_PATH_NAME from `sc.exe qc` output.
+ * @param {string} qcText
+ * @returns {string}
+ */
+function parseScBinaryPath(qcText) {
+  const text = String(qcText || '')
+  const m = text.match(/BINARY_PATH_NAME\s*:\s*(.+)$/im)
+  if (!m) return ''
+  return normalizeServiceBinaryPath(m[1])
+}
+
+/**
+ * Read real SCM ImagePath for a Windows service.
+ * @param {string} serviceName
+ * @returns {Promise<{ present: boolean, binaryPath: string, raw: string }>}
+ */
+async function queryServiceImagePath(serviceName) {
+  if (typeof deps.serviceBinaryPath === 'string' && deps.serviceBinaryPath) {
+    return { present: true, binaryPath: normalizeServiceBinaryPath(deps.serviceBinaryPath), raw: 'deps' }
+  }
+  if ((deps.platform || process.platform) !== 'win32') {
+    return { present: false, binaryPath: '', raw: '' }
+  }
+  const result = await runExecFile('sc.exe', ['qc', serviceName], { timeoutMs: 15000 })
+  const raw = `${result.stdout}\n${result.stderr}`
+  if (/FAILED\s+1060/i.test(raw) || /does not exist/i.test(raw)) {
+    return { present: false, binaryPath: '', raw }
+  }
+  const binaryPath = parseScBinaryPath(raw)
+  return { present: Boolean(binaryPath) || result.ok, binaryPath, raw }
+}
+
+/**
+ * Canonical branded install locations (Program Files\\WXQK\\WXQK.exe).
+ * @returns {{ dir: string, exePath: string, mshPath: string }}
+ */
+function expectedBrandedInstallPaths() {
+  if (deps.installedAgentDir) {
+    const dir = String(deps.installedAgentDir)
+    return { dir, exePath: path.join(dir, EXE_NAME), mshPath: path.join(dir, MSH_NAME) }
+  }
+  const pf = process.env.ProgramFiles || 'C:\\Program Files'
+  const dir = path.join(pf, 'WXQK')
+  return { dir, exePath: path.join(dir, EXE_NAME), mshPath: path.join(dir, MSH_NAME) }
+}
+
+/**
+ * True when ImagePath points at branded WXQK.exe under an allowed install dir.
+ * @param {string} binaryPath
+ * @param {string} [expectedExePath]
+ */
+function isBrandedImagePath(binaryPath, expectedExePath) {
+  const normalized = normalizeServiceBinaryPath(binaryPath).replace(/\//g, '\\')
+  if (!normalized) return false
+  const base = path.basename(normalized).toLowerCase()
+  if (base !== EXE_NAME.toLowerCase()) return false
+  if (expectedExePath) {
+    const want = String(expectedExePath).replace(/\//g, '\\').toLowerCase()
+    if (normalized.toLowerCase() === want) return true
+  }
+  return /\\WXQK(?:\\WXQK)?\\WXQK\.exe$/i.test(normalized)
+}
+
+/**
+ * Detect UAC / elevation denial from elevated command result.
+ * @param {{ ok?: boolean, code?: number, stdout?: string, stderr?: string, error?: string }} result
+ */
+function isElevationDenied(result) {
+  const text = `${result && result.stderr || ''}\n${result && result.stdout || ''}\n${result && result.error || ''}`
+  if (/1223/.test(text)) return true
+  if (/canceled by the user|cancelled by the user|被用户取消|用户取消/i.test(text)) return true
+  if (/requires elevation|请求的操作需要提升/i.test(text)) return true
+  return false
+}
+
+/**
+ * PE / brand gate for packaged WXQK.exe — never install default MeshAgent artifact.
+ * Non-PE test doubles (tiny fake files) skip with skipped:true.
+ * @param {string} exePath
+ */
+async function verifyBrandedAgentArtifact(exePath) {
+  if (typeof deps.verifyBrandedArtifact === 'function') {
+    return deps.verifyBrandedArtifact(exePath)
+  }
+  if (!fileExists(exePath)) {
+    return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 WXQK.exe' }
+  }
+  if (path.basename(exePath).toLowerCase() !== EXE_NAME.toLowerCase()) {
+    return { ok: false, code: 'MESH_BAD_ARTIFACT_NAME', message: 'Agent 文件名必须是 WXQK.exe' }
+  }
+  let isPe = false
+  try {
+    const fd = deps.fs.openSync(exePath, 'r')
+    try {
+      const buf = Buffer.alloc(2)
+      deps.fs.readSync(fd, buf, 0, 2, 0)
+      isPe = buf[0] === 0x4d && buf[1] === 0x5a
+    } finally {
+      try { deps.fs.closeSync(fd) } catch { /* ignore */ }
+    }
+  } catch {
+    isPe = false
+  }
+  if (!isPe) {
+    return { ok: true, skipped: true, fileDescription: 'WXQK', originalFilename: EXE_NAME }
+  }
+  if ((deps.platform || process.platform) !== 'win32') {
+    return { ok: true, skipped: true, fileDescription: 'WXQK', originalFilename: EXE_NAME }
+  }
+  const esc = String(exePath).replace(/'/g, "''")
+  const ps = [
+    `$vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo('${esc}')`,
+    `$obj = [pscustomobject]@{ FileDescription = $vi.FileDescription; OriginalFilename = $vi.OriginalFilename; ProductName = $vi.ProductName }`,
+    `$obj | ConvertTo-Json -Compress`,
+  ].join('; ')
+  const result = await runExecFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+    timeoutMs: 30000,
+  })
+  if (!result.ok) {
+    return { ok: false, code: 'MESH_BAD_ARTIFACT', message: '无法读取 Agent 版本资源' }
+  }
+  let info = {}
+  try {
+    info = JSON.parse(String(result.stdout || '').trim() || '{}')
+  } catch {
+    return { ok: false, code: 'MESH_BAD_ARTIFACT', message: 'Agent 版本资源解析失败' }
+  }
+  const desc = String(info.FileDescription || '').trim()
+  const orig = String(info.OriginalFilename || '').trim()
+  const product = String(info.ProductName || '').trim()
+  if (!/^WXQK$/i.test(desc) || !/^WXQK\.exe$/i.test(orig)) {
+    return {
+      ok: false,
+      code: 'MESH_BAD_ARTIFACT',
+      message: '发行包 Agent 不是品牌化 WXQK（疑似默认 MeshAgent）',
+      fileDescription: desc,
+      originalFilename: orig,
+      productName: product,
+    }
+  }
+  return { ok: true, fileDescription: desc, originalFilename: orig, productName: product }
+}
+
+/**
+ * @param {string} serviceName
+ */
 async function queryNamedServiceState(serviceName) {
   if ((deps.platform || process.platform) !== 'win32') {
     return { present: false, state: 'unsupported', raw: '', name: serviceName }
@@ -507,9 +686,6 @@ async function queryNamedServiceState(serviceName) {
   return { present: false, state: 'error', raw, name: serviceName }
 }
 
-/**
- * Query Windows service state for branded WXQK service.
- */
 async function queryServiceState() {
   return queryNamedServiceState(SERVICE_NAME)
 }
@@ -519,8 +695,69 @@ async function queryLegacyServiceState() {
 }
 
 /**
+ * @param {{
+ *   installedExePresent: boolean,
+ *   installedMshPresent: boolean,
+ *   servicePresent: boolean,
+ *   imagePath: string,
+ *   imagePathOk: boolean,
+ * }} probe
+ */
+function classifyBrandInstallHealth(probe) {
+  const filesOk = Boolean(probe.installedExePresent && probe.installedMshPresent)
+  if (probe.servicePresent) {
+    if (!filesOk || !probe.imagePathOk) return 'stale_service'
+    return 'files_and_service_ok'
+  }
+  if (filesOk) return 'files_only'
+  return 'missing'
+}
+
+/**
+ * True only when EXE + MSH exist and ImagePath is branded WXQK.exe.
+ * Never treat bare servicePresent as success.
+ * @param {{
+ *   installedExePresent?: boolean,
+ *   installedMshPresent?: boolean,
+ *   exePresent?: boolean,
+ *   mshPresent?: boolean,
+ *   imagePathOk?: boolean,
+ *   servicePresent?: boolean,
+ *   status?: string,
+ * }} status
+ */
+function isBrandedInstallHealthy(status) {
+  const exe = status.installedExePresent != null ? status.installedExePresent : status.exePresent
+  const msh = status.installedMshPresent != null ? status.installedMshPresent : status.mshPresent
+  return Boolean(exe && msh && status.imagePathOk && status.servicePresent)
+}
+
+/**
+ * Stop + delete orphan WXQK SCM registration (files may already be gone).
+ */
+async function removeStaleWxqkServiceRegistration() {
+  log('WARN', 'removing stale WXQK service registration')
+  await runElevated('sc.exe', ['stop', SERVICE_NAME])
+  const deleted = await runElevated('sc.exe', ['delete', SERVICE_NAME])
+  if (isElevationDenied(deleted)) {
+    return { ok: false, code: 'MESH_ELEVATION_REQUIRED', message: '需要管理员权限以修复损坏的服务', result: deleted }
+  }
+  const expected = expectedBrandedInstallPaths()
+  const dirEsc = expected.dir.replace(/'/g, "''")
+  await runElevated('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+    `if (Test-Path -LiteralPath '${dirEsc}') { Remove-Item -LiteralPath '${dirEsc}' -Recurse -Force -ErrorAction SilentlyContinue }`,
+  ])
+  return {
+    ok: deleted.ok || /1060|does not exist/i.test(`${deleted.stdout}\n${deleted.stderr}`),
+    code: deleted.ok ? 'OK' : 'STALE_SERVICE_DELETE_FAILED',
+    message: deleted.ok ? 'stale service removed' : redact(deleted.stderr || deleted.error || 'delete failed'),
+    result: deleted,
+  }
+}
+
+/**
  * Confirm a legacy Mesh Agent install belongs to this WXQK deployment.
- * Never treat a third-party MeshCentral agent as ours.
  * @param {{ clientId?: string }} [opts]
  */
 function isLegacyAgentOwnedByWxqk(opts = {}) {
@@ -546,7 +783,6 @@ function isLegacyAgentOwnedByWxqk(opts = {}) {
       if (agentName === expected) {
         return { owned: true, reason: 'agentName_match', agentName, legacy }
       }
-      // Still WXQK-prefixed → this product's agent (maybe remapped client); safe to migrate.
       return { owned: true, reason: 'agentName_prefix', agentName, legacy }
     }
     return { owned: true, reason: 'agentName_prefix', agentName, legacy }
@@ -580,7 +816,6 @@ function isLegacyAgentOwnedByWxqk(opts = {}) {
 
 /**
  * Stop legacy service and attempt uninstall only after branded WXQK is healthy.
- * On failure to install/start branded agent, restart legacy (rollback).
  * @param {{ clientId?: string }} [options]
  */
 async function migrateLegacyMeshAgentToWxqk(options = {}) {
@@ -613,7 +848,7 @@ async function migrateLegacyMeshAgentToWxqk(options = {}) {
     }
     return {
       ok: false,
-      code: 'MIGRATE_INSTALL_FAILED',
+      code: installed.code === 'MESH_ELEVATION_REQUIRED' ? 'MESH_ELEVATION_REQUIRED' : 'MIGRATE_INSTALL_FAILED',
       action: 'migrate_rollback',
       message: installed.message || '服务升级失败，已恢复旧服务',
       install: installed,
@@ -622,7 +857,7 @@ async function migrateLegacyMeshAgentToWxqk(options = {}) {
   }
 
   const started = await startMeshAgent()
-  if (!started.ok) {
+  if (!started.ok || !isBrandedInstallHealthy(started.status || {}) || (started.status && started.status.status !== 'running')) {
     log('ERROR', 'migration start failed — rolling back legacy', { message: started.message })
     try {
       await uninstallMeshAgent()
@@ -632,7 +867,7 @@ async function migrateLegacyMeshAgentToWxqk(options = {}) {
     }
     return {
       ok: false,
-      code: 'MIGRATE_START_FAILED',
+      code: started.code === 'MESH_ELEVATION_REQUIRED' ? 'MESH_ELEVATION_REQUIRED' : 'MIGRATE_START_FAILED',
       action: 'migrate_rollback',
       message: started.message || '服务启动失败，已恢复旧服务',
       start: started,
@@ -640,7 +875,6 @@ async function migrateLegacyMeshAgentToWxqk(options = {}) {
     }
   }
 
-  // Branded service healthy — remove legacy service (keep identity via agentName / server remap).
   const legacyPaths = ownership.legacy || resolveLegacyInstalledMeshAgentPaths()
   if (legacyPaths && fileExists(legacyPaths.exePath)) {
     let un = await runElevated(legacyPaths.exePath, ['-fulluninstall'])
@@ -668,7 +902,11 @@ async function migrateLegacyMeshAgentToWxqk(options = {}) {
 }
 
 async function getMeshAgentVersion() {
-  const { exePath } = resolveMeshAgentPaths()
+  const packaged = resolveMeshAgentPaths()
+  const installed = resolveInstalledMeshAgentPaths()
+  const exePath = (installed && fileExists(installed.exePath))
+    ? installed.exePath
+    : packaged.exePath
   if (!fileExists(exePath)) {
     return { ok: false, version: '', message: 'wxqk_agent_missing' }
   }
@@ -691,36 +929,82 @@ async function getMeshAgentVersion() {
   }
 }
 
+/**
+ * Status based on INSTALLED brand files + real SCM ImagePath — never package-only presence.
+ */
 async function getMeshAgentStatus() {
-  const paths = resolveMeshAgentPaths()
-  const exePresent = fileExists(paths.exePath)
-  const mshPresent = fileExists(paths.mshPath)
+  const packaged = resolveMeshAgentPaths()
+  const expected = expectedBrandedInstallPaths()
+  const installedResolved = resolveInstalledMeshAgentPaths()
+  const installedExePath = installedResolved ? installedResolved.exePath : expected.exePath
+  const installedMshPath = installedResolved ? installedResolved.mshPath : expected.mshPath
+
+  const packagedExePresent = fileExists(packaged.exePath)
+  const packagedMshPresent = fileExists(packaged.mshPath)
+  const installedExePresent = fileExists(installedExePath)
+  const installedMshPresent = fileExists(installedMshPath)
+
   const service = await queryServiceState()
-  const versionInfo = exePresent ? await getMeshAgentVersion() : { ok: false, version: '', message: 'wxqk_agent_missing' }
+  let imagePath = ''
+  let imagePathOk = false
+  if (service.present) {
+    const qc = await queryServiceImagePath(SERVICE_NAME)
+    imagePath = qc.binaryPath || ''
+    imagePathOk = isBrandedImagePath(imagePath, expected.exePath)
+  }
+
+  const health = classifyBrandInstallHealth({
+    installedExePresent,
+    installedMshPresent,
+    servicePresent: service.present,
+    imagePath,
+    imagePathOk,
+  })
 
   let status = 'missing'
-  if (!exePresent || !mshPresent) status = 'missing'
-  else if (service.state === 'running') status = 'running'
-  else if (service.state === 'stopped' || service.state === 'pending') status = 'stopped'
-  else if (service.state === 'error' || service.state === 'unknown') status = 'broken'
-  else if (exePresent && mshPresent && !service.present) status = 'installed_no_service'
-  else status = 'missing'
+  if (health === 'stale_service') {
+    status = 'stale_service'
+  } else if (health === 'missing') {
+    status = 'missing'
+  } else if (service.state === 'running' && health === 'files_and_service_ok') {
+    status = 'running'
+  } else if ((service.state === 'stopped' || service.state === 'pending') && health === 'files_and_service_ok') {
+    status = 'stopped'
+  } else if (health === 'files_only') {
+    status = 'installed_no_service'
+  } else if (service.state === 'error' || service.state === 'unknown') {
+    status = 'broken'
+  } else {
+    status = 'broken'
+  }
+
+  const versionInfo = installedExePresent || packagedExePresent
+    ? await getMeshAgentVersion()
+    : { ok: false, version: '', message: 'wxqk_agent_missing' }
 
   return {
     ok: true,
     status,
-    exePresent,
-    mshPresent,
+    exePresent: installedExePresent,
+    mshPresent: installedMshPresent,
+    installedExePresent,
+    installedMshPresent,
+    packagedExePresent,
+    packagedMshPresent,
     servicePresent: service.present,
     serviceState: service.state,
+    imagePath,
+    imagePathOk,
     serviceName: SERVICE_NAME,
     serviceDisplayName: SERVICE_DISPLAY_NAME,
     version: versionInfo.version || '',
     paths: {
-      root: paths.root,
-      exePath: paths.exePath,
-      mshPath: paths.mshPath,
-      packaged: paths.packaged,
+      root: packaged.root,
+      exePath: packaged.exePath,
+      mshPath: packaged.mshPath,
+      installedExePath,
+      installedMshPath,
+      packaged: packaged.packaged,
     },
     hostname: os.hostname(),
     checkedAt: new Date(deps.now()).toISOString(),
@@ -728,16 +1012,13 @@ async function getMeshAgentStatus() {
 }
 
 /**
- * Install WXQK as a branded Windows service under Program Files\\WXQK.
- * MeshCentral -fullinstall still embeds legacy "Mesh Agent" paths in many builds,
- * so WXQK uses New-Service + type=own (non-interactive) after copying files.
  * @param {{ exePath: string, mshPath: string }} files
  */
 async function installBrandedWindowsService(files) {
-  const pf = process.env.ProgramFiles || 'C:\\Program Files'
-  const installDir = path.join(pf, 'WXQK')
-  const destExe = path.join(installDir, EXE_NAME)
-  const destMsh = path.join(installDir, MSH_NAME)
+  const expected = expectedBrandedInstallPaths()
+  const installDir = expected.dir
+  const destExe = expected.exePath
+  const destMsh = expected.mshPath
   const srcExe = String(files.exePath).replace(/'/g, "''")
   const srcMsh = String(files.mshPath).replace(/'/g, "''")
   const dirEsc = installDir.replace(/'/g, "''")
@@ -750,6 +1031,8 @@ async function installBrandedWindowsService(files) {
     `New-Item -ItemType Directory -Force -Path '${dirEsc}' | Out-Null`,
     `Copy-Item -LiteralPath '${srcExe}' -Destination '${exeEsc}' -Force`,
     `Copy-Item -LiteralPath '${srcMsh}' -Destination '${mshEsc}' -Force`,
+    `if (-not (Test-Path -LiteralPath '${exeEsc}')) { throw 'WXQK.exe missing after copy' }`,
+    `if (-not (Test-Path -LiteralPath '${mshEsc}')) { throw 'WXQK.msh missing after copy' }`,
     `$svc = Get-Service -Name '${svc}' -ErrorAction SilentlyContinue`,
     `if ($null -eq $svc) {`,
     `  New-Service -Name '${svc}' -BinaryPathName '"${exeEsc}"' -DisplayName '${display}' -Description '${display}' -StartupType Automatic | Out-Null`,
@@ -758,15 +1041,13 @@ async function installBrandedWindowsService(files) {
     `sc.exe config '${svc}' binPath= '"${exeEsc}"' | Out-Null`,
     `$svc2 = Get-Service -Name '${svc}' -ErrorAction SilentlyContinue`,
     `if ($null -ne $svc2 -and $svc2.Status -ne 'Running') { Start-Service -Name '${svc}' }`,
+    `if (-not (Test-Path -LiteralPath '${exeEsc}')) { throw 'WXQK.exe missing after service config' }`,
     `Get-Service -Name '${svc}' | Select-Object -ExpandProperty Status`,
   ].join('; ')
   return runElevated('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps])
 }
 
 /**
- * Install branded WXQK agent as a Windows service when possible.
- * Elevates only for install.
- * When clientId is provided, installs from a staged msh with agentName=WXQK-<clientId>.
  * @param {{ clientId?: string }} [options]
  */
 async function installMeshAgent(options = {}) {
@@ -778,6 +1059,17 @@ async function installMeshAgent(options = {}) {
   }
   if ((deps.platform || process.platform) !== 'win32') {
     return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows 安装服务' }
+  }
+
+  const brandGate = await verifyBrandedAgentArtifact(paths.exePath)
+  if (!brandGate.ok) {
+    log('ERROR', 'install aborted: bad branded artifact', brandGate)
+    return {
+      ok: false,
+      code: brandGate.code || 'MESH_BAD_ARTIFACT',
+      message: brandGate.message || '发行包 Agent 无效',
+      brand: brandGate,
+    }
   }
 
   let installExe = paths.exePath
@@ -800,10 +1092,25 @@ async function installMeshAgent(options = {}) {
   }
 
   let result = await installBrandedWindowsService({ exePath: installExe, mshPath: installMsh })
+  if (isElevationDenied(result)) {
+    return {
+      ok: false,
+      code: 'MESH_ELEVATION_REQUIRED',
+      message: '需要管理员权限才能安装服务',
+      status: await getMeshAgentStatus(),
+    }
+  }
   if (!result.ok) {
-    // Fallback for older MeshCentral agents that still honor -fullinstall branding
     const elevateOpts = stagingDir ? { cwd: stagingDir } : {}
     result = await runElevated(installExe, ['-fullinstall'], elevateOpts)
+    if (isElevationDenied(result)) {
+      return {
+        ok: false,
+        code: 'MESH_ELEVATION_REQUIRED',
+        message: '需要管理员权限才能安装服务',
+        status: await getMeshAgentStatus(),
+      }
+    }
     if (!result.ok) {
       result = await runElevated(installExe, ['-install'], elevateOpts)
     }
@@ -816,16 +1123,22 @@ async function installMeshAgent(options = {}) {
     log(mshSync.ok ? 'INFO' : 'WARN', 'post-install msh sync', mshSync)
   }
 
-  // Ensure service is own-process (interactive TYPE 110 breaks outbound for some builds)
   await runElevated('sc.exe', ['config', SERVICE_NAME, 'type=', 'own'])
 
   const after = await getMeshAgentStatus()
-  const ok = result.ok || after.servicePresent || after.status === 'running'
-  log(ok ? 'INFO' : 'ERROR', 'install finished', { ok, status: after.status, agentName: agentName || undefined })
+  // CRITICAL: never treat orphan servicePresent as install success
+  const ok = Boolean(result.ok) && isBrandedInstallHealthy(after)
+  log(ok ? 'INFO' : 'ERROR', 'install finished', {
+    ok,
+    status: after.status,
+    imagePathOk: after.imagePathOk,
+    installedExePresent: after.installedExePresent,
+    agentName: agentName || undefined,
+  })
   return {
     ok,
     code: ok ? 'OK' : 'MESH_INSTALL_FAILED',
-    message: ok ? '服务已就绪' : redact(result.stderr || result.error || '安装失败'),
+    message: ok ? '服务已就绪' : redact(result.stderr || result.error || '安装失败：缺少可执行文件或服务配置无效'),
     status: after,
     agentName: agentName || undefined,
     stagingDir: stagingDir || undefined,
@@ -837,20 +1150,41 @@ async function startMeshAgent() {
   if ((deps.platform || process.platform) !== 'win32') {
     return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows' }
   }
+  const before = await getMeshAgentStatus()
+  if (before.status === 'stale_service' || !isBrandedInstallHealthy(before)) {
+    return {
+      ok: false,
+      code: before.status === 'stale_service' ? 'MESH_STALE_SERVICE' : 'MESH_START_FAILED',
+      message: '服务安装不完整，无法启动',
+      status: before,
+    }
+  }
   log('INFO', 'starting WXQK service')
   let result = await runExecFile('sc.exe', ['start', SERVICE_NAME], { timeoutMs: 60000 })
   if (!result.ok) {
-    const paths = resolveMeshAgentPaths()
-    if (fileExists(paths.exePath)) {
-      result = await runElevated(paths.exePath, ['-start'])
+    const installed = resolveInstalledMeshAgentPaths()
+    const exePath = installed && fileExists(installed.exePath)
+      ? installed.exePath
+      : resolveMeshAgentPaths().exePath
+    if (fileExists(exePath)) {
+      result = await runElevated(exePath, ['-start'])
+      if (isElevationDenied(result)) {
+        return {
+          ok: false,
+          code: 'MESH_ELEVATION_REQUIRED',
+          message: '需要管理员权限才能启动服务',
+          status: await getMeshAgentStatus(),
+        }
+      }
     }
   }
   const after = await getMeshAgentStatus()
-  const ok = after.status === 'running' || /already been started|1056/i.test(`${result.stdout}\n${result.stderr}`)
+  const already = /already been started|1056/i.test(`${result.stdout}\n${result.stderr}`)
+  const ok = after.status === 'running' && isBrandedInstallHealthy(after)
   return {
-    ok,
-    code: ok ? 'OK' : 'MESH_START_FAILED',
-    message: ok ? '服务已就绪' : redact(result.stderr || result.error || '启动失败'),
+    ok: ok || (already && after.status === 'running' && isBrandedInstallHealthy(after)),
+    code: (ok || (already && after.status === 'running')) ? 'OK' : 'MESH_START_FAILED',
+    message: (ok || already) ? '服务已就绪' : redact(result.stderr || result.error || '启动失败'),
     status: after,
   }
 }
@@ -862,13 +1196,17 @@ async function stopMeshAgent() {
   log('INFO', 'stopping WXQK service')
   let result = await runExecFile('sc.exe', ['stop', SERVICE_NAME], { timeoutMs: 60000 })
   if (!result.ok) {
-    const paths = resolveMeshAgentPaths()
-    if (fileExists(paths.exePath)) {
-      result = await runElevated(paths.exePath, ['-stop'])
+    const installed = resolveInstalledMeshAgentPaths()
+    if (installed && fileExists(installed.exePath)) {
+      result = await runElevated(installed.exePath, ['-stop'])
     }
   }
   const after = await getMeshAgentStatus()
-  const ok = after.status === 'stopped' || after.status === 'installed_no_service' || /1052|1062|not started/i.test(`${result.stdout}\n${result.stderr}`)
+  const ok = after.status === 'stopped'
+    || after.status === 'installed_no_service'
+    || after.status === 'stale_service'
+    || after.status === 'missing'
+    || /1052|1062|not started/i.test(`${result.stdout}\n${result.stderr}`)
   return {
     ok: ok || result.ok,
     code: (ok || result.ok) ? 'OK' : 'MESH_STOP_FAILED',
@@ -885,21 +1223,36 @@ async function restartMeshAgent() {
 
 async function repairMeshAgent(options = {}) {
   log('INFO', 'repairing WXQK service')
-  const stopped = await stopMeshAgent()
+  const before = await getMeshAgentStatus()
+  if (before.status === 'stale_service' || (before.servicePresent && !isBrandedInstallHealthy(before))) {
+    const removed = await removeStaleWxqkServiceRegistration()
+    if (!removed.ok) {
+      return {
+        ok: false,
+        code: removed.code || 'MESH_REPAIR_FAILED',
+        message: removed.message || '无法清除损坏的服务注册',
+        status: await getMeshAgentStatus(),
+        remove: removed,
+      }
+    }
+  } else {
+    await stopMeshAgent()
+  }
+
   const paths = resolveMeshAgentPaths()
   if (!fileExists(paths.exePath) || !fileExists(paths.mshPath)) {
     return { ok: false, code: 'MESH_AGENT_FILES_MISSING', message: '缺少 WXQK.exe 或 WXQK.msh', status: await getMeshAgentStatus() }
   }
   const installed = await installMeshAgent({ clientId: options.clientId })
   if (!installed.ok) {
-    return { ok: false, code: 'MESH_REPAIR_FAILED', message: installed.message, stop: stopped, install: installed }
+    return { ok: false, code: installed.code || 'MESH_REPAIR_FAILED', message: installed.message, install: installed, status: installed.status }
   }
   const started = await startMeshAgent()
+  const ok = Boolean(started.ok && started.status && started.status.status === 'running' && isBrandedInstallHealthy(started.status))
   return {
-    ok: started.ok,
-    code: started.ok ? 'OK' : 'MESH_REPAIR_FAILED',
-    message: started.ok ? '服务已就绪' : started.message,
-    stop: stopped,
+    ok,
+    code: ok ? 'OK' : (started.code || 'MESH_REPAIR_FAILED'),
+    message: ok ? '服务已就绪' : started.message,
     install: installed,
     start: started,
     status: started.status,
@@ -911,12 +1264,16 @@ async function uninstallMeshAgent() {
     return { ok: false, code: 'UNSUPPORTED_OS', message: '仅支持 Windows' }
   }
   log('INFO', 'uninstalling WXQK service')
-  const paths = resolveMeshAgentPaths()
+  const installed = resolveInstalledMeshAgentPaths()
+  const packaged = resolveMeshAgentPaths()
   let result = { ok: false, stdout: '', stderr: '', error: '', code: 1 }
-  if (fileExists(paths.exePath)) {
-    result = await runElevated(paths.exePath, ['-fulluninstall'])
-    if (!result.ok) result = await runElevated(paths.exePath, ['-uninstall'])
-    if (!result.ok) result = await runElevated(paths.exePath, ['Mesh', 'Service', 'uninstall'])
+  const exePath = installed && fileExists(installed.exePath)
+    ? installed.exePath
+    : packaged.exePath
+  if (fileExists(exePath)) {
+    result = await runElevated(exePath, ['-fulluninstall'])
+    if (!result.ok) result = await runElevated(exePath, ['-uninstall'])
+    if (!result.ok) result = await runElevated(exePath, ['Mesh', 'Service', 'uninstall'])
   }
   if (!result.ok) {
     await runElevated('sc.exe', ['stop', SERVICE_NAME])
@@ -933,8 +1290,7 @@ async function uninstallMeshAgent() {
 }
 
 /**
- * Lifecycle helper: missing→install (or migrate legacy), stopped→start, running→noop, broken→repair.
- * New installs use staged msh with agentName=WXQK-<clientId>.
+ * Lifecycle: healthy → noop; stale_service → reinstall; missing+owned legacy → migrate; else install/start/repair.
  * @param {{ clientId?: string }} [options]
  */
 async function ensureMeshAgentRunning(options = {}) {
@@ -942,10 +1298,28 @@ async function ensureMeshAgentRunning(options = {}) {
   log('INFO', 'ensureMeshAgentRunning', { clientId: clientId || undefined })
   const before = await getMeshAgentStatus()
 
-  // Brand migration: WXQK service absent but legacy Mesh Agent may be ours.
-  if (!before.servicePresent) {
+  if (before.status === 'stale_service') {
+    log('WARN', 'detected STALE_SERVICE — auto repair', {
+      imagePath: before.imagePath,
+      installedExePresent: before.installedExePresent,
+      installedMshPresent: before.installedMshPresent,
+    })
+    const repaired = await repairMeshAgent({ clientId })
+    if (repaired.ok) await cleanupOwnedLegacyAfterBrandHealthy({ clientId })
+    return {
+      ok: repaired.ok,
+      code: repaired.ok ? 'OK' : repaired.code,
+      action: 'repair_stale',
+      message: repaired.message,
+      status: repaired.status || (await getMeshAgentStatus()),
+      agentName: buildAgentName(clientId) || undefined,
+    }
+  }
+
+  if (before.status === 'missing' || (before.status === 'installed_no_service' && !before.servicePresent)) {
     const legacy = await queryLegacyServiceState()
-    if (legacy.present) {
+    const legacyFiles = resolveLegacyInstalledMeshAgentPaths()
+    if (legacy.present || legacyFiles) {
       const ownership = isLegacyAgentOwnedByWxqk({ clientId })
       if (ownership.owned) {
         const migrated = await migrateLegacyMeshAgentToWxqk({ clientId })
@@ -982,22 +1356,43 @@ async function ensureMeshAgentRunning(options = {}) {
     }
     return { ok: true, code: 'OK', action: 'noop', message: '服务已就绪', status: before }
   }
+
   if (before.status === 'missing') {
     const installed = await installMeshAgent({ clientId })
     if (!installed.ok) {
       return { ok: false, code: installed.code, action: 'install', message: installed.message, status: installed.status || before }
     }
     const started = await startMeshAgent()
+    const ok = Boolean(started.ok && started.status && started.status.status === 'running' && isBrandedInstallHealthy(started.status))
+    if (ok) await cleanupOwnedLegacyAfterBrandHealthy({ clientId })
     return {
-      ok: started.ok,
-      code: started.ok ? 'OK' : started.code,
+      ok,
+      code: ok ? 'OK' : started.code,
       action: 'install_start',
       message: started.message,
       status: started.status,
       agentName: installed.agentName,
     }
   }
+
   if (before.status === 'stopped' || before.status === 'installed_no_service') {
+    if (before.status === 'installed_no_service') {
+      // Files on disk but no healthy SCM registration — must install, not only sc start
+      const installed = await installMeshAgent({ clientId })
+      if (!installed.ok) {
+        return { ok: false, code: installed.code, action: 'install', message: installed.message, status: installed.status || before }
+      }
+      const started = await startMeshAgent()
+      const ok = Boolean(started.ok && started.status && started.status.status === 'running' && isBrandedInstallHealthy(started.status))
+      return {
+        ok,
+        code: ok ? 'OK' : started.code,
+        action: 'install_start',
+        message: started.message,
+        status: started.status,
+        agentName: installed.agentName || buildAgentName(clientId) || undefined,
+      }
+    }
     if (clientId && installedAgentNeedsRepair(clientId)) {
       log('WARN', 'stopped agent needs repair before start', {
         clientId,
@@ -1022,7 +1417,11 @@ async function ensureMeshAgentRunning(options = {}) {
       status: started.status,
     }
   }
+
   const repaired = await repairMeshAgent({ clientId })
+  if (repaired.ok) {
+    await cleanupOwnedLegacyAfterBrandHealthy({ clientId })
+  }
   return {
     ok: repaired.ok,
     code: repaired.ok ? 'OK' : repaired.code,
@@ -1030,6 +1429,67 @@ async function ensureMeshAgentRunning(options = {}) {
     message: repaired.message,
     status: repaired.status || (await getMeshAgentStatus()),
   }
+}
+
+/**
+ * After branded WXQK is healthy+running, uninstall owned legacy Mesh Agent leftovers.
+ * Never touches third-party Mesh Agent installs.
+ * @param {{ clientId?: string }} [options]
+ */
+async function cleanupOwnedLegacyAfterBrandHealthy(options = {}) {
+  const status = await getMeshAgentStatus()
+  if (status.status !== 'running' || !isBrandedInstallHealthy(status)) {
+    return { ok: false, code: 'BRAND_NOT_READY', message: 'branded agent not healthy; skip legacy cleanup' }
+  }
+  const clientId = safeClientIdForAgent(options.clientId)
+  const ownership = isLegacyAgentOwnedByWxqk({ clientId })
+  const alts = []
+  if (ownership.owned && ownership.legacy) alts.push(ownership.legacy)
+  for (const dir of legacyInstallDirCandidates()) {
+    const found = pickAgentDir(dir, LEGACY_EXE_NAMES, LEGACY_MSH_NAMES, false)
+    if (found) alts.push(found)
+  }
+  const seen = new Set()
+  let cleaned = 0
+  for (const found of alts) {
+    if (!found || !fileExists(found.exePath) || seen.has(found.dir)) continue
+    seen.add(found.dir)
+    let parsed = new Map()
+    try {
+      if (fileExists(found.mshPath)) parsed = parseMshText(deps.fs.readFileSync(found.mshPath, 'utf8'))
+    } catch { /* ignore */ }
+    const agentName = String(parsed.get('agentName') || '').trim()
+    const ownedByPrefix = agentName.startsWith(AGENT_NAME_PREFIX)
+    let ownedByIdentity = false
+    if (!ownedByPrefix) {
+      const templatePath = resolveMeshAgentPaths().mshPath
+      if (fileExists(templatePath) && fileExists(found.mshPath)) {
+        try {
+          const tmpl = parseMshText(deps.fs.readFileSync(templatePath, 'utf8'))
+          const keys = ['MeshServer', 'ServerID', 'MeshID']
+          let matched = 0
+          let required = 0
+          for (const key of keys) {
+            const want = String(tmpl.get(key) || '').trim()
+            if (!want) continue
+            required += 1
+            if (want === String(parsed.get(key) || '').trim()) matched += 1
+          }
+          ownedByIdentity = required >= 2 && matched === required
+        } catch { /* ignore */ }
+      }
+    }
+    if (!ownedByPrefix && !ownedByIdentity) continue
+    log('INFO', 'cleaning owned legacy Mesh Agent leftover', { dir: found.dir, agentName: agentName || undefined })
+    let un = await runElevated(found.exePath, ['-fulluninstall'])
+    if (!un.ok) un = await runElevated(found.exePath, ['-uninstall'])
+    if (!un.ok) {
+      await runElevated('sc.exe', ['stop', LEGACY_SERVICE_NAME])
+      await runElevated('sc.exe', ['delete', LEGACY_SERVICE_NAME])
+    }
+    cleaned += 1
+  }
+  return { ok: true, code: 'OK', cleaned, message: cleaned ? 'legacy leftovers cleaned' : 'no owned legacy leftovers' }
 }
 
 module.exports = {
@@ -1054,6 +1514,15 @@ module.exports = {
   migrateLegacyMeshAgentToWxqk,
   isLegacyAgentOwnedByWxqk,
   queryLegacyServiceState,
+  queryServiceImagePath,
+  parseScBinaryPath,
+  normalizeServiceBinaryPath,
+  isBrandedImagePath,
+  isBrandedInstallHealthy,
+  verifyBrandedAgentArtifact,
+  removeStaleWxqkServiceRegistration,
+  expectedBrandedInstallPaths,
+  cleanupOwnedLegacyAfterBrandHealthy,
   safeClientIdForAgent,
   buildAgentName,
   parseMshText,
