@@ -29,14 +29,14 @@ def open_ws_nginx(style='control'):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.load_verify_locations('/etc/nginx/ssl/wxqk-ip.crt')
-    ssock = ctx.wrap_socket(raw, server_hostname='120.27.219.138')
-    url = 'wss://120.27.219.138:8444/control.ashx?auth=' + token
+    ssock = ctx.wrap_socket(raw, server_hostname='203.0.113.10')
+    url = 'wss://203.0.113.10:8444/control.ashx?auth=' + token
     ws = websocket.create_connection(
         url,
         socket=ssock,
         timeout=20,
-        origin='https://120.27.219.138:8444',
-        host='120.27.219.138:8444',
+        origin='https://203.0.113.10:8444',
+        host='203.0.113.10:8444',
     )
     return ws
 
@@ -44,7 +44,7 @@ def open_ws_variants(style='control'):
     token = mc.mint_login_token('user//admin', style=style, expire_min=30)
     variants = [
         ('nginx', None),
-        ('loop_origin_https', 'https://120.27.219.138:8444'),
+        ('loop_origin_https', 'https://203.0.113.10:8444'),
         ('loop_origin_http', 'http://127.0.0.1:9443'),
         ('loop_origin_none', ''),
     ]
@@ -199,7 +199,7 @@ except Exception as e:
     print('b64', e)
 ok = False
 for mid in cands:
-    for ms in ('wss://120.27.219.138:4433/agent.ashx', 'wss://120.27.219.138:8444/agent.ashx'):
+    for ms in ('wss://203.0.113.10:4433/agent.ashx', 'wss://203.0.113.10:8444/agent.ashx'):
         outp = subprocess.check_output(
             ['docker', 'exec', '-e', 'MID=' + mid, '-e', 'MS=' + ms, 'wxqk-meshcentral', 'node', '/tmp/gen_msh.js'],
             stderr=subprocess.STDOUT, text=True, errors='replace'

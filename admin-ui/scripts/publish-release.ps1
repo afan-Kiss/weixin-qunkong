@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 # One-command release: bump (optional) → package portable → publish to update channel.
 param(
-  [string]$BaseUrl = 'https://120.27.219.138:8443/wxqk',
+  [string]$BaseUrl = 'https://mesh.example.invalid/wxqk',
   [string]$Password = $env:WXQK_PUBLISH_PASSWORD,
   [switch]$Mandatory,
   [switch]$SkipBump,

@@ -52,7 +52,7 @@ def upsert_env(path, updates):
 
 base_updates = {
     'WXQK_MESH_ENABLED': '1',
-    'WXQK_MESH_URL': 'https://120.27.219.138:8444',
+    'WXQK_MESH_URL': 'https://203.0.113.10:8444',
     'WXQK_MESH_INTERNAL_URL': 'http://127.0.0.1:9443',
     'WXQK_MESH_USER': 'user//admin',
     'WXQK_MESH_LOGIN_KEY': key,
@@ -73,7 +73,7 @@ import meshcentral_client as mc
 importlib.reload(mc)
 import websocket
 
-ORIGIN = 'https://120.27.219.138:8444'
+ORIGIN = 'https://203.0.113.10:8444'
 
 def open_ws(style='control'):
     token = mc.mint_login_token('user//admin', style=style, expire_min=30)
@@ -82,7 +82,7 @@ def open_ws(style='control'):
         url,
         timeout=20,
         origin=ORIGIN,
-        header=['Origin: ' + ORIGIN, 'Host: 120.27.219.138:8444'],
+        header=['Origin: ' + ORIGIN, 'Host: 203.0.113.10:8444'],
     )
 
 def drain(ws, seconds=10):
@@ -204,9 +204,9 @@ except Exception as e:
 msh_ok = False
 for mid in candidates:
     for ms in (
-        'wss://120.27.219.138:4433/agent.ashx',
-        'wss://120.27.219.138:8444/agent.ashx',
-        'wss://120.27.219.138/agent.ashx',
+        'wss://203.0.113.10:4433/agent.ashx',
+        'wss://203.0.113.10:8444/agent.ashx',
+        'wss://203.0.113.10/agent.ashx',
     ):
         outp = subprocess.check_output(
             ['docker', 'exec', '-e', 'MID=' + mid, '-e', 'MS=' + ms, 'wxqk-meshcentral', 'node', '/tmp/gen_msh.js'],

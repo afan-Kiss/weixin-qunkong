@@ -111,15 +111,42 @@ def authorize_client_access(
     }
 
 
-def handle_health(data_dir: Path, send: SendFn) -> bool:
+def handle_health(data_dir: Path, send: SendFn, *, deep: bool = False, admin: bool = False) -> bool:
     mc = _load_client()
     if mc is None:
-        send(200, {**_disabled_payload(), "message": "meshcentral_client 未加载"})
+        send(200, {
+            **_disabled_payload(),
+            "message": "meshcentral_client 未加载",
+            "enabled": False,
+            "meshReachable": False,
+            "controlChannel": False,
+            "loginKeyConfigured": False,
+            "version": "1.2.4",
+            "webRtcDisabled": True,
+            "userMessage": "远程维护服务器未配置",
+        })
         return True
     try:
-        send(200, mc.health_check())
+        # Deep control.ashx probe is admin-only; never return secrets.
+        payload = mc.health_check(deep=bool(deep and admin))
+        # Strip any accidental secret-ish fields
+        for bad in ("loginKey", "loginTokenKey", "password", "cookie", "token", "embedUrl"):
+            payload.pop(bad, None)
+        send(200, payload)
     except Exception as exc:
-        send(200, {"ok": False, "code": "MESH_ERROR", "message": str(exc)})
+        send(200, {
+            "ok": False,
+            "code": "MESH_ERROR",
+            "message": "MeshCentral 诊断失败",
+            "enabled": False,
+            "meshReachable": False,
+            "controlChannel": False,
+            "loginKeyConfigured": False,
+            "version": "1.2.4",
+            "webRtcDisabled": True,
+            "userMessage": "远程维护服务器不可达",
+            "detail": str(exc)[:120],
+        })
     return True
 
 
@@ -323,10 +350,11 @@ def try_handle_get(
         auth = {"ok": True, "role": "admin", "username": "", "message": "admin"}
 
     if path == "/api/mesh/health":
-        if auth.get("role") != "admin" and str(auth.get("username") or "").lower() not in _ops_usernames():
-            # software non-ops: still allow health without secrets
-            pass
-        return handle_health(data_dir, send)
+        is_admin = auth.get("role") == "admin" or str(auth.get("username") or "").lower() in _ops_usernames()
+        if not is_admin and auth.get("role") != "admin":
+            # software non-ops: allow shallow health without secrets / control probe
+            return handle_health(data_dir, send, deep=False, admin=False)
+        return handle_health(data_dir, send, deep=True, admin=True)
 
     client_id = str((qs.get("clientId") or qs.get("client_id") or [""])[0] or "")
     gate = authorize_client_access(data_dir, auth, client_id, get_online_meta=get_online_meta)

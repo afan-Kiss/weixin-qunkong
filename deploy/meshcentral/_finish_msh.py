@@ -44,8 +44,8 @@ qmesh = subprocess.check_output(['python3','-c','import urllib.parse,os;print(ur
 
 # curl download with login for possible msh; also keep exe
 cmd = (
-    f"curl -sk --resolve 120.27.219.138:8444:127.0.0.1 "
-    f"\"https://120.27.219.138:8444/meshagents?id=3&meshid={qmesh}&login={login}\" "
+    f"curl -sk --resolve 203.0.113.10:8444:127.0.0.1 "
+    f"\"https://203.0.113.10:8444/meshagents?id=3&meshid={qmesh}&login={login}\" "
     f"-o /opt/wxqk/meshcentral/agent-staging/auth-agent.bin "
     f"-w 'http=%{{http_code}} size=%{{size_download}}\\n'"
 )
@@ -153,7 +153,7 @@ except Exception as e:
 
 ok=False
 for mid in cands:
-    for ms in ('wss://120.27.219.138:4433/agent.ashx','wss://120.27.219.138:8444/agent.ashx'):
+    for ms in ('wss://203.0.113.10:4433/agent.ashx','wss://203.0.113.10:8444/agent.ashx'):
         try:
             outp=subprocess.check_output(
                 ['docker','exec','-e','MID='+mid,'-e','MS='+ms,'wxqk-meshcentral','node','/tmp/gen_msh2.js'],

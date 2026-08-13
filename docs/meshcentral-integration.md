@@ -27,14 +27,13 @@ wxqk admin console (#/desktop)
 
 ```bash
 cd deploy/meshcentral
-python manage.py prepare
-# edit .env + config.json
-python manage.py validate
-python manage.py up
-python manage.py status
+python manage.py bootstrap --public-host <YOUR_MESH_HOST>
+python manage.py doctor
 ```
 
 Image: `ghcr.io/ylianst/meshcentral:1.2.4` (never `:latest`). Volumes: `data/`, `files/`, `backups/`.
+
+`WXQK_MESH_LOGIN_KEY` lives only on the **wxqk server** (`/etc/wxqk/mesh.env` or `deploy/meshcentral/wxqk-mesh.env`). Windows clients never receive it.
 
 ## Production TLS (public IP, no domain)
 
@@ -42,7 +41,8 @@ Production Mesh entry uses a **publicly trusted Let's Encrypt IP Address Certifi
 with the **shortlived** ACME profile (~6 days / 160 hours):
 
 ```text
-https://120.27.219.138:8444
+https://<YOUR_MESH_HOST>:8444
+# documentation / lab example: https://203.0.113.10:8444
 ```
 
 Requirements:

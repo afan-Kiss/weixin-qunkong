@@ -271,41 +271,110 @@ def _http_get(url: str, timeout: float, *, follow_redirects: bool = True) -> tup
         raise
 
 
-def health_check() -> dict[str, Any]:
-    """GET public or internal URL. Soft errors when Mesh is disabled or unreachable."""
+def health_check(*, deep: bool = False) -> dict[str, Any]:
+    """
+    Soft MeshCentral health for diagnostics.
+    Never returns login keys / cookies / passwords.
+    deep=True also probes control.ashx when websocket is available.
+    """
+    snap = config_snapshot()
     if not is_enabled():
-        return {"ok": False, "code": "MESH_DISABLED", "message": "MeshCentral 未启用"}
+        return {
+            "ok": False,
+            "code": "MESH_DISABLED",
+            "message": "MeshCentral 未启用",
+            "enabled": False,
+            "meshReachable": False,
+            "controlChannel": False,
+            "loginKeyConfigured": bool(snap.get("loginKeyConfigured")),
+            "version": PINNED_MESHCENTRAL_VERSION,
+            "webRtcDisabled": True,
+            "userMessage": "远程维护服务器未配置",
+        }
     timeout = float(_env_int("WXQK_MESH_TIMEOUT", 15))
     targets = []
     for u in (internal_url(), public_url()):
         if u and u not in targets:
             targets.append(u)
     if not targets:
-        return {"ok": False, "code": "MESH_URL_MISSING", "message": "未配置 WXQK_MESH_URL"}
+        return {
+            "ok": False,
+            "code": "MESH_URL_MISSING",
+            "message": "未配置 WXQK_MESH_URL",
+            "enabled": True,
+            "meshReachable": False,
+            "controlChannel": False,
+            "loginKeyConfigured": bool(snap.get("loginKeyConfigured")),
+            "version": PINNED_MESHCENTRAL_VERSION,
+            "webRtcDisabled": True,
+            "userMessage": "远程维护服务器未配置",
+        }
 
     errors: list[str] = []
+    reachable = False
+    status_code = 0
+    used_url = ""
     for url in targets:
         try:
-            # Prefer no-follow for loopback HTTP (Mesh redirects to AliasPort HTTPS).
             follow = not url.lower().startswith("http://127.0.0.1") and not url.lower().startswith("http://localhost")
             status, body, final = _http_get(url, timeout, follow_redirects=follow)
             ok = status < 500
-            return {
-                "ok": ok,
-                "code": "OK" if ok else "MESH_UNHEALTHY",
-                "statusCode": status,
-                "url": url,
-                "finalUrl": final,
-                "bytes": len(body or b""),
-                "message": "MeshCentral 可达" if ok else f"HTTP {status}",
-            }
+            reachable = ok
+            status_code = status
+            used_url = url
+            if ok:
+                break
+            errors.append(f"{url}: HTTP {status}")
         except Exception as exc:
             errors.append(f"{url}: {exc}")
+
+    control_ok = False
+    control_code = ""
+    if deep and reachable and snap.get("loginKeyConfigured"):
+        synced = sync_nodes_via_control(timeout=min(timeout, 8.0))
+        control_ok = bool(synced.get("ok"))
+        control_code = str(synced.get("code") or "")
+        if not control_ok:
+            errors.append(str(synced.get("message") or control_code or "control failed")[:160])
+
+    if not reachable:
+        return {
+            "ok": False,
+            "code": "MESH_UNREACHABLE",
+            "message": "MeshCentral 不可达",
+            "enabled": True,
+            "meshReachable": False,
+            "controlChannel": False,
+            "loginKeyConfigured": bool(snap.get("loginKeyConfigured")),
+            "version": PINNED_MESHCENTRAL_VERSION,
+            "webRtcDisabled": True,
+            "errors": errors[:5],
+            "userMessage": "远程维护服务器不可达",
+        }
+
+    ok = reachable and bool(snap.get("loginKeyConfigured"))
+    if deep:
+        ok = ok and control_ok
     return {
-        "ok": False,
-        "code": "MESH_UNREACHABLE",
-        "message": "MeshCentral 不可达",
+        "ok": ok,
+        "code": "OK" if ok else (
+            "MESH_CONTROL_FAILED" if deep and reachable and not control_ok
+            else ("MESH_KEY_MISSING" if reachable and not snap.get("loginKeyConfigured") else "MESH_PARTIAL")
+        ),
+        "message": "MeshCentral 可达" if reachable else "MeshCentral 不可达",
+        "enabled": True,
+        "meshReachable": True,
+        "controlChannel": bool(control_ok) if deep else None,
+        "loginKeyConfigured": bool(snap.get("loginKeyConfigured")),
+        "version": PINNED_MESHCENTRAL_VERSION,
+        "webRtcDisabled": True,
+        "statusCode": status_code,
+        "url": used_url,
         "errors": errors[:5],
+        "userMessage": (
+            "远程维护服务正常" if ok
+            else ("远程维护服务器未配置" if not snap.get("loginKeyConfigured") else "远程维护服务器不可达")
+        ),
     }
 
 

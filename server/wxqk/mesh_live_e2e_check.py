@@ -7,7 +7,7 @@ Requires env credentials to talk to wxqk + MeshCentral.
 
 Usage (PowerShell example):
   $env:WXQK_MESH_ENABLED='1'
-  $env:WXQK_MESH_URL='https://120.27.219.138:8444'
+  $env:WXQK_MESH_URL='https://mesh.example.invalid:8444'
   $env:WXQK_MESH_LOGIN_KEY='<hex>'
   $env:WXQK_MESH_USER='user//admin'
   $env:WXQK_DATA_DIR='D:\\wxqk-data'   # optional; default ./_e2e_data

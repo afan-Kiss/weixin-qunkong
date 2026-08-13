@@ -63,13 +63,13 @@ def main() -> int:
         "need=['MeshName','MeshID','ServerID','MeshServer']\n"
         "keys={ln.split('=',1)[0] for ln in text.splitlines() if '=' in ln}\n"
         "print('MISSING', [k for k in need if k not in keys])\n"
-        "print('POINTS_PROD', '120.27.219.138' in text)\n"
+        "print('POINTS_PROD', '203.0.113.10' in text)\n"
         "PY"
     )
 
     # health: mesh HTTPS + wxqk active + docker
     run(
-        "curl -skI --resolve 120.27.219.138:8444:127.0.0.1 https://120.27.219.138:8444/ | head -n 12; "
+        "curl -skI --resolve 203.0.113.10:8444:127.0.0.1 https://203.0.113.10:8444/ | head -n 12; "
         "cd /opt/wxqk/meshcentral && docker compose ps --format '{{.Name}} {{.Status}}'; "
         "systemctl is-active wxqk docker; "
         "python3 - <<'PY'\n"

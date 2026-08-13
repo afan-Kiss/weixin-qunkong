@@ -30,9 +30,9 @@ if not mesh_id:
     raw = socket.create_connection(('127.0.0.1', 8444), timeout=20)
     ctx = ssl.create_default_context(); ctx.check_hostname=False
     ctx.load_verify_locations('/etc/nginx/ssl/wxqk-ip.crt')
-    ssock = ctx.wrap_socket(raw, server_hostname='120.27.219.138')
-    url = 'wss://120.27.219.138:8444/control.ashx?auth=' + token
-    ws = websocket.create_connection(url, socket=ssock, timeout=20, origin='https://120.27.219.138:8444')
+    ssock = ctx.wrap_socket(raw, server_hostname='203.0.113.10')
+    url = 'wss://203.0.113.10:8444/control.ashx?auth=' + token
+    ws = websocket.create_connection(url, socket=ssock, timeout=20, origin='https://203.0.113.10:8444')
     ws.send(json.dumps({'action':'meshes','responseid':'m1'}))
     end=time.time()+10
     while time.time()<end:
@@ -71,14 +71,14 @@ ctx.load_verify_locations('/etc/nginx/ssl/wxqk-ip.crt')
 
 def fetch(url, dest):
     # force connect to 127.0.0.1:8444
-    req = urllib.request.Request(url, headers={'Host':'120.27.219.138:8444'})
+    req = urllib.request.Request(url, headers={'Host':'203.0.113.10:8444'})
     # custom opener that connects to loopback
     class R(urllib.request.HTTPSHandler):
         def https_open(self, req2):
             return self.do_open(self._conn, req2)
         def _conn(self, host, **kwargs):
-            # host will be 120.27.219.138:8444 — redirect to 127.0.0.1
-            return ctx.wrap_socket(socket.create_connection(('127.0.0.1', 8444), timeout=60), server_hostname='120.27.219.138')
+            # host will be 203.0.113.10:8444 — redirect to 127.0.0.1
+            return ctx.wrap_socket(socket.create_connection(('127.0.0.1', 8444), timeout=60), server_hostname='203.0.113.10')
     opener = urllib.request.build_opener(R())
     with opener.open(req, timeout=120) as resp:
         data = resp.read()
@@ -86,9 +86,9 @@ def fetch(url, dest):
     return len(data), data[:16]
 
 candidates = [
-    f'https://120.27.219.138:8444/meshagents?id=3&meshid={qmesh}&login={qlogin}',
-    f'https://120.27.219.138:8444/meshagents?id=3&meshid={qmesh}&login={qlogin}&type=msh',
-    f'https://120.27.219.138:8444/?login={qlogin}',
+    f'https://203.0.113.10:8444/meshagents?id=3&meshid={qmesh}&login={qlogin}',
+    f'https://203.0.113.10:8444/meshagents?id=3&meshid={qmesh}&login={qlogin}&type=msh',
+    f'https://203.0.113.10:8444/?login={qlogin}',
 ]
 for u in candidates[:2]:
     try:
@@ -130,8 +130,8 @@ except Exception as e:
 if not (out/'meshagent.msh').exists():
     for mid in cands:
         for ms in (
-            'wss://120.27.219.138:4433/agent.ashx',
-            'wss://120.27.219.138:8444/agent.ashx',
+            'wss://203.0.113.10:4433/agent.ashx',
+            'wss://203.0.113.10:8444/agent.ashx',
         ):
             outp=subprocess.check_output(
                 ['docker','exec','-e','MID='+mid,'-e','MS='+ms,'wxqk-meshcentral','node','/tmp/gen_msh.js'],
@@ -159,10 +159,10 @@ token = mc.mint_login_token('user//admin', style='control', expire_min=30)
 raw = socket.create_connection(('127.0.0.1', 8444), timeout=20)
 ctx2 = ssl.create_default_context(); ctx2.check_hostname=False
 ctx2.load_verify_locations('/etc/nginx/ssl/wxqk-ip.crt')
-ssock = ctx2.wrap_socket(raw, server_hostname='120.27.219.138')
+ssock = ctx2.wrap_socket(raw, server_hostname='203.0.113.10')
 ws = websocket.create_connection(
-    'wss://120.27.219.138:8444/control.ashx?auth='+token,
-    socket=ssock, timeout=20, origin='https://120.27.219.138:8444'
+    'wss://203.0.113.10:8444/control.ashx?auth='+token,
+    socket=ssock, timeout=20, origin='https://203.0.113.10:8444'
 )
 for payload in [
     {'action':'getagentconfig','meshid':mesh_id,'responseid':'g1'},

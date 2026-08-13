@@ -50,7 +50,7 @@ def main() -> int:
     run("ss -tulpn | egrep ':(8444|9443|9080|4433)\\b' || true", check=False)
     run("curl -skI https://127.0.0.1:8444/ | head -n 25", check=False)
     run("curl -sI http://127.0.0.1:9080/ | head -n 15", check=False)
-    run("curl -skI https://120.27.219.138:8444/ | head -n 25", check=False)
+    run("curl -skI https://203.0.113.10:8444/ | head -n 25", check=False)
     c.close()
     return 0
 

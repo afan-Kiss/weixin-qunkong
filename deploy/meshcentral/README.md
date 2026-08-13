@@ -15,11 +15,25 @@ Relay-only remote maintenance. Replaces the retired custom desktop path.
 
 ```bash
 cd deploy/meshcentral
-python manage.py prepare    # copies .env.example / config.example.json, creates data|files|backups
+python manage.py bootstrap --public-host <YOUR_MESH_HOST>
+python manage.py doctor
+```
+
+Idempotent bootstrap: prepare → config defaults → validate → compose up →
+read MeshCentral 1.2.4 `loginTokenKey` via `node …/meshcentral --loginTokenKey` →
+sync server-only `wxqk-mesh.env` (and `/etc/wxqk/mesh.env` when permitted).
+
+Never prints the full login key (only `configured=true length=… fingerprint=…`).
+
+Manual steps still available:
+
+```bash
+python manage.py prepare
 # edit .env + config.json (Cert, allowedFramingOrigins, hostname)
 python manage.py validate
-python manage.py up         # docker compose up -d
+python manage.py up
 python manage.py status
+python manage.py gen-secret --write ./wxqk-mesh.env   # no stdout secret unless --show-secret
 ```
 
 Manual equivalent:
@@ -49,7 +63,9 @@ On the MeshCentral host (after first start):
 docker compose exec meshcentral node node_modules/meshcentral --loginTokenKey
 ```
 
-Put the hex into wxqk env as `WXQK_MESH_LOGIN_KEY` (alias `WXQK_MESH_SECRET`). Never put it in the Electron renderer or git.
+Put the hex into **wxqk server** env as `WXQK_MESH_LOGIN_KEY` (alias `WXQK_MESH_SECRET`) —
+preferably via `python manage.py bootstrap` which writes `wxqk-mesh.env` / `/etc/wxqk/mesh.env`.
+Never put it in the Electron renderer, portable client, git, or chat.
 
 Cookies minted by wxqk include MeshCentral `expire` (minutes, default 30 via `WXQK_MESH_TOKEN_EXPIRE_MIN`). Without `expire`, MeshCentral only accepts ~2 minutes.
 

@@ -73,7 +73,7 @@ def main() -> int:
     run(
         "ok=0; "
         "while read -r MID; do "
-        "  for MS in 'wss://120.27.219.138:4433/agent.ashx' 'wss://120.27.219.138:8444/agent.ashx'; do "
+        "  for MS in 'wss://203.0.113.10:4433/agent.ashx' 'wss://203.0.113.10:8444/agent.ashx'; do "
         "    echo TRY \"$MID\" \"$MS\"; "
         "    if docker exec -e MID=\"$MID\" -e MS=\"$MS\" wxqk-meshcentral node /tmp/gen_msh.js; then "
         "      docker cp wxqk-meshcentral:/tmp/out.msh /opt/wxqk/meshcentral/agent-staging/meshagent.msh; "

@@ -12,7 +12,7 @@ import paramiko
 from deploy import EXTRA_PY
 from deploy_rd_portal_888 import NGINX_PORT_CONF, PORTAL_HTML
 
-HOST = os.environ.get("WXQK_SSH_HOST", "120.27.219.138")
+HOST = os.environ.get("WXQK_SSH_HOST") or "203.0.113.10"
 USER = os.environ.get("WXQK_SSH_USER", "root")
 PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or None
 PUBLIC_HTTPS = os.environ.get("WXQK_PUBLIC_HTTPS", f"https://{HOST}:8443/wxqk").rstrip("/")

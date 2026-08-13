@@ -41,6 +41,10 @@ server/**/data/
 # MeshCentral local deploy artifacts / Agent pairing (never commit production)
 deploy/meshcentral/.env
 deploy/meshcentral/config.json
+deploy/meshcentral/wxqk-mesh.env
+deploy/meshcentral/data/
+deploy/meshcentral/files/
+deploy/meshcentral/backups/
 deploy/meshcentral/data/
 deploy/meshcentral/files/
 deploy/meshcentral/backups/

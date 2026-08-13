@@ -80,8 +80,8 @@ def main() -> int:
     # Probe agent download endpoints (common ids) without auth
     run(
         "for id in 1 2 3 4 5 6 7 8 14 16; do "
-        "code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve 120.27.219.138:8444:127.0.0.1 "
-        "'https://120.27.219.138:8444/meshagents?id='$id); "
+        "code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve 203.0.113.10:8444:127.0.0.1 "
+        "'https://203.0.113.10:8444/meshagents?id='$id); "
         "echo id=$id code=$code; done",
         check=False,
     )

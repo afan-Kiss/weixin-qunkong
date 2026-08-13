@@ -152,7 +152,7 @@ def publish_targeted_release(
     file_name: str = "",
     download_url: str = "",
     seed_b64: str = "",
-    public_base_url: str = "https://120.27.219.138:8443/wxqk",
+    public_base_url: str = "https://mesh.example.invalid/wxqk",
 ) -> dict[str, Any]:
     """Publish a package only for selected clientIds; keep global stable manifest unchanged."""
     targets = [str(x).strip() for x in (target_client_ids or []) if str(x).strip()]
@@ -772,7 +772,7 @@ def publish_release(
     file_name: str = "",
     download_url: str = "",
     seed_b64: str = "",
-    public_base_url: str = "https://120.27.219.138:8443/wxqk",
+    public_base_url: str = "https://mesh.example.invalid/wxqk",
 ) -> dict[str, Any]:
     bid = _safe_build_id(build_id)
     if not bid:

@@ -98,8 +98,8 @@ TOKEN_TTL = _parse_admin_token_ttl()
 ONLINE_TTL = 90  # seconds
 DATA_DIR = Path(_env("WXQK_DATA", "FACAI888_DATA", "SIREN_DATA", default="/opt/wxqk/data"))
 PUBLIC_BASE_URL = str(
-    _env("FACAI888_PUBLIC_BASE_URL", "WXQK_PUBLIC_BASE_URL", default="https://120.27.219.138:8443/wxqk") or ""
-).strip().rstrip("/") or "https://120.27.219.138:8443/wxqk"
+    _env("FACAI888_PUBLIC_BASE_URL", "WXQK_PUBLIC_BASE_URL", default="https://mesh.example.invalid/wxqk") or ""
+).strip().rstrip("/") or "https://mesh.example.invalid/wxqk"
 _TRUSTED_PROXIES_RAW = str(_env("FACAI888_TRUSTED_PROXIES", "SIREN_TRUSTED_PROXIES", default="127.0.0.1,::1"))
 LOG_DIR = DATA_DIR / "logs"
 META_DIR = DATA_DIR / "clients"
@@ -1931,10 +1931,16 @@ class Handler(BaseHTTPRequestHandler):
         allowed_origins = {
             "https://xiangyuzhubao.xyz",
             "https://www.xiangyuzhubao.xyz",
-            "https://120.27.219.138:8443",
-            "http://120.27.219.138",
-            "http://120.27.219.138:888",
+            "https://mesh.example.invalid",
+            "http://127.0.0.1",
+            "http://localhost",
+            "http://localhost:888",
         }
+        # Extra origins from server env (comma-separated), never hardcode production IPs in source.
+        for extra in str(os.environ.get("WXQK_CORS_ORIGINS") or "").split(","):
+            e = extra.strip()
+            if e:
+                allowed_origins.add(e)
         if origin in allowed_origins:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")

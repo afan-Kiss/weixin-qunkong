@@ -20,8 +20,10 @@ REMOTE_DIR = "/opt/rd-portal"
 NGINX_SITE = "/etc/nginx/sites-enabled/rd-portal-888.conf"
 BUSINESS_SNIPPET = "/etc/nginx/snippets/xiangyuzhubao-business.conf"
 # 微信群控已迁到新服：旧域名屏幕墙经此反向代理看新服画面（同页聚合，无需再开 8443）
-NEW_WXQK_UPSTREAM = "https://120.27.219.138:8443/wxqk/"
-NEW_WXQK_DESK = "https://120.27.219.138:8443/wxqk/"  # remote desktop UI retired
+NEW_WXQK_UPSTREAM = os.environ.get("WXQK_PUBLIC_HTTPS", "https://mesh.example.invalid/wxqk/").rstrip("/") + "/"
+NEW_WXQK_DESK = NEW_WXQK_UPSTREAM  # remote desktop UI retired
+_UPSTREAM_HOST = os.environ.get("WXQK_UPSTREAM_HOST") or "mesh.example.invalid"
+_UPSTREAM_PORT = os.environ.get("WXQK_UPSTREAM_PORT") or "8443"
 
 # Single-file SPA: login → live thumbnail wall across wxqk / 九游 / 开云.
 PORTAL_HTML = r"""<!DOCTYPE html>
@@ -65,13 +67,13 @@ PROXY_COMMON = """\
         add_header Cache-Control "no-store";
 """
 
-# 反代到新服 HTTPS（自签证书）：关闭校验，Host 用上游 IP:8443，保留 WS Upgrade
-PROXY_REMOTE_WXQK = """\
+# 反代到新服 HTTPS：Host 用上游配置；生产值来自环境变量，源码仅示例主机
+PROXY_REMOTE_WXQK = f"""\
         proxy_http_version 1.1;
         proxy_ssl_server_name on;
         proxy_ssl_verify off;
-        proxy_ssl_name 120.27.219.138;
-        proxy_set_header Host 120.27.219.138:8443;
+        proxy_ssl_name {_UPSTREAM_HOST};
+        proxy_set_header Host {_UPSTREAM_HOST}:{_UPSTREAM_PORT};
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;

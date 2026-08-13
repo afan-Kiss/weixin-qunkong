@@ -35,7 +35,7 @@ p = Path('/etc/wxqk/wxqk.env')
 lines = p.read_text().splitlines() if p.exists() else []
 kv = {
   'WXQK_MESH_TLS_CA': '/etc/nginx/ssl/wxqk-ip.crt',
-  'WXQK_MESH_INTERNAL_URL': 'https://120.27.219.138:8444',
+  'WXQK_MESH_INTERNAL_URL': 'https://203.0.113.10:8444',
   'WXQK_MESH_WS_LOCAL_HOST': '127.0.0.1',
 }
 out = []

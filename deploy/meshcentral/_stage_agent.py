@@ -25,7 +25,7 @@ def open_ws(style='control'):
     token = mc.mint_login_token('user//admin', style=style, expire_min=30)
     # Prefer nginx TLS with known cert; fallback to TlsOffload plain HTTP
     urls = [
-        'wss://120.27.219.138:8444/control.ashx?auth=' + token,
+        'wss://203.0.113.10:8444/control.ashx?auth=' + token,
         'ws://127.0.0.1:9443/control.ashx?auth=' + token,
     ]
     last=None
@@ -37,7 +37,7 @@ def open_ws(style='control'):
                 ctx.load_verify_locations('/etc/nginx/ssl/wxqk-ip.crt')
                 # IP cert may not match hostname verification perfectly — still verify cert chain
                 try:
-                    ws = websocket.create_connection(url, timeout=20, sslopt={"context": ctx, "server_hostname": "120.27.219.138"})
+                    ws = websocket.create_connection(url, timeout=20, sslopt={"context": ctx, "server_hostname": "203.0.113.10"})
                 except Exception:
                     # cert is self-signed for IP; load as trusted and disable hostname only if needed
                     ctx2 = ssl.create_default_context()

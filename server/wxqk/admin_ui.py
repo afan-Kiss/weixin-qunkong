@@ -1166,35 +1166,53 @@ async function refreshDesktopMeshStatus() {
   const online = findOnlineByClientId(cid) || {};
   const label = displayClientLabel(online);
   const ip = String(online.ip || '').trim() || '—';
+  let serverBanner = '';
+  try {
+    const health = await api('/api/mesh/health');
+    if (health && health.enabled === false) {
+      serverBanner = '<div style="margin-bottom:10px"><span class="badge badge-deny">远程维护服务器未配置</span></div>';
+    } else if (health && health.meshReachable === false) {
+      serverBanner = '<div style="margin-bottom:10px"><span class="badge badge-deny">远程维护服务器不可达</span></div>';
+    } else if (health && health.loginKeyConfigured === false) {
+      serverBanner = '<div style="margin-bottom:10px"><span class="badge badge-deny">远程维护服务器未配置</span></div>';
+    } else if (health && health.ok) {
+      serverBanner = '<div style="margin-bottom:10px"><span class="badge badge-ok">远程维护服务正常</span></div>';
+    }
+  } catch (_) { /* device status still useful */ }
   try {
     const st = await api('/api/mesh/status?clientId=' + encodeURIComponent(cid));
     const ready = !!(st.ready || st.remoteState === 'ready');
     const remoteState = String(st.remoteState || '');
     const userMsg = st.userMessage || st.message || '';
     let statusLabel = '';
-    if (ready) {
-      statusLabel = '<span class="badge badge-ok">远程服务已就绪</span>';
+    if (serverBanner.indexOf('未配置') >= 0 || serverBanner.indexOf('不可达') >= 0) {
+      // Server-level problem dominates device wording
+      statusLabel = '<span class="badge badge-neutral">等待远程维护服务器就绪…</span>';
+    } else if (ready) {
+      statusLabel = '<span class="badge badge-ok">设备已就绪</span>';
     } else if (remoteState === 'bound_offline' || st.code === 'MESH_AGENT_OFFLINE') {
-      statusLabel = '<span class="badge badge-neutral">设备当前离线</span>';
+      statusLabel = '<span class="badge badge-neutral">设备 Agent 离线</span>';
     } else if (remoteState === 'unverified' || st.code === 'MESH_SYNC_FAILED' || st.code === 'MESH_WS_ERROR') {
       statusLabel = '<span class="badge badge-neutral">正在等待设备上线…</span>';
     } else if (remoteState === 'preparing' || st.code === 'MESH_PREPARING') {
-      statusLabel = '<span class="badge badge-neutral">正在启动远程服务…</span>';
+      statusLabel = '<span class="badge badge-neutral">设备 Agent 正在启动…</span>';
     } else if (remoteState === 'unbound' || st.code === 'MESH_NO_MATCH' || st.code === 'MESH_NODE_MISSING') {
-      statusLabel = '<span class="badge badge-neutral">正在绑定设备…</span>';
+      statusLabel = '<span class="badge badge-neutral">设备尚未绑定</span>';
     } else if (st.ok === false && st.code === 'MESH_DISABLED') {
-      statusLabel = '<span class="badge badge-deny">远程服务不可用</span>';
+      statusLabel = '<span class="badge badge-deny">远程维护服务器未配置</span>';
     } else if (st.ok === false || remoteState === 'error') {
       statusLabel = '<span class="badge badge-deny">远程服务准备失败</span>';
     } else {
       statusLabel = '<span class="badge badge-neutral">' + escHtml(userMsg || '正在准备远程服务…') + '</span>';
     }
-    info.innerHTML = '<div><b>设备</b><div>' + escHtml(label) + '</div>'
+    info.innerHTML = serverBanner
+      + '<div><b>设备</b><div>' + escHtml(label) + '</div>'
       + '<div class="muted" style="margin-top:4px;font-size:12px">IP ' + escHtml(ip) + '</div></div>'
       + '<div style="margin-top:10px"><b>状态</b><div>' + statusLabel + '</div></div>'
       + (userMsg && ready ? '<div style="margin-top:10px" class="muted">' + escHtml(userMsg) + '</div>' : '');
   } catch (e) {
-    info.innerHTML = '<span class="badge badge-deny">远程服务准备失败</span><div class="muted" style="margin-top:8px">' + escHtml(e.message || e) + '</div>';
+    info.innerHTML = serverBanner
+      + '<span class="badge badge-deny">远程服务准备失败</span><div class="muted" style="margin-top:8px">' + escHtml(e.message || e) + '</div>';
   }
 }
 function friendlyMeshError(data) {

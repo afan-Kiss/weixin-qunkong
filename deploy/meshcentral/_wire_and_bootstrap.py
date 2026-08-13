@@ -13,7 +13,7 @@ import paramiko
 sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 REMOTE = "/opt/wxqk/meshcentral"
-PUBLIC = "https://120.27.219.138:8444"
+PUBLIC = "https://203.0.113.10:8444"
 
 
 def main() -> int:

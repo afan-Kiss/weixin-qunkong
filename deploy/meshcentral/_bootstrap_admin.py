@@ -63,7 +63,7 @@ def main() -> int:
             "user=admin\n"
             "userid=user//admin\n"
             f"password={new_pass}\n"
-            "url=https://120.27.219.138:8444\n"
+            "url=https://203.0.113.10:8444\n"
             "note=first web signup becomes site admin if no users yet\n"
         )
     sftp.chmod("/opt/wxqk/meshcentral/ADMIN_BOOTSTRAP.txt", 0o600)
@@ -95,7 +95,7 @@ def main() -> int:
 
     # Public HTTPS via Host header on loopback (avoid hairpin hang)
     run(
-        "curl -skI --resolve 120.27.219.138:8444:127.0.0.1 https://120.27.219.138:8444/ | head -n 20",
+        "curl -skI --resolve 203.0.113.10:8444:127.0.0.1 https://203.0.113.10:8444/ | head -n 20",
         check=False,
     )
     # mesh health needs auth cookie — check unauthenticated code path vs with fake

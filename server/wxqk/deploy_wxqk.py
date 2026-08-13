@@ -15,7 +15,7 @@ import paramiko
 from deploy import EXTRA_PY, PASSWORD, USER, VERSION_POLICY
 
 HERE = Path(__file__).resolve().parent
-HOST = os.environ.get("WXQK_SSH_HOST", "120.27.219.138").strip()
+HOST = os.environ.get("WXQK_SSH_HOST", "").strip() or "203.0.113.10"
 REMOTE_DIR = "/opt/wxqk"
 SERVICE = "wxqk"
 PORT = 4812
@@ -36,7 +36,7 @@ Environment=FACAI888_PORT={PORT}
 Environment=FACAI888_BIND=127.0.0.1
 Environment=FACAI888_DATA={REMOTE_DIR}/data
 Environment=FACAI888_PUBLIC_PREFIX={PUBLIC_PREFIX}
-Environment=FACAI888_PUBLIC_BASE_URL=https://120.27.219.138:8443{PUBLIC_PREFIX}
+Environment=FACAI888_PUBLIC_BASE_URL=https://mesh.example.invalid{PUBLIC_PREFIX}
 Environment=FACAI888_AUTO_ACTIVATE_DEVICES=1
 Environment=FACAI888_PUBLISH_KEY_B64=TIwR8GPTQsAO49IXWjfXok0xHouoHGFbkTsi5B4Pf9A=
 ExecStart=/usr/bin/python3 {REMOTE_DIR}/server.py

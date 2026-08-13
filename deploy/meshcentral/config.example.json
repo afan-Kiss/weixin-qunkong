@@ -35,7 +35,7 @@
         "file://",
         "app://."
       ],
-      "certUrl": "https://120.27.219.138:8444/"
+      "certUrl": "https://mesh.example.invalid:8444/"
     }
   }
 }

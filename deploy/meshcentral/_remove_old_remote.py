@@ -10,7 +10,7 @@ import paramiko
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkcore.request import CommonRequest
 
-HOST = os.environ.get("WXQK_SSH_HOST", "120.27.219.138").strip()
+HOST = os.environ.get("WXQK_SSH_HOST", "203.0.113.10").strip()
 USER = os.environ.get("WXQK_SSH_USER", "root").strip()
 PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or None
 AK = os.environ.get("ALIYUN_ACCESS_KEY_ID") or ""
