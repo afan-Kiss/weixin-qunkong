@@ -117,8 +117,14 @@ class RemoteSecurityTest(unittest.TestCase):
         self.assertIn("embedUrl", text)
         self.assertIn("friendlyMeshError", text)
         self.assertIn("远程服务已就绪", text)
+        self.assertIn("displayClientLabel", text)
+        self.assertIn("looksLikeInternalId", text)
+        self.assertIn('placeholder="搜索账号 / IP"', text)
         self.assertNotIn("设备未绑定 Mesh 节点", text)
         self.assertNotIn("远程桌面已退役", text)
+        # Desktop list / status must not render raw clientId as primary label
+        self.assertNotIn('escHtml(cid) + \'</div>\'', text)
+        self.assertNotIn("class=\"mono\">' + escHtml(cid)", text)
 
     def test_sync_snapshot_is_bounded(self):
         payload = {

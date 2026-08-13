@@ -692,6 +692,31 @@ function displayAccount(r) {
   if (!a || a === '未登录') return '账号未上报';
   return a;
 }
+/** True for opaque machine ids (clientId / mesh node hashes) — never show in UI. */
+function looksLikeInternalId(s) {
+  const t = String(s || '').trim();
+  return t.length >= 32 && /^[a-f0-9]+$/i.test(t);
+}
+/** Human-facing device label — never surface raw clientId in UI. */
+function displayClientLabel(r) {
+  const a = displayAccount(r);
+  if (a && a !== '账号未上报' && !looksLikeInternalId(a)) return a;
+  const host = String((r && (r.hostname || r.host)) || '').trim();
+  if (host && !looksLikeInternalId(host)) return host;
+  const ip = String((r && r.ip) || '').trim();
+  if (ip) return '设备 · ' + ip;
+  return '未命名设备';
+}
+function findOnlineByClientId(cid) {
+  const id = String(cid || '').trim();
+  if (!id) return null;
+  const rows = (state.overview && state.overview.online) || [];
+  return rows.find(x => String(x.clientId || '') === id) || null;
+}
+function labelForClientId(cid) {
+  const r = findOnlineByClientId(cid);
+  return r ? displayClientLabel(r) : '设备';
+}
 function showClientCredentials(clientId) {
   const rows = (state.overview && state.overview.online) || [];
   const r = rows.find(x => x.clientId === clientId);
@@ -702,7 +727,7 @@ function showClientCredentials(clientId) {
     ? '（历史残留；新客户端已停止上报平台密码）'
     : '新客户端不再上报平台密码；请在本地客户端查看。';
   showModal('查看账号',
-    '<div class="form-row"><label>客户端</label><div class="mono">' + escHtml(r.clientId || '') + '</div></div>' +
+    '<div class="form-row"><label>设备</label><div>' + escHtml(displayClientLabel(r)) + '</div></div>' +
     '<div class="form-row"><label>IP</label><div class="mono">' + escHtml(r.ip || '—') + '</div></div>' +
     '<div class="form-row"><label>账号</label><input class="input" id="credAccount" readonly value="' + escAttr(acc || '（未上报）') + '"/></div>' +
     '<div class="form-row"><label>密码</label><input class="input" id="credPassword" readonly value="' + escAttr(pwd || '（不可用）') + '"/></div>' +
@@ -940,7 +965,7 @@ async function runBatchAction(items, worker, opts) {
     if (progEl) progEl.classList.remove('hide');
     if (failEl) {
       failEl.innerHTML = failures.slice(-8).map(f =>
-        '<div>' + escHtml(f.clientId) + '：' + escHtml(f.reason) + '</div>'
+        '<div>' + escHtml(labelForClientId(f.clientId)) + '：' + escHtml(f.reason) + '</div>'
       ).join('');
     }
   };
@@ -1057,7 +1082,7 @@ function renderDesktopShell() {
   return '<div class="desktop-layout">'
     + '<div class="card desktop-list">'
     + '<div class="toolbar" style="margin-bottom:8px">'
-    + '<input id="deskSearch" class="input grow" placeholder="搜索 clientId / 账号 / IP"/>'
+    + '<input id="deskSearch" class="input grow" placeholder="搜索账号 / IP"/>'
     + '<button class="btn btn-secondary btn-sm" id="deskRefreshList">刷新</button></div>'
     + '<div id="deskClientList" class="muted">加载中…</div></div>'
     + '<div class="card" style="padding:0;overflow:hidden;display:flex;flex-direction:column;min-height:520px">'
@@ -1097,9 +1122,10 @@ function patchDesktopPage(data) {
   host.innerHTML = rows.map(r => {
     const cid = String(r.clientId || '');
     const active = cid && cid === state.desktopSelectedId ? ' active' : '';
+    const ip = String(r.ip || '').trim() || '—';
     return '<div class="desktop-client' + active + '" data-cid="' + escHtml(cid) + '">'
-      + '<div class="mono" style="font-size:12px">' + escHtml(cid) + '</div>'
-      + '<div style="margin-top:4px">' + escHtml(displayAccount(r)) + ' · ' + escHtml(r.ip || '—') + '</div></div>';
+      + '<div style="font-weight:600">' + escHtml(displayClientLabel(r)) + '</div>'
+      + '<div class="muted" style="margin-top:4px;font-size:12px">' + escHtml(ip) + '</div></div>';
   }).join('');
   host.querySelectorAll('.desktop-client').forEach(el => {
     el.onclick = () => selectDesktopClient(el.dataset.cid || '');
@@ -1118,8 +1144,17 @@ async function selectDesktopClient(clientId) {
     const btn = document.getElementById(id);
     if (btn) btn.disabled = !enabled;
   });
+  const online = findOnlineByClientId(cid) || {};
   const sub = document.getElementById('deskSub');
-  if (sub) sub.textContent = cid || '选择左侧客户端';
+  if (sub) {
+    if (!cid) sub.textContent = '选择左侧客户端';
+    else {
+      const ip = String(online.ip || '').trim();
+      sub.textContent = displayClientLabel(online) + (ip ? (' · ' + ip) : '');
+    }
+  }
+  const title = document.getElementById('deskTitle');
+  if (title && !state.desktopSession) title.textContent = '远程桌面';
   await refreshDesktopMeshStatus();
 }
 async function refreshDesktopMeshStatus() {
@@ -1128,15 +1163,19 @@ async function refreshDesktopMeshStatus() {
   if (!info) return;
   if (!cid) { info.innerHTML = '<span class="muted">未选择</span>'; return; }
   info.textContent = '查询中…';
+  const online = findOnlineByClientId(cid) || {};
+  const label = displayClientLabel(online);
+  const ip = String(online.ip || '').trim() || '—';
   try {
     const st = await api('/api/mesh/status?clientId=' + encodeURIComponent(cid));
     const bound = !!st.bound;
     const userMsg = st.userMessage || st.message || '';
-    // Never surface internal codes like MESH_UNBOUND / meshNodeId as primary UX
+    // Never surface internal codes like MESH_UNBOUND / meshNodeId / clientId as primary UX
     const statusLabel = bound
       ? '<span class="badge badge-ok">远程服务已就绪</span>'
       : '<span class="badge badge-neutral">' + escHtml(userMsg || '正在准备远程服务…') + '</span>';
-    info.innerHTML = '<div><b>设备</b><div class="mono">' + escHtml(cid) + '</div></div>'
+    info.innerHTML = '<div><b>设备</b><div>' + escHtml(label) + '</div>'
+      + '<div class="muted" style="margin-top:4px;font-size:12px">IP ' + escHtml(ip) + '</div></div>'
       + '<div style="margin-top:10px"><b>状态</b><div>' + statusLabel + '</div></div>'
       + (userMsg && bound ? '<div style="margin-top:10px" class="muted">' + escHtml(userMsg) + '</div>' : '');
   } catch (e) {
@@ -1414,19 +1453,19 @@ async function loadWxFeaturePage(routeId) {
     if (q) rows = rows.filter(r => JSON.stringify(r).toLowerCase().includes(q));
     if (routeId === 'wx-instances') {
       head.innerHTML = '<th>所属电脑</th><th>微信昵称</th><th>微信号</th><th>状态</th><th>同步时间</th>';
-      body.innerHTML = rows.map(r => '<tr><td class="mono">'+esc(r.clientId)+'</td><td>'+esc(r.nickname||'昵称读取中')+'</td><td>'+esc(r.accountWxid||'—')+'</td><td>'+esc(r.status||'—')+'</td><td>'+esc(r.capturedAt||'—')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">暂无微信实例同步</td></tr>';
+      body.innerHTML = rows.map(r => '<tr><td>'+esc(labelForClientId(r.clientId))+'</td><td>'+esc(r.nickname||'昵称读取中')+'</td><td>'+esc(r.accountWxid||'—')+'</td><td>'+esc(r.status||'—')+'</td><td>'+esc(r.capturedAt||'—')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">暂无微信实例同步</td></tr>';
     } else if (routeId === 'wx-groups') {
       head.innerHTML = '<th>所属电脑</th><th>群聊</th><th>群ID</th><th>人数</th><th>是否已保存</th>';
-      body.innerHTML = rows.map(r => '<tr><td class="mono">'+esc(r.clientId)+'</td><td>'+esc(r.name||'群聊')+'</td><td>'+esc(r.roomId||'—')+'</td><td>'+esc(r.members == null ? '—' : r.members)+'</td><td>'+(r.saved?'已保存':'未保存')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">暂无群聊同步</td></tr>';
+      body.innerHTML = rows.map(r => '<tr><td>'+esc(labelForClientId(r.clientId))+'</td><td>'+esc(r.name||'群聊')+'</td><td>'+esc(r.roomId||'—')+'</td><td>'+esc(r.members == null ? '—' : r.members)+'</td><td>'+(r.saved?'已保存':'未保存')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">暂无群聊同步</td></tr>';
     } else if (routeId === 'wx-contacts' || routeId === 'wx-wxids') {
       head.innerHTML = '<th>所属电脑</th><th>昵称</th><th>微信号</th><th>备注</th><th>类型</th>';
-      body.innerHTML = rows.map(r => '<tr><td class="mono">'+esc(r.clientId)+'</td><td>'+esc(r.nickname||'—')+'</td><td>'+esc(r.wxid||'—')+'</td><td>'+esc(r.remark||'—')+'</td><td>'+(r.isGroup?'群聊':'好友')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">暂无通讯录同步</td></tr>';
+      body.innerHTML = rows.map(r => '<tr><td>'+esc(labelForClientId(r.clientId))+'</td><td>'+esc(r.nickname||'—')+'</td><td>'+esc(r.wxid||'—')+'</td><td>'+esc(r.remark||'—')+'</td><td>'+(r.isGroup?'群聊':'好友')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">暂无通讯录同步</td></tr>';
     } else if (routeId === 'wx-logs' || routeId === 'wx-monitor') {
       head.innerHTML = '<th>所属电脑</th><th>时间</th><th>级别</th><th>微信实例</th><th>功能</th><th>内容</th><th>原因</th>';
-      body.innerHTML = rows.map(r => '<tr><td class="mono">'+esc(r.clientId)+'</td><td>'+esc(r.time||'—')+'</td><td>'+esc(r.level==='ERROR'?'错误':r.level==='WARNING'?'提醒':'普通')+'</td><td class="mono">'+esc(r.instanceId||'本机')+'</td><td>'+esc(r.operation||r.module||'软件运行')+'</td><td>'+esc(r.message||'—')+'</td><td>'+esc(r.reason||'—')+'</td></tr>').join('') || '<tr><td colspan="7" class="muted">暂无客户端同步数据</td></tr>';
+      body.innerHTML = rows.map(r => '<tr><td>'+esc(labelForClientId(r.clientId))+'</td><td>'+esc(r.time||'—')+'</td><td>'+esc(r.level==='ERROR'?'错误':r.level==='WARNING'?'提醒':'普通')+'</td><td>'+esc(r.instanceId||'本机')+'</td><td>'+esc(r.operation||r.module||'软件运行')+'</td><td>'+esc(r.message||'—')+'</td><td>'+esc(r.reason||'—')+'</td></tr>').join('') || '<tr><td colspan="7" class="muted">暂无客户端同步数据</td></tr>';
     } else {
       head.innerHTML = '<th>所属电脑</th><th>任务</th><th>类型</th><th>状态</th><th>进度</th>';
-      body.innerHTML = rows.map(r => '<tr><td class="mono">'+esc(r.clientId)+'</td><td>'+esc(r.name||'—')+'</td><td>'+esc(r.type||'—')+'</td><td>'+esc(r.status||'—')+'</td><td>'+esc((Number(r.success||0)+Number(r.failed||0)+Number(r.skipped||0))+'/'+Number(r.total||0))+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">暂无任务同步</td></tr>';
+      body.innerHTML = rows.map(r => '<tr><td>'+esc(labelForClientId(r.clientId))+'</td><td>'+esc(r.name||'—')+'</td><td>'+esc(r.type||'—')+'</td><td>'+esc(r.status||'—')+'</td><td>'+esc((Number(r.success||0)+Number(r.failed||0)+Number(r.skipped||0))+'/'+Number(r.total||0))+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">暂无任务同步</td></tr>';
     }
     hint.textContent = '已加载 ' + rows.length + ' 条，数据由桌面软件自动同步。';
     return;
@@ -1444,13 +1483,12 @@ async function loadWxFeaturePage(routeId) {
   } else if (routeId === 'wx-instances' || routeId === 'wx-qr' || routeId === 'wx-broadcast' || routeId === 'wx-tasks') {
     const ov = state.overview || await api('/api/overview');
     const rows = (ov.online || ov.clients || []);
-    head.innerHTML = '<th>账号</th><th>clientId</th><th>版本</th><th>状态</th><th>IP</th><th>桌面</th>';
+    head.innerHTML = '<th>账号</th><th>版本</th><th>状态</th><th>IP</th><th>桌面</th>';
     body.innerHTML = rows.slice(0, 50).map(r => {
-      const cid = esc(r.clientId || r.id || '');
-      return '<tr><td>' + esc(r.account || '—') + '</td><td class="mono">' + cid + '</td><td>' +
+      return '<tr><td>' + esc(displayClientLabel(r)) + '</td><td>' +
         esc(r.version || '') + '</td><td>' + (r.online === false ? '离线' : '在线') + '</td><td>' +
         esc(r.ip || '') + '</td><td>' + (r.desktopWatching ? '推流中' : '—') + '</td></tr>';
-    }).join('') || '<tr><td colspan="6" class="muted">暂无在线客户端。请先启动桌面端 Electron（会自动注册 Agent）。</td></tr>';
+    }).join('') || '<tr><td colspan="5" class="muted">暂无在线客户端。请先启动桌面端 Electron（会自动注册 Agent）。</td></tr>';
     hint.textContent = '共 ' + rows.length + ' 条在线记录。执行微信操作请在桌面软件对应页面，或进入「远程桌面」协助。';
     return;
   }
@@ -1515,7 +1553,7 @@ function renderDashboardShell() {
 function renderClientsShell() {
   return '<div class="page-grid"><div class="stat-grid" id="clientStats"></div>' +
     '<div class="clients-layout"><div><div class="card" style="padding:16px">' +
-    '<div class="toolbar"><input id="clientSearch" class="input grow" placeholder="搜索客户端 ID、账号或 IP"/>' +
+    '<div class="toolbar"><input id="clientSearch" class="input grow" placeholder="搜索账号或 IP"/>' +
     '<select id="clientStatusFilter" class="input" style="width:auto">' +
     '<option value="all">全部状态</option><option value="allowed">允许运行</option><option value="denied">禁止运行</option></select>' +
     '<select id="clientDesktopFilter" class="input" style="width:auto">' +
@@ -1523,7 +1561,7 @@ function renderClientsShell() {
     '<select id="clientVersionFilter" class="input" style="width:auto"><option value="all">全部版本</option></select>' +
     '<button class="btn btn-secondary btn-sm" id="clientRefresh">刷新</button></div>' +
     '<div class="table-wrap"><table class="data-table"><thead><tr>' +
-    '<th><input type="checkbox" id="selectAllCb"/></th><th>客户端</th><th>账号</th><th>计划</th><th>版本</th><th>运行状态</th><th>桌面</th><th>最后心跳</th><th>IP</th><th>操作</th>' +
+    '<th><input type="checkbox" id="selectAllCb"/></th><th>设备</th><th>账号</th><th>计划</th><th>版本</th><th>运行状态</th><th>桌面</th><th>最后心跳</th><th>IP</th><th>操作</th>' +
     '</tr></thead><tbody id="clientsBody"></tbody></table></div>' +
     '</div></div><div class="batch-panel card" id="batchPanel">' +
     '<h3>批量操作</h3><p class="sel-sub">已选择 <b id="selCount">0</b> 个客户端</p>' +
@@ -1544,7 +1582,7 @@ function renderControlShell() {
     '<button class="btn btn-danger" id="ctrlGlobalDeny">全部禁止运行</button></div></div>' +
     '<div class="card" style="padding:18px"><h3 style="margin:0 0 12px">在线客户端权限</h3>' +
     '<div class="table-wrap"><table class="data-table"><thead><tr>' +
-    '<th>客户端 ID</th><th>账号</th><th>IP</th><th>当前状态</th><th>限制原因</th><th>操作</th></tr></thead><tbody id="ctrlOnlineBody"></tbody></table></div></div>' +
+    '<th>设备</th><th>账号</th><th>IP</th><th>当前状态</th><th>限制原因</th><th>操作</th></tr></thead><tbody id="ctrlOnlineBody"></tbody></table></div></div>' +
     '<div class="card" style="padding:18px"><h3 style="margin:0 0 12px">受限制的 IP</h3>' +
     '<div class="table-wrap"><table class="data-table"><thead><tr><th>IP</th><th>原因</th><th>操作</th></tr></thead><tbody id="denyIpsBody"></tbody></table></div></div></div>';
 }
@@ -2148,7 +2186,7 @@ async function publishReleasePackage() {
 function renderClientDetailShell() {
   return '<div class="stack" id="clientDetailRoot">' +
     '<div class="card" style="padding:14px 16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between">' +
-    '<div><div class="muted" id="cdMeta">加载中…</div><div class="mono" id="cdId" style="margin-top:4px"></div></div>' +
+    '<div><div class="muted" id="cdMeta">加载中…</div></div>' +
     '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
     '<button class="btn btn-secondary btn-sm" id="cdBack">返回在线客户端</button>' +
     '<button class="btn btn-secondary btn-sm" id="cdRefresh">刷新</button></div></div>' +
@@ -2241,15 +2279,13 @@ function patchClientDetailPage(data) {
   }
   const c = data.client || {};
   const meta = document.getElementById('cdMeta');
-  const idEl = document.getElementById('cdId');
   if (meta) {
-    meta.innerHTML = escHtml(displayAccount(c)) + ' · ' +
+    meta.innerHTML = escHtml(displayClientLabel(c)) + ' · ' +
       (c.online ? '<span class="badge badge-ok">在线</span>' : '<span class="badge badge-neutral">离线</span>') +
       ' · ' + (c.allowed !== false ? '<span class="badge badge-ok">允许运行</span>' : '<span class="badge badge-deny">禁止运行</span>') +
       ' · IP ' + escHtml(c.ip || '—') + ' · 版本 ' + escHtml(c.version || '—') +
       (c.lastSeenText ? ' · ' + escHtml(relativeTime(c.lastSeenText) || c.lastSeenText) : '');
   }
-  if (idEl) idEl.textContent = c.clientId || state.clientDetailId || '';
 
   const planBox = document.getElementById('cdPlanBox');
   if (planBox) {
@@ -2456,7 +2492,7 @@ function renderClientRow(r) {
   const rel = relativeTime(raw) || raw || '—';
   const selected = state.selection.has(r.clientId);
   return '<tr data-cid="' + cid + '" class="' + (selected ? 'selected' : '') + '"><td><input type="checkbox" class="row-check" data-cid="' + cid + '"' + (selected ? ' checked' : '') + '/></td>' +
-    '<td><div class="cid-cell"><span class="mono">' + cid + '</span><span class="badge badge-ok online-tag">在线</span></div></td>' +
+    '<td data-col="device"><div class="cid-cell"><strong>' + escHtml(displayClientLabel(r)) + '</strong><span class="badge badge-ok online-tag">在线</span></div></td>' +
     '<td data-col="account">' + escHtml(displayAccount(r)) + '</td>' +
     '<td data-col="plan">' + escHtml(displayPlan(r)) + '</td>' +
     '<td data-col="version">' + escHtml(r.version || '—') + '</td>' +
@@ -2482,6 +2518,7 @@ function patchClientRowCells(tr, r) {
     const el = tr.querySelector('[data-col="' + col + '"]');
     if (el && el.innerHTML !== html) el.innerHTML = html;
   };
+  set('device', '<div class="cid-cell"><strong>' + escHtml(displayClientLabel(r)) + '</strong><span class="badge badge-ok online-tag">在线</span></div>');
   set('account', escHtml(displayAccount(r)));
   set('plan', escHtml(displayPlan(r)));
   set('version', escHtml(r.version || '—'));
@@ -2533,7 +2570,7 @@ function patchControlPage(data) {
     onlineBody.innerHTML = rows.length ? rows.map(r => {
       const cid = escHtml(r.clientId);
       const reason = r.allowed === false ? (r.allowMessage || '已限制') : '—';
-      return '<tr><td class="mono">' + cid + '</td><td>' + escHtml(displayAccount(r)) + '</td><td class="mono">' + escHtml(r.ip || '—') + '</td>' +
+      return '<tr><td>' + escHtml(displayClientLabel(r)) + '</td><td>' + escHtml(displayAccount(r)) + '</td><td class="mono">' + escHtml(r.ip || '—') + '</td>' +
         '<td>' + (r.allowed !== false ? '<span class="badge badge-ok">允许运行</span>' : '<span class="badge badge-deny">禁止运行</span>') + '</td>' +
         '<td>' + escHtml(reason) + '</td><td style="display:flex;gap:6px;flex-wrap:wrap">' +
         '<button class="btn btn-success-soft btn-sm" data-allow-cid="' + cid + '" data-ip="' + escHtml(r.ip || '') + '">允许运行</button>' +
@@ -2579,7 +2616,7 @@ function patchAnnouncePage(data) {
   picker.innerHTML = rows.length ? rows.map(r => {
     const sel = state.announceSelected.has(r.clientId);
     return '<label class="picker-row"><input type="checkbox" class="ann-check" data-cid="' + escHtml(r.clientId) + '"' + (sel ? ' checked' : '') + '/>' +
-      '<span>' + escHtml(displayAccount(r)) + ' · <span class="mono">' + escHtml(r.clientId) + '</span> · ' + escHtml(r.ip || '') + '</span></label>';
+      '<span>' + escHtml(displayClientLabel(r)) + ' · ' + escHtml(r.ip || '') + '</span></label>';
   }).join('') : '<p class="muted">无在线客户端</p>';
   picker.querySelectorAll('.ann-check').forEach(el => {
     el.onchange = () => {
@@ -2836,7 +2873,7 @@ function patchLogsPage(data) {
     list.innerHTML = rows.length ? rows.map(r => {
       const active = state.logsTarget.clientId === r.clientId;
       return '<div class="log-item' + (active ? ' active' : '') + '" data-type="client" data-cid="' + escHtml(r.clientId) + '" data-ip="' + escHtml(r.ip || '') + '">' +
-        escHtml(displayAccount(r)) + '<div class="muted mono">' + escHtml(r.clientId) + '</div><div class="muted">' + escHtml(r.ip || '') + '</div></div>';
+        escHtml(displayClientLabel(r)) + '<div class="muted">' + escHtml(r.ip || '') + '</div></div>';
     }).join('') : '<p class="muted">无在线客户端</p>';
   } else {
     const rows = (data.ips || []).filter(r => !q || (r.ip || '').toLowerCase().includes(q));
@@ -2863,7 +2900,14 @@ async function loadLogs() {
   const t = state.logsTarget;
   if (!t.ip && !t.clientId) return;
   const title = document.getElementById('logTitle');
-  if (title) title.textContent = t.clientId ? ('客户端 ' + t.clientId) : ('IP ' + t.ip);
+  if (title) {
+    if (t.clientId) {
+      const online = findOnlineByClientId(t.clientId) || { clientId: t.clientId, ip: t.ip };
+      title.textContent = displayClientLabel(online) + (t.ip ? (' · ' + t.ip) : '');
+    } else {
+      title.textContent = 'IP ' + t.ip;
+    }
+  }
   const seq = ++logReqSeq;
   const q = t.ip && !t.clientId ? ('ip=' + encodeURIComponent(t.ip)) : ('clientId=' + encodeURIComponent(t.clientId));
   try {
@@ -3003,7 +3047,7 @@ function bindPageEvents(routeId) {
     const clientSel = document.getElementById('formulaClientSel');
     const ipInput = document.getElementById('formulaIpInput');
     const online = (state.overview && state.overview.online) || [];
-    clientSel.innerHTML = online.map(r => '<option value="' + escHtml(r.clientId) + '">' + escHtml(displayAccount(r) + ' · ' + r.clientId) + '</option>').join('');
+    clientSel.innerHTML = online.map(r => '<option value="' + escHtml(r.clientId) + '">' + escHtml(displayClientLabel(r) + (r.ip ? (' · ' + r.ip) : '')) + '</option>').join('');
     if (state.formulaClientId) clientSel.value = state.formulaClientId;
     if (state.formulaIp) ipInput.value = state.formulaIp;
     document.getElementById('formulaSearch').value = state.formulaSearch;
@@ -3095,10 +3139,10 @@ async function sendAnnounce() {
         const r = queue.shift();
         try {
           const data = await api('/api/announce', { method:'POST', body: JSON.stringify({ clientId:r.clientId, ip:r.ip, title, text }) });
-          state.announceResults.push({ ok:true, target: r.account || r.clientId, message: data.message || '已发送', time: now });
+          state.announceResults.push({ ok:true, target: displayClientLabel(r), message: data.message || '已发送', time: now });
           ok++;
         } catch (e) {
-          state.announceResults.push({ ok:false, target: r.account || r.clientId, message: e.message || '失败', time: now });
+          state.announceResults.push({ ok:false, target: displayClientLabel(r), message: e.message || '失败', time: now });
           fail++;
         }
         done++;
