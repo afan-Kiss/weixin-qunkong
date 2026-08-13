@@ -2007,7 +2007,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not client_id:
                     client_id = str(self.headers.get("X-Client-Id") or "").strip()
                 ip = client_ip(self)
-                man, sig = um.resolve_manifest_for_client(
+                man, sig, sig_v2 = um.resolve_manifest_for_client(
                     DATA_DIR,
                     client_id=client_id,
                     client_ip=ip,
@@ -2018,6 +2018,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "manifest": man,
                     "signature": sig,
+                    "signatureV2": sig_v2 or um.load_signature_v2_hex(DATA_DIR),
                     "publicKey": um.public_key_b64(DATA_DIR),
                 })
             except Exception as e:

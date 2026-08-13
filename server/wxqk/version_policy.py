@@ -216,7 +216,7 @@ def evaluate_client(meta: dict[str, Any], pol: dict[str, Any] | None = None, dat
         "protocolVersion": frozenset({"facai888-v1", "app-v1"}),
         "securityProtocolVersion": frozenset({"security-v1", "sec-v1"}),
         "desktopProtocolVersion": frozenset({"desktop-webrtc-v1", "desk-v1", "meshcentral-v1"}),
-        "updaterProtocolVersion": frozenset({"updater-v1", "upd-v1"}),
+        "updaterProtocolVersion": frozenset({"updater-v1", "upd-v1", "updater-v2", "upd-v2"}),
     }
     expect = [
         ("protocolVersion", proto, pol.get("protocolVersion")),

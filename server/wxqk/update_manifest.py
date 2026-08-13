@@ -15,6 +15,33 @@ from typing import Any
 _lock = threading.RLock()
 
 SIGNING_KEY_ID = "facai888-v1"
+UPDATER_PROTOCOL_V1 = "updater-v1"
+UPDATER_PROTOCOL_V2 = "updater-v2"
+
+
+def normalize_target_client_ids(raw) -> list[str]:
+    """Sort + dedupe target client ids for stable v2 signatures."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw or []:
+        cid = str(item or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(cid)
+    out.sort()
+    return out
+
+
+def manifest_uses_v2(man: dict[str, Any]) -> bool:
+    raw = str((man or {}).get("updaterProtocolVersion") or "").strip().lower()
+    if raw in (UPDATER_PROTOCOL_V2, "upd-v2"):
+        return True
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    try:
+        return int(digits) >= 2 if digits else False
+    except Exception:
+        return False
 
 
 def _root(data_dir: Path) -> Path:
@@ -57,6 +84,13 @@ def load_signature_hex(data_dir: Path) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
+def load_signature_v2_hex(data_dir: Path) -> str:
+    path = _root(data_dir) / "release-manifest.sig.v2"
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
 def _targeted_path(data_dir: Path) -> Path:
     return _root(data_dir) / "targeted-releases.json"
 
@@ -89,14 +123,15 @@ def resolve_manifest_for_client(
     client_ip: str = "",
     online_lookup=None,
     clients_by_ip=None,
-) -> tuple[dict[str, Any], str]:
-    """Return (manifest, signature). Targeted override wins for matching clientId/IP."""
+) -> tuple[dict[str, Any], str, str]:
+    """Return (manifest, signature_v1, signature_v2). Targeted override wins for matching clientId/IP."""
     stable = load_manifest(data_dir)
     stable_sig = load_signature_hex(data_dir)
+    stable_sig_v2 = load_signature_v2_hex(data_dir)
     targeted = load_targeted_releases(data_dir)
     releases = targeted.get("releases") if isinstance(targeted, dict) else []
     if not isinstance(releases, list) or not releases:
-        return stable, stable_sig
+        return stable, stable_sig, stable_sig_v2
 
     cid = str(client_id or "").strip()
     tip = str(client_ip or "").strip()
@@ -125,7 +160,7 @@ def resolve_manifest_for_client(
     for rel in releases:
         if not isinstance(rel, dict):
             continue
-        targets = [str(x).strip() for x in (rel.get("targetClientIds") or []) if str(x).strip()]
+        targets = normalize_target_client_ids(rel.get("targetClientIds") or [])
         if not targets:
             continue
         if not candidate_ids.intersection(targets):
@@ -133,12 +168,13 @@ def resolve_manifest_for_client(
         man = rel.get("manifest") if isinstance(rel.get("manifest"), dict) else None
         if not man:
             continue
-        sig = str(rel.get("signature") or "")
+        sig = str(rel.get("signature") or "") or stable_sig
+        sig_v2 = str(rel.get("signatureV2") or "") or stable_sig_v2
         # Ensure target list is visible to new clients
         man = dict(man)
         man["targetClientIds"] = targets
-        return man, sig or stable_sig
-    return stable, stable_sig
+        return man, sig, sig_v2
+    return stable, stable_sig, stable_sig_v2
 
 
 def publish_targeted_release(
@@ -155,7 +191,7 @@ def publish_targeted_release(
     public_base_url: str = "https://mesh.example.invalid/wxqk",
 ) -> dict[str, Any]:
     """Publish a package only for selected clientIds; keep global stable manifest unchanged."""
-    targets = [str(x).strip() for x in (target_client_ids or []) if str(x).strip()]
+    targets = normalize_target_client_ids(target_client_ids)
     if not targets:
         return {"ok": False, "message": "targetClientIds 必填"}
     bid = _safe_build_id(build_id)
@@ -190,7 +226,7 @@ def publish_targeted_release(
         "protocolVersion": "facai888-v1",
         "securityProtocolVersion": "security-v1",
         "desktopProtocolVersion": "desktop-webrtc-v1",
-        "updaterProtocolVersion": "updater-v1",
+        "updaterProtocolVersion": UPDATER_PROTOCOL_V2,
         "mandatory": bool(mandatory),
         "publishedAt": published_at,
         "minimumSupportedBuild": "",
@@ -203,8 +239,9 @@ def publish_targeted_release(
         "releaseSequence": seq,
         "minimumReleaseSequence": 0,
         "targetClientIds": targets,
+        "securityEmergency": False,
     }
-    sig_hex = sign_manifest(data_dir, man, seed_b64=seed_b64)
+    sig_v1, sig_v2 = sign_manifest_dual(data_dir, man, seed_b64=seed_b64)
     store = load_targeted_releases(data_dir)
     releases = [r for r in (store.get("releases") or []) if isinstance(r, dict)]
     # Replace overlapping targets
@@ -218,7 +255,8 @@ def publish_targeted_release(
     kept.append({
         "targetClientIds": targets,
         "manifest": man,
-        "signature": sig_hex,
+        "signature": sig_v1,
+        "signatureV2": sig_v2,
         "publishedAt": published_at,
     })
     save_targeted_releases(data_dir, {"releases": kept})
@@ -243,7 +281,14 @@ def publish_targeted_release(
         "sha256": digest,
         "targetClientIds": targets,
     })
-    return {"ok": True, "manifest": man, "signature": sig_hex, "targeted": True, "targetClientIds": targets}
+    return {
+        "ok": True,
+        "manifest": man,
+        "signature": sig_v1,
+        "signatureV2": sig_v2,
+        "targeted": True,
+        "targetClientIds": targets,
+    }
 
 
 def package_path(data_dir: Path, build_id: str) -> Path | None:
@@ -350,8 +395,8 @@ def public_key_b64(data_dir: Path, seed_b64: str = "") -> str:
     return base64.b64encode(key.public_key().public_bytes_raw()).decode("ascii")
 
 
-def canonical_manifest_bytes(man: dict[str, Any]) -> bytes:
-    """Must match Go updater.ManifestCanonicalJSON field set + order."""
+def canonical_manifest_bytes_v1(man: dict[str, Any]) -> bytes:
+    """Must match Go updater.ManifestCanonicalJSON / client canonicalManifestBytesV1."""
     wire = {
         "version": str(man.get("version") or ""),
         "buildId": str(man.get("buildId") or ""),
@@ -359,7 +404,7 @@ def canonical_manifest_bytes(man: dict[str, Any]) -> bytes:
         "protocolVersion": str(man.get("protocolVersion") or "facai888-v1"),
         "securityProtocolVersion": str(man.get("securityProtocolVersion") or "security-v1"),
         "desktopProtocolVersion": str(man.get("desktopProtocolVersion") or "desktop-webrtc-v1"),
-        "updaterProtocolVersion": str(man.get("updaterProtocolVersion") or "updater-v1"),
+        "updaterProtocolVersion": str(man.get("updaterProtocolVersion") or UPDATER_PROTOCOL_V1),
         "mandatory": bool(man.get("mandatory", True)),
         "publishedAt": str(man.get("publishedAt") or ""),
         "minimumSupportedBuild": str(man.get("minimumSupportedBuild") or ""),
@@ -373,13 +418,68 @@ def canonical_manifest_bytes(man: dict[str, Any]) -> bytes:
     return json.dumps(wire, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def canonical_manifest_bytes_v2(man: dict[str, Any]) -> bytes:
+    """v2 wire: v1 fields + signed control plane (seq / targets / emergency)."""
+    wire = {
+        "version": str(man.get("version") or ""),
+        "buildId": str(man.get("buildId") or ""),
+        "gitCommit": str(man.get("gitCommit") or ""),
+        "protocolVersion": str(man.get("protocolVersion") or "facai888-v1"),
+        "securityProtocolVersion": str(man.get("securityProtocolVersion") or "security-v1"),
+        "desktopProtocolVersion": str(man.get("desktopProtocolVersion") or "desktop-webrtc-v1"),
+        "updaterProtocolVersion": str(man.get("updaterProtocolVersion") or UPDATER_PROTOCOL_V2),
+        "mandatory": bool(man.get("mandatory", True)),
+        "publishedAt": str(man.get("publishedAt") or ""),
+        "minimumSupportedBuild": str(man.get("minimumSupportedBuild") or ""),
+        "downloadURL": str(man.get("downloadURL") or ""),
+        "fileName": str(man.get("fileName") or ""),
+        "fileSize": int(man.get("fileSize") or 0),
+        "sha256": str(man.get("sha256") or ""),
+        "signingKeyId": str(man.get("signingKeyId") or SIGNING_KEY_ID),
+        "authenticodePublisher": str(man.get("authenticodePublisher") or ""),
+        "releaseSequence": int(man.get("releaseSequence") or 0),
+        "minimumReleaseSequence": int(man.get("minimumReleaseSequence") or 0),
+        "targetClientIds": normalize_target_client_ids(man.get("targetClientIds")),
+        "securityEmergency": bool(man.get("securityEmergency")),
+    }
+    return json.dumps(wire, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def canonical_manifest_bytes(man: dict[str, Any]) -> bytes:
+    """Backward-compatible alias → v1 (old clients / tests)."""
+    return canonical_manifest_bytes_v1(man)
+
+
 def sign_manifest(data_dir: Path, man: dict[str, Any], seed_b64: str = "") -> str:
+    """Primary signature for the response `signature` field.
+
+    Compatibility: always produce a v1-wire signature here so existing
+    clients (updater-v1 only) keep verifying. New clients prefer `signatureV2`.
+    """
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     seed = ensure_publish_key(data_dir, seed_b64=seed_b64)
     key = Ed25519PrivateKey.from_private_bytes(seed)
-    sig = key.sign(canonical_manifest_bytes(man))
+    sig = key.sign(canonical_manifest_bytes_v1(man))
     return sig.hex()
+
+
+def sign_manifest_v2(data_dir: Path, man: dict[str, Any], seed_b64: str = "") -> str:
+    """v2 control-plane signature (releaseSequence / targets / emergency)."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    seed = ensure_publish_key(data_dir, seed_b64=seed_b64)
+    key = Ed25519PrivateKey.from_private_bytes(seed)
+    sig = key.sign(canonical_manifest_bytes_v2(man))
+    return sig.hex()
+
+
+def sign_manifest_dual(data_dir: Path, man: dict[str, Any], seed_b64: str = "") -> tuple[str, str]:
+    """Return (signature_v1, signature_v2) for transitional publishes."""
+    return (
+        sign_manifest(data_dir, man, seed_b64=seed_b64),
+        sign_manifest_v2(data_dir, man, seed_b64=seed_b64),
+    )
 
 
 def next_release_sequence(data_dir: Path) -> int:
@@ -824,7 +924,7 @@ def publish_release(
         "protocolVersion": "facai888-v1",
         "securityProtocolVersion": "security-v1",
         "desktopProtocolVersion": "desktop-webrtc-v1",
-        "updaterProtocolVersion": "updater-v1",
+        "updaterProtocolVersion": UPDATER_PROTOCOL_V2,
         "mandatory": bool(mandatory),
         "publishedAt": published_at,
         "minimumSupportedBuild": "",
@@ -837,19 +937,25 @@ def publish_release(
         "releaseSequence": seq,
         # Soft floor: do not force-update solely via signed minSeq (policy handles kill-switch).
         "minimumReleaseSequence": 0,
+        "targetClientIds": [],
+        "securityEmergency": False,
     }
-    sig_hex = sign_manifest(data_dir, man, seed_b64=seed_b64)
+    sig_v1, sig_v2 = sign_manifest_dual(data_dir, man, seed_b64=seed_b64)
     root = _root(data_dir)
 
     # Manifest first (clients read this), then policy — crash mid-way must not leave
     # latestReleaseSequence ahead of a still-old signed manifest.
+    # signature = v1 (legacy clients); signatureV2 file = v2 control-plane.
     with _lock:
         tmp_m = root / "release-manifest.json.tmp"
         tmp_s = root / "release-manifest.sig.tmp"
+        tmp_s2 = root / "release-manifest.sig.v2.tmp"
         tmp_m.write_text(json.dumps(man, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp_s.write_text(sig_hex + "\n", encoding="utf-8")
+        tmp_s.write_text(sig_v1 + "\n", encoding="utf-8")
+        tmp_s2.write_text(sig_v2 + "\n", encoding="utf-8")
         tmp_m.replace(root / "release-manifest.json")
         tmp_s.replace(root / "release-manifest.sig")
+        tmp_s2.replace(root / "release-manifest.sig.v2")
 
     try:
         import version_policy as vp
@@ -889,7 +995,8 @@ def publish_release(
     return {
         "ok": True,
         "manifest": man,
-        "signature": sig_hex,
+        "signature": sig_v1,
+        "signatureV2": sig_v2,
         "publicKey": public_key_b64(data_dir, seed_b64=seed_b64),
     }
 
@@ -998,6 +1105,7 @@ def status(data_dir: Path, seed_b64: str = "") -> dict[str, Any]:
         "ok": True,
         "manifest": man,
         "signature": load_signature_hex(data_dir),
+        "signatureV2": load_signature_v2_hex(data_dir),
         "packages": pkgs,
         "publicKey": public_key_b64(data_dir, seed_b64=seed_b64),
         "events": recent_events(data_dir, 30),
