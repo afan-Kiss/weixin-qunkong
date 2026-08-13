@@ -5,29 +5,79 @@
      - page is framed (WXQK iframe) and server-baked viewmode is 11/13
    Normal top-level MeshCentral admin is not auto-connected.
 
-   Also: WXQK parent postMessage {source:'wxqk', kind:'desktop-input', enabled:bool}
-   drives MeshCentral DeskControl (official Input checkbox) for real view-only. */
+   Security: parent postMessage {source:'wxqk', kind:'desktop-input', enabled:bool}
+   is accepted ONLY when:
+     - ev.source === window.parent
+     - ev.origin exactly matches EXPECTED_WXQK_ORIGIN (from #wxqkpo=) OR
+       is listed in WXQK_PARENT_ORIGINS (exact scheme+host+port)
+   Never use '*' targetOrigin for inbound trust decisions. */
 (function () {
   try {
     if (window.__wxqkAutoConnectInstalled) return;
     window.__wxqkAutoConnectInstalled = true;
+
+    // Injected by wxqk_patch.py from domains."".allowedFramingOrigins (JSON array).
+    var WXQK_PARENT_ORIGINS = __WXQK_PARENT_ORIGINS__;
 
     function modeFromText(t) {
       t = String(t || '').toLowerCase();
       if (t === 'desktop' || t === 'files') return t;
       return '';
     }
+    function readHashParam(name) {
+      try {
+        var h = String(window.location.hash || '').replace(/^#/, '');
+        var parts = h.split(/[&]/);
+        for (var i = 0; i < parts.length; i++) {
+          var kv = parts[i].split('=');
+          if (decodeURIComponent(kv[0] || '') === name) {
+            return decodeURIComponent((kv.slice(1).join('=')) || '');
+          }
+        }
+      } catch (eH) { /* ignore */ }
+      return '';
+    }
+    function originExactInAllowlist(origin) {
+      var o = String(origin || '');
+      if (!o) return false;
+      if (!Array.isArray(WXQK_PARENT_ORIGINS)) return false;
+      for (var i = 0; i < WXQK_PARENT_ORIGINS.length; i++) {
+        if (String(WXQK_PARENT_ORIGINS[i]) === o) return true;
+      }
+      return false;
+    }
+    function resolveExpectedParentOrigin() {
+      var fromHash = readHashParam('wxqkpo');
+      if (fromHash) {
+        try {
+          var u = new URL(fromHash);
+          // Only http(s) absolute origins — exact URL.origin
+          if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+          return u.origin;
+        } catch (e1) {
+          return '';
+        }
+      }
+      try {
+        if (document.referrer) {
+          var r = new URL(document.referrer).origin;
+          if (originExactInAllowlist(r)) return r;
+        }
+      } catch (e2) { /* ignore */ }
+      return '';
+    }
+    var EXPECTED_WXQK_ORIGIN = resolveExpectedParentOrigin();
+
     var mode = '';
     try {
       var qm = String(window.location.search || '').match(/[?&]wxqkauto=(desktop|files)\b/i);
       if (qm) mode = modeFromText(qm[1]);
     } catch (eQ) { /* ignore */ }
     try {
-      var hm = String(window.location.hash || '').match(/[#&]?wxqkauto=(desktop|files)\b/i);
+      var hm = String(window.location.hash || '').match(/(?:^|[?#&])wxqkauto=(desktop|files)\b/i);
       if (!mode && hm) mode = modeFromText(hm[1]);
-    } catch (eH) { /* ignore */ }
+    } catch (eH2) { /* ignore */ }
 
-    // Handlebars substitutes {{viewmode}} at render time (survives login URL cleanup).
     var bakedView = parseInt('{{viewmode}}', 10);
     var inFrame = false;
     try { inFrame = !!(window.parent && window.parent !== window); } catch (eF) { inFrame = true; }
@@ -38,7 +88,7 @@
       try {
         var hm2 = String(window.location.search || '').match(/[?&]hide=(\d+)\b/);
         if (hm2) return parseInt(hm2[1], 10);
-      } catch (eH2) { /* ignore */ }
+      } catch (eH3) { /* ignore */ }
       return NaN;
     }
     if (!mode && (bakedView === 11 || bakedView === 13) && (inFrame || hideMask() === 63)) {
@@ -53,19 +103,39 @@
     var maxConnectTries = 3;
     var nextConnectAt = 0;
     var finished = false;
-    // WXQK product default: view-only until parent enables input
     var wantInput = false;
+
+    function isTrustedParentMessage(ev) {
+      if (!ev) return false;
+      try {
+        if (ev.source !== window.parent) return false;
+      } catch (eS) {
+        return false;
+      }
+      var origin = String(ev.origin || '');
+      if (!origin) return false;
+      if (EXPECTED_WXQK_ORIGIN && origin === EXPECTED_WXQK_ORIGIN) return true;
+      if (originExactInAllowlist(origin)) return true;
+      return false;
+    }
 
     function postState(kind, state, detail) {
       try {
         if (!window.parent || window.parent === window) return;
-        var origin = '*';
-        try {
-          if (document.referrer) origin = new URL(document.referrer).origin;
-        } catch (e1) { /* keep * */ }
+        var target = EXPECTED_WXQK_ORIGIN || '';
+        if (!target) {
+          try {
+            if (document.referrer) {
+              var r = new URL(document.referrer).origin;
+              if (originExactInAllowlist(r)) target = r;
+            }
+          } catch (eR) { /* ignore */ }
+        }
+        // Fail closed: never postMessage to '*'
+        if (!target) return;
         window.parent.postMessage(
           { source: 'wxqk', kind: kind, state: state, detail: detail || '' },
-          origin
+          target
         );
       } catch (e2) { /* ignore */ }
     }
@@ -95,12 +165,10 @@
       var s = document.createElement('style');
       s.id = 'wxqk-embed-chrome';
       s.textContent = [
-        '/* Hide MeshCentral desktop chrome; WXQK supplies product toolbar */',
         '#DeskControlSpan,#DeskControl,#deskkeys,#DeskTools,#DeskRefreshButton,',
         '#DeskRecordButton,#DeskRecordButtonImage,#DeskClipButton,#DeskSaveButton,',
         '#p11progress,#deskProgress{display:none!important}',
-        '#deskarea3x{height:100vh!important;max-height:100vh!important}',
-        'body.fullscreen #deskarea3x,html.fullscreen #deskarea3x{height:100vh!important}'
+        '#deskarea3x{height:100vh!important;max-height:100vh!important}'
       ].join('');
       (document.head || document.documentElement).appendChild(s);
     }
@@ -118,11 +186,9 @@
             QS('DeskControlSpan').color = enabled ? null : 'red';
           }
         } catch (eC) { /* ignore */ }
-        // Official helper updates store + color from checkbox
         try {
           if (typeof toggleKvmControl === 'function') toggleKvmControl();
         } catch (eT) { /* ignore */ }
-        // toggleKvmControl may re-read checkbox — ensure still desired
         el.checked = !!enabled;
         if (typeof putstore === 'function') putstore('DeskControl', enabled ? 1 : 0);
         return true;
@@ -136,7 +202,6 @@
       setWxqkDeskInput(wantInput);
     }
 
-    // Parent → iframe input gate
     window.addEventListener('message', function (ev) {
       try {
         var d = ev && ev.data;
@@ -144,13 +209,14 @@
         var k = String(d.kind || d.type || '');
         if (k !== 'desktop-input') return;
         if (mode !== 'desktop') return;
+        // Strict parent + origin gate (ignore evil origins even if source==='wxqk')
+        if (!isTrustedParentMessage(ev)) return;
         var ok = setWxqkDeskInput(!!d.enabled);
         postState('desktop-input', d.enabled ? 'on' : 'off', ok ? 'ok' : 'pending');
       } catch (eM) { /* ignore */ }
     });
 
     injectWxqkChromeCss();
-    // Prefer view-only before Mesh restores DeskControl=1 from local store
     try {
       if (mode === 'desktop' && typeof putstore === 'function') putstore('DeskControl', 0);
     } catch (eP) { /* ignore */ }
@@ -167,7 +233,6 @@
           finished = true;
           clearInterval(timer);
           enforceDefaultViewOnly();
-          // Keep enforcing briefly — updateDesktopButtons may reset from store
           var guard = 0;
           var guardTimer = setInterval(function () {
             guard += 1;
@@ -206,7 +271,6 @@
         }
         if (mode === 'desktop') {
           if (typeof connectDesktop !== 'function') return;
-          // Ensure view-only before first connectDesktop so Input starts unchecked
           enforceDefaultViewOnly();
           connectTries += 1;
           nextConnectAt = attempt + 10;

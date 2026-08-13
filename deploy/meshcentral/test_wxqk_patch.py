@@ -22,6 +22,15 @@ from wxqk_patch import (
 
 class WxqkPatchTest(unittest.TestCase):
     def test_snippet_has_required_connect_calls(self):
+        from pathlib import Path
+
+        raw = (Path(__file__).resolve().parent / "patches" / "wxqk_autoconnect.snippet.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("__WXQK_PARENT_ORIGINS__", raw)
+        self.assertIn("isTrustedParentMessage", raw)
+        self.assertIn("EXPECTED_WXQK_ORIGIN", raw)
+        self.assertIn("ev.source !== window.parent", raw)
         snip = read_snippet()
         self.assertIn(MARKER_BEGIN, snip)
         self.assertIn(MARKER_END, snip)
@@ -33,6 +42,10 @@ class WxqkPatchTest(unittest.TestCase):
         self.assertIn("desktop-input", snip)
         self.assertIn("DeskControl", snip)
         self.assertIn("putstore('DeskControl'", snip)
+        # Placeholder must be substituted with a JSON array
+        self.assertNotIn("__WXQK_PARENT_ORIGINS__", snip)
+        self.assertIn("WXQK_PARENT_ORIGINS = [", snip)
+        self.assertIn("never postMessage to '*'", snip)
 
     def test_inject_inserts_once_and_is_idempotent(self):
         snip = read_snippet()

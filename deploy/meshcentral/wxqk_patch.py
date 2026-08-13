@@ -63,12 +63,68 @@ def _run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subpro
     )
 
 
+def _load_parent_origins() -> list[str]:
+    """Exact https? origins allowed to drive DeskControl (from Mesh config framing list)."""
+    origins: list[str] = []
+    for candidate in (
+        HERE / "config.json",
+        HERE / "data" / "config.json",
+        Path("/opt/wxqk/meshcentral/config.json"),
+        Path("/opt/meshcentral/meshcentral-data/config.json"),
+    ):
+        try:
+            if not candidate.is_file():
+                continue
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            domain0 = ((data.get("domains") or {}).get("")) if isinstance(data.get("domains"), dict) else {}
+            raw = (domain0 or {}).get("allowedFramingOrigins") if isinstance(domain0, dict) else None
+            if isinstance(raw, list):
+                for item in raw:
+                    s = str(item or "").strip()
+                    if not s or s == "*":
+                        continue
+                    try:
+                        # Normalize to exact origin (scheme+host+port)
+                        from urllib.parse import urlparse
+
+                        p = urlparse(s if "://" in s else f"https://{s}")
+                        if p.scheme not in ("http", "https") or not p.hostname:
+                            continue
+                        origin = f"{p.scheme}://{p.hostname}" + (f":{p.port}" if p.port else "")
+                        if origin not in origins:
+                            origins.append(origin)
+                    except Exception:
+                        continue
+            if origins:
+                break
+        except Exception:
+            continue
+    # Always allow common local admin origins used by WXQK console / Electron shell.openExternal
+    for extra in (
+        "http://127.0.0.1",
+        "http://localhost",
+        "http://127.0.0.1:888",
+        "http://localhost:888",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ):
+        if extra not in origins:
+            origins.append(extra)
+    return origins
+
+
 def read_snippet() -> str:
     raw = SNIPPET_PATH.read_text(encoding="utf-8")
     if MARKER_BEGIN not in raw or MARKER_END not in raw:
         raise RuntimeError("snippet missing WXQK markers")
     if "connectDesktop(null, 3)" not in raw or "connectFiles(null, 1)" not in raw:
         raise RuntimeError("snippet missing required connect calls")
+    if "__WXQK_PARENT_ORIGINS__" not in raw:
+        raise RuntimeError("snippet missing __WXQK_PARENT_ORIGINS__ placeholder")
+    if "isTrustedParentMessage" not in raw:
+        raise RuntimeError("snippet missing isTrustedParentMessage gate")
+    origins_json = json.dumps(_load_parent_origins(), ensure_ascii=False)
+    raw = raw.replace("__WXQK_PARENT_ORIGINS__", origins_json, 1)
     return raw.strip() + "\n"
 
 

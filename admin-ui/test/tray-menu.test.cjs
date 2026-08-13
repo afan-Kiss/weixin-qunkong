@@ -24,5 +24,6 @@ test('system tray provides the four requested menu entries', () => {
   assert.match(source, /app\.relaunch\(/)
   assert.match(source, /app\.exit\(0\)/)
   assert.match(source, /click: \(\) => restartApp\(\)/)
-  assert.doesNotMatch(source, /setAlwaysOnTop/)
+  // Tray itself must not pin the window; brief alwaysOnTop is allowed only in showMainWindow activate path
+  assert.doesNotMatch(source, /function createTray[\s\S]*?setAlwaysOnTop/)
 })

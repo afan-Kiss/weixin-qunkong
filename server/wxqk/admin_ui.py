@@ -342,6 +342,8 @@ const state = {
   desktopSessionMode: '', // 'desktop' | 'files'
   desktopInputEnabled: false,
   desktopConnState: 'idle', // idle|connecting|connected|error
+  desktopMeshOrigin: '', // exact https origin of current embed URL
+  desktopEmbedUrl: '',
   _wxqkRelayMsgBound: false,
   announceMode: 'clients',
   announceSelected: new Set(),
@@ -1114,15 +1116,63 @@ function setDeskConnStatus(text, kind) {
   else if (kind === 'busy') el.classList.add('is-busy');
   else if (kind === 'err') el.classList.add('is-err');
 }
+/** Parse Mesh embed URL → exact https origin. Fail closed for non-https / invalid. */
+function parseMeshEmbedOrigin(embedUrl) {
+  try {
+    const u = new URL(String(embedUrl || ''));
+    if (u.protocol !== 'https:') return '';
+    if (!u.hostname) return '';
+    return u.origin;
+  } catch (_) {
+    return '';
+  }
+}
+function setDesktopEmbedSession(embedUrl) {
+  const url = String(embedUrl || '');
+  const origin = parseMeshEmbedOrigin(url);
+  state.desktopEmbedUrl = url;
+  state.desktopMeshOrigin = origin;
+  return origin;
+}
+function clearDesktopEmbedSession() {
+  state.desktopEmbedUrl = '';
+  state.desktopMeshOrigin = '';
+}
+function appendWxqkParentOriginToEmbed(url) {
+  // Stamp parent origin into hash so Mesh patch can pin EXPECTED_WXQK_ORIGIN (exact match).
+  try {
+    const u = new URL(String(url || ''));
+    const parentOrigin = String(window.location.origin || '');
+    if (!/^https?:\/\//i.test(parentOrigin)) return String(url || '');
+    const auto = /viewmode=13/.test(u.search) ? 'files' : 'desktop';
+    const parts = [];
+    parts.push('wxqkauto=' + encodeURIComponent(auto));
+    parts.push('wxqkpo=' + encodeURIComponent(parentOrigin));
+    u.hash = parts.join('&');
+    return u.toString();
+  } catch (_) {
+    return String(url || '');
+  }
+}
 function postDeskInputToFrame(enabled) {
   const frame = document.getElementById('deskFrame');
-  if (!frame || !frame.contentWindow) return;
+  const meshOrigin = String(state.desktopMeshOrigin || '');
+  if (!frame || !frame.contentWindow) return false;
+  if (!meshOrigin || !/^https:\/\//i.test(meshOrigin)) {
+    // Fail closed — never fall back to '*'
+    setDeskConnStatus('连接异常', 'err');
+    setDeskRelayStatus('无法校验远程桌面来源，保持仅观看', 'err');
+    return false;
+  }
   try {
     frame.contentWindow.postMessage(
       { source: 'wxqk', kind: 'desktop-input', type: 'desktop-input', enabled: !!enabled },
-      '*'
+      meshOrigin
     );
-  } catch (_) { /* cross-origin until loaded */ }
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 function applyDesktopInputMode(enabled, { toast } = {}) {
   const allow = !!enabled;
@@ -1138,12 +1188,20 @@ function applyDesktopInputMode(enabled, { toast } = {}) {
   if (hint) {
     hint.textContent = allow ? '' : '当前为仅观看模式 · 勾选下方后可操作鼠标键盘';
   }
-  postDeskInputToFrame(allow);
-  // Retry a few times — Mesh page may still be booting DeskControl
-  if (state.desktopSessionMode === 'desktop' && state.desktopSession) {
-    [400, 1200, 2500].forEach((ms) => setTimeout(() => postDeskInputToFrame(allow), ms));
+  if (allow && !state.desktopMeshOrigin) {
+    // Cannot securely enable control without a verified Mesh origin
+    state.desktopInputEnabled = false;
+    if (cb) cb.checked = false;
+    if (stage) stage.classList.add('is-viewonly');
+    setDeskConnStatus('连接异常', 'err');
+    showDeskToast('无法开启远程控制（来源未校验）');
+    return;
   }
-  if (toast) showDeskToast(allow ? '已开启远程控制' : '当前为仅观看模式');
+  postDeskInputToFrame(state.desktopInputEnabled);
+  if (state.desktopSessionMode === 'desktop' && state.desktopSession) {
+    [400, 1200, 2500].forEach((ms) => setTimeout(() => postDeskInputToFrame(state.desktopInputEnabled), ms));
+  }
+  if (toast) showDeskToast(state.desktopInputEnabled ? '已开启远程控制' : '当前为仅观看模式');
 }
 function syncDesktopBottomBar() {
   const hasSel = !!state.desktopSelectedId;
@@ -1180,6 +1238,7 @@ async function stopDesktop() {
   state.desktopSessionMode = '';
   state.desktopInputEnabled = false;
   state.desktopConnState = 'idle';
+  clearDesktopEmbedSession();
   setDeskRelayStatus('');
   setDeskConnStatus('未连接');
   syncDesktopBottomBar();
@@ -1207,10 +1266,15 @@ function onWxqkMeshRelayMessage(ev) {
     const data = ev && ev.data;
     if (!data || data.source !== 'wxqk') return;
     if (!state.desktopSession) return;
+    const meshOrigin = String(state.desktopMeshOrigin || '');
+    if (!meshOrigin) return;
+    // Exact origin match (scheme+host+port) — no startsWith / contains
+    if (String(ev.origin || '') !== meshOrigin) return;
+    const frame = document.getElementById('deskFrame');
+    if (!frame || !frame.contentWindow || ev.source !== frame.contentWindow) return;
     const kind = String(data.kind || data.type || '');
     const st = String(data.state || '');
     if (kind === 'desktop-input') {
-      // Mesh acknowledged input mode — keep parent checkbox in sync if needed
       return;
     }
     if (kind !== 'desktop' && kind !== 'files') return;
@@ -1223,7 +1287,6 @@ function onWxqkMeshRelayMessage(ev) {
       setDeskConnStatus('已连接', 'ok');
       setDeskRelayStatus(kind === 'files' ? '文件已连接' : '桌面已连接', 'ok');
       if (kind === 'desktop') {
-        // Enforce default view-only (or current checkbox) via Mesh DeskControl
         applyDesktopInputMode(!!state.desktopInputEnabled, { toast: false });
       }
       setTimeout(() => {
@@ -1454,7 +1517,19 @@ async function openMeshSession(mode, { forceTab } = {}) {
     state.desktopSessionMode = mode === 'files' ? 'files' : 'desktop';
     state.desktopInputEnabled = false;
     state.desktopConnState = 'connecting';
-    const url = String(data.embedUrl);
+    const rawUrl = String(data.embedUrl);
+    const meshOrigin = setDesktopEmbedSession(rawUrl);
+    if (!meshOrigin) {
+      clearDesktopEmbedSession();
+      state.desktopSession = 0;
+      state.desktopSessionMode = '';
+      setDeskConnStatus('连接异常', 'err');
+      setDeskRelayStatus('嵌入地址无效（需要 HTTPS），保持未连接', 'err');
+      alert('远程桌面地址无效，已拒绝打开（安全校验失败）');
+      await refreshDesktopMeshStatus();
+      return;
+    }
+    const url = appendWxqkParentOriginToEmbed(rawUrl);
     if (forceTab) {
       window.open(url, '_blank', 'noopener');
       return;
@@ -1543,7 +1618,14 @@ function bindDesktopPageEvents() {
     const frame = document.getElementById('deskFrame');
     if (!frame || !state.desktopSession) return;
     try {
-      const u = frame.src;
+      const base = String(state.desktopEmbedUrl || frame.src || '');
+      const origin = setDesktopEmbedSession(base);
+      if (!origin) {
+        setDeskConnStatus('连接异常', 'err');
+        setDeskRelayStatus('刷新失败：嵌入来源无效', 'err');
+        return;
+      }
+      const u = appendWxqkParentOriginToEmbed(base);
       frame.src = 'about:blank';
       setTimeout(() => { frame.src = u; applyDesktopInputMode(!!state.desktopInputEnabled, { toast: false }); }, 50);
       setDeskConnStatus('连接中', 'busy');

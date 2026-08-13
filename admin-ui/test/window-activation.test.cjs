@@ -65,10 +65,9 @@ test('main window activation policy: no alwaysOnTop, split show/activate, first 
   assert.match(source, /function showMainWindow\(opts = \{\}\)/)
   assert.match(source, /function activateMainWindow\(\)/)
   assert.match(source, /showMainWindow\(\{ focus: true \}\)/)
-  // Splash 可用 alwaysOnTop；主窗口路径禁止
+  // Splash 可用 alwaysOnTop；主窗口仅在用户激活（二次启动/托盘）时短暂置顶再清除
   assert.match(source, /function createSplashWindow[\s\S]*?setAlwaysOnTop\(true/)
-  assert.match(source, /主窗口正常情况下永远不得 alwaysOnTop/)
-  assert.doesNotMatch(source, /function showMainWindow[\s\S]*?setAlwaysOnTop/)
+  assert.match(source, /function showMainWindow[\s\S]*?setAlwaysOnTop\(true\)[\s\S]*?setAlwaysOnTop\(false\)/)
   assert.doesNotMatch(source, /ready-to-show[\s\S]{0,400}?setAlwaysOnTop/)
   assert.match(source, /\[WINDOW\] second-instance/)
   assert.match(source, /shouldActivateOnSecondInstance/)

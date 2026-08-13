@@ -1,4 +1,22 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, clipboard, screen, shell, session, Notification } = require('electron')
+const path = require('path')
+const { existsSync } = require('fs')
+
+/**
+ * Portable single-instance identity MUST be stable across launches.
+ * electron-builder portable unpacks to a temp dir each run; default userData would
+ * be unique per unpack → requestSingleInstanceLock would NOT serialize instances.
+ * Keep this BEFORE requestSingleInstanceLock / heavy init.
+ */
+;(function pinPortableUserData() {
+  try {
+    const portableDir = String(process.env.PORTABLE_EXECUTABLE_DIR || '').trim()
+    if (!portableDir) return
+    const dataDir = path.join(portableDir, 'WXQK-Data')
+    app.setPath('userData', dataDir)
+    try { app.setPath('sessionData', path.join(dataDir, 'session')) } catch { /* older electron */ }
+  } catch { /* ignore */ }
+})()
 
 /** 轻量启动计时；额外写 %TEMP%\wxqk-startup-marks.json（单次很小，便于外部测速） */
 const startupEpochNs = process.hrtime.bigint()
@@ -19,7 +37,6 @@ function markStartup(label) {
     const ms = Number(process.hrtime.bigint() - startupEpochNs) / 1e6
     console.log(`[STARTUP] ${label} +${ms.toFixed(1)}ms`)
     const fs = require('fs')
-    const path = require('path')
     const os = require('os')
     const file = path.join(os.tmpdir(), 'wxqk-startup-marks.json')
     let data = {}
@@ -35,10 +52,20 @@ function markStartup(label) {
 }
 markStartup('process start')
 
+// Single-instance lock as early as possible (after portable userData pin).
+// Second instances must not continue loading storage/backend/tray modules.
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) {
+  try { app.quit() } catch { /* ignore */ }
+  process.exit(0)
+}
+/** second-instance arrived before mainWindow / ready-to-show */
+let pendingSecondInstanceFocus = false
+
 // 部分机器 GPU/驱动异常会导致进程在但窗口不显示/白屏
 try { app.disableHardwareAcceleration() } catch {}
 const { createHash, randomUUID } = require('crypto')
-const { createReadStream, createWriteStream, existsSync, mkdirSync, appendFileSync, readFileSync, writeFileSync, unlinkSync, statSync, readdirSync } = require('fs')
+const { createReadStream, createWriteStream, mkdirSync, appendFileSync, readFileSync, writeFileSync, unlinkSync, statSync, readdirSync } = require('fs')
 const { readdir, stat } = require('fs/promises')
 const { pipeline } = require('stream/promises')
 const { spawn, execFile } = require('child_process')
@@ -46,7 +73,7 @@ const { promisify } = require('util')
 const net = require('net')
 const http = require('http')
 const https = require('https')
-const path = require('path')
+// path + existsSync already required above for portable userData pin
 const { initStorage, saveSetting, getSettings, upsertInstance, listStoredInstances, removeInstance, removeInactiveInstancesByPorts, saveLog, listLogs, clearLogs, clearRuntimeCaches, clearApiSamplesOnly, saveApiSample, saveEvent, listMessageEventsForKickScan, listMemberJoins, listFriendAddStatuses, createTask, listTasks, getTaskItems, setTaskStatus, cancelTask, setTaskItemStatus, setTaskItemStarted, setTaskItemResult, patchTaskItemRequest, patchTaskConfig, recoverInterruptedTasks, repairConfirmedSendTextResults, reserveFriendDailyAttempt, reserveQrJoinDailyAttempt, releaseFriendDailyAttempt, releaseQrJoinDailyAttempt, updateTaskItemInstanceId, migrateDirectorySnapshotToInstance, rebindChatAddCandidatesForAccount, hasDeliveredContent, recordDeliveredContent, hasDirectoryOwnership, loadDirectoryOwnershipSet, syncDirectorySnapshot, remoteSyncSnapshot, saveQrItem, listQrItems, deleteQrItems, updateQrScanResult, updateQrItemType, getChatAddRule, saveChatAddRule, upsertChatAddCandidate, listChatAddCandidates, markChatAddCandidatesTasked, clearChatAddCandidates, upsertKickedGroupPending, getKickedGroupCleanup, listKickedGroupPending, listActiveKickedCleanupTargets, rebindKickedGroupPendingToInstance, updateKickedGroupCleanup, removeLocalChatroomOwnership, listOwnedChatrooms, markChatroomBlocked, isChatroomBlocked, isChatroomBlockedForInstance, loadBlockedRoomIdSet, loadBlockedRoomIdSetForInstance, loadDirectoryExcludedRoomIdSetForInstance, listBlockedChatrooms, hasQrContentHash } = require('./storage.cjs')
 const { MAX_MESSAGE_BYTES, LengthPrefixedDecoder, hasFrequentEvidence, isVerifiedSuccess, buildAddFriendRequest, evaluateFriendAddResult, isRetryableFriendCredentialFailure } = require('./protocol.cjs')
 const { createSerialExecutor, parseInjectorOutput, decodeInjectorChunks, waitForInjectorClose } = require('./instance-runtime.cjs')
@@ -148,26 +175,25 @@ const {
 const secondInstanceGate = createSecondInstanceGate()
 /** 首次 ready-to-show 完成前，second-instance 不得抢焦点 */
 let mainWindowFirstShowDone = false
-
-const hasSingleInstanceLock = app.requestSingleInstanceLock()
-if (!hasSingleInstanceLock) {
-  app.quit()
-} else {
-  app.on('second-instance', () => {
-    // 便携版连续双击会产生多个延迟启动器，随后陆续触发；节流避免持续抢前台
-    const at = Date.now()
-    try { appLog('INFO', '[WINDOW] second-instance', { at }) } catch { /* appLog 尚未就绪时忽略 */ }
-    if (!shouldActivateOnSecondInstance({
-      appReady: app.isReady(),
-      firstShowDone: mainWindowFirstShowDone,
-      gate: secondInstanceGate,
-      now: at,
-    })) {
-      return
-    }
-    activateMainWindow()
-  })
-}
+// Primary process already holds the lock (acquired at process start). Register activator only.
+app.on('second-instance', () => {
+  // 便携版连续双击会产生多个延迟启动器，随后陆续触发；节流避免持续抢前台
+  const at = Date.now()
+  try { appLog('INFO', '[WINDOW] second-instance', { at }) } catch { /* appLog 尚未就绪时忽略 */ }
+  if (!app.isReady() || !mainWindowFirstShowDone || !mainWindow || mainWindow.isDestroyed()) {
+    pendingSecondInstanceFocus = true
+    return
+  }
+  if (!shouldActivateOnSecondInstance({
+    appReady: true,
+    firstShowDone: true,
+    gate: secondInstanceGate,
+    now: at,
+  })) {
+    return
+  }
+  activateMainWindow()
+})
 
 const isDev = !app.isPackaged
 
@@ -5619,6 +5645,10 @@ function createWindow() {
     win.show()
     win.focus()
     mainWindowFirstShowDone = true
+    if (pendingSecondInstanceFocus) {
+      pendingSecondInstanceFocus = false
+      activateMainWindow()
+    }
   })
   // 防止 ready-to-show 未触发时界面一直不出现；兜底只 show，不抢焦点
   setTimeout(() => {
@@ -5628,6 +5658,10 @@ function createWindow() {
       closeSplashWindow()
       win.show()
       mainWindowFirstShowDone = true
+      if (pendingSecondInstanceFocus) {
+        pendingSecondInstanceFocus = false
+        activateMainWindow()
+      }
     }
   }, 2500).unref()
 
@@ -5665,8 +5699,19 @@ function showMainWindow(opts = {}) {
   const win = createWindow()
   if (win.isMinimized()) win.restore()
   if (!win.isVisible()) win.show()
-  // 主窗口正常情况下永远不得 alwaysOnTop
-  if (focus) win.focus()
+  if (focus) {
+    try {
+      // Windows: brief alwaysOnTop + moveTop to raise from tray / behind others (no persistent topmost)
+      win.setAlwaysOnTop(true)
+      if (typeof win.moveTop === 'function') win.moveTop()
+      win.focus()
+      setTimeout(() => {
+        try { if (!win.isDestroyed()) win.setAlwaysOnTop(false) } catch { /* ignore */ }
+      }, 250).unref?.()
+    } catch {
+      try { win.focus() } catch { /* ignore */ }
+    }
+  }
 }
 
 /** 用户明确要求激活主窗口（托盘、二次启动等） */
