@@ -18,6 +18,9 @@ const FAILED_FILE = 'failed-update.json'
 const PHASE_FILE = 'phase.json'
 const HIGHEST_COMMITTED_FILE = 'highest-committed-seq.json'
 const APPLYING_LOCK = 'applying.lock'
+const HANDOFF_RESULT_FILE = 'handoff-result.json'
+const ROLLBACK_DIR_NAME = 'rollback'
+const ROLLBACK_META_FILE = 'rollback-meta.json'
 
 const PHASE = Object.freeze({
   IDLE: 'IDLE',
@@ -27,11 +30,14 @@ const PHASE = Object.freeze({
   WAITING_OLD_EXIT: 'WAITING_OLD_EXIT',
   STARTING_NEW: 'STARTING_NEW',
   WAITING_NEW_READY: 'WAITING_NEW_READY',
+  COMMITTING: 'COMMITTING',
   COMMITTED: 'COMMITTED',
   ROLLING_BACK: 'ROLLING_BACK',
   ROLLED_BACK: 'ROLLED_BACK',
   FAILED: 'FAILED',
 })
+
+const APPLYING_LOCK_TTL_MS = 10 * 60 * 1000
 
 /**
  * @param {string} [userDataDir]
@@ -92,8 +98,134 @@ function isUpdateApplying(userDataDir) {
     PHASE.WAITING_OLD_EXIT,
     PHASE.STARTING_NEW,
     PHASE.WAITING_NEW_READY,
+    PHASE.COMMITTING,
     PHASE.ROLLING_BACK,
   ].includes(phase) || fs.existsSync(path.join(resolveUpdateStateDir(userDataDir), APPLYING_LOCK))
+}
+
+function writeApplyingLock(userDataDir, payload = {}) {
+  const dir = ensureStateDir(userDataDir)
+  const row = {
+    updateId: String(payload.updateId || ''),
+    helperPid: Number(payload.helperPid || 0) || 0,
+    createdAt: String(payload.createdAt || new Date().toISOString()),
+    ttlMs: Number(payload.ttlMs || APPLYING_LOCK_TTL_MS) || APPLYING_LOCK_TTL_MS,
+  }
+  writeJson(path.join(dir, APPLYING_LOCK), row)
+  return row
+}
+
+function readApplyingLock(userDataDir) {
+  return readJson(path.join(resolveUpdateStateDir(userDataDir), APPLYING_LOCK))
+}
+
+function isPidAlive(pid) {
+  const n = Number(pid || 0)
+  if (!n) return false
+  try {
+    process.kill(n, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function writeHandoffResult(userDataDir, payload) {
+  const dir = ensureStateDir(userDataDir)
+  const row = {
+    schema: 1,
+    updateId: String(payload.updateId || ''),
+    result: String(payload.result || ''),
+    reason: String(payload.reason || ''),
+    at: new Date().toISOString(),
+  }
+  writeJson(path.join(dir, HANDOFF_RESULT_FILE), row)
+  return row
+}
+
+function readHandoffResult(userDataDir) {
+  return readJson(path.join(resolveUpdateStateDir(userDataDir), HANDOFF_RESULT_FILE))
+}
+
+function getRollbackArtifactPath(userDataDir, updateId) {
+  return path.join(
+    resolveUpdateStateDir(userDataDir),
+    ROLLBACK_DIR_NAME,
+    String(updateId || 'unknown'),
+    'previous.exe',
+  )
+}
+
+/**
+ * ROLLBACK_ARTIFACT_GATE: copy current old EXE before old process exits.
+ */
+function prepareRollbackArtifact(userDataDir, { updateId, oldExePath }) {
+  const uid = String(updateId || '')
+  const src = path.resolve(String(oldExePath || ''))
+  if (!uid) return { ok: false, reason: 'ROLLBACK_ARTIFACT_PREPARE_FAILED', detail: 'updateId_missing' }
+  if (!src || !fs.existsSync(src)) {
+    return { ok: false, reason: 'ROLLBACK_ARTIFACT_PREPARE_FAILED', detail: 'old_missing' }
+  }
+  const dest = getRollbackArtifactPath(userDataDir, uid)
+  fs.mkdirSync(path.dirname(dest), { recursive: true })
+  try {
+    fs.copyFileSync(src, dest)
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'ROLLBACK_ARTIFACT_PREPARE_FAILED',
+      detail: 'copy_failed',
+      error: String(error && error.message || error),
+    }
+  }
+  const srcSha = hashFileSync(src)
+  const dstSha = hashFileSync(dest)
+  if (srcSha !== dstSha) {
+    try { fs.unlinkSync(dest) } catch { /* ignore */ }
+    return { ok: false, reason: 'ROLLBACK_ARTIFACT_PREPARE_FAILED', detail: 'sha_mismatch' }
+  }
+  const meta = {
+    schema: 1,
+    updateId: uid,
+    oldExePath: src,
+    artifactPath: path.resolve(dest),
+    sha256: dstSha,
+    preparedAt: new Date().toISOString(),
+  }
+  writeJson(path.join(path.dirname(dest), ROLLBACK_META_FILE), meta)
+  return { ok: true, ...meta }
+}
+
+function readRollbackMeta(userDataDir, updateId) {
+  const dest = getRollbackArtifactPath(userDataDir, updateId)
+  return readJson(path.join(path.dirname(dest), ROLLBACK_META_FILE))
+}
+
+/**
+ * Restore original versioned entry from rollback artifact (commit-critical for rollback).
+ */
+function restoreOriginalEntryFromArtifact(userDataDir, { updateId, oldExePath }) {
+  const meta = readRollbackMeta(userDataDir, updateId)
+  const artifact = path.resolve(String(meta?.artifactPath || getRollbackArtifactPath(userDataDir, updateId)))
+  const target = path.resolve(String(oldExePath || meta?.oldExePath || ''))
+  if (!artifact || !fs.existsSync(artifact)) {
+    return { ok: false, reason: 'rollback_artifact_missing', artifact }
+  }
+  if (!target) return { ok: false, reason: 'old_entry_missing' }
+  const expectedSha = String(meta?.sha256 || hashFileSync(artifact)).toLowerCase()
+  try {
+    if (path.resolve(artifact) !== target) {
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.copyFileSync(artifact, target)
+    }
+  } catch (error) {
+    return { ok: false, reason: 'old_entry_restore_failed', error: String(error && error.message || error) }
+  }
+  const actual = hashFileSync(target).toLowerCase()
+  if (actual !== expectedSha) {
+    return { ok: false, reason: 'old_entry_sha_mismatch', expectedSha, actual }
+  }
+  return { ok: true, artifact, oldExePath: target, sha256: actual }
 }
 
 /**
@@ -107,6 +239,10 @@ function writePrepared(userDataDir, payload) {
     updateId: String(payload.updateId || ''),
     exePath: path.resolve(String(payload.exePath || '')),
     oldExePath: path.resolve(String(payload.oldExePath || '')),
+    rollbackArtifactPath: payload.rollbackArtifactPath
+      ? path.resolve(String(payload.rollbackArtifactPath))
+      : '',
+    rollbackSha256: String(payload.rollbackSha256 || '').toLowerCase(),
     version: String(payload.version || ''),
     buildId: String(payload.buildId || ''),
     releaseSequence: Number(payload.releaseSequence || 0) || 0,
@@ -115,9 +251,8 @@ function writePrepared(userDataDir, payload) {
     parentPid: Number(payload.parentPid || process.pid) || process.pid,
   }
   writeJson(path.join(dir, PREPARED_FILE), row)
-  // Clear stale ready from previous attempts
   try { fs.unlinkSync(path.join(dir, READY_FILE)) } catch { /* ignore */ }
-  writeJson(path.join(dir, APPLYING_LOCK), { updateId: row.updateId, at: row.preparedAt })
+  writeApplyingLock(userDataDir, { updateId: row.updateId, helperPid: 0, createdAt: row.preparedAt })
   setPhase(userDataDir, PHASE.PREPARED, { updateId: row.updateId })
   return row
 }
@@ -157,10 +292,12 @@ function readReady(userDataDir) {
 }
 
 /**
+ * Full READY validation (Node source of truth).
  * @param {object} prepared
  * @param {object|null} ready
+ * @param {{ expectedNewPid?: number }} [options]
  */
-function validateReadyAck(prepared, ready) {
+function validateReadyAck(prepared, ready, options = {}) {
   if (!prepared || !ready) return { ok: false, reason: 'missing' }
   if (String(ready.status) !== 'ready') return { ok: false, reason: 'status' }
   if (String(ready.updateId || '') !== String(prepared.updateId || '')) {
@@ -177,11 +314,11 @@ function validateReadyAck(prepared, ready) {
   }
   const pid = Number(ready.pid || 0)
   if (!pid) return { ok: false, reason: 'pid_missing' }
-  try {
-    process.kill(pid, 0)
-  } catch {
-    return { ok: false, reason: 'pid_dead' }
+  const expected = options.expectedNewPid != null ? Number(options.expectedNewPid) : null
+  if (expected != null && Number.isFinite(expected) && expected > 0 && pid !== expected) {
+    return { ok: false, reason: 'pid_mismatch' }
   }
+  if (!isPidAlive(pid)) return { ok: false, reason: 'pid_dead' }
   return { ok: true }
 }
 
@@ -195,9 +332,18 @@ async function waitForReadyAck(userDataDir, prepared, options = {}) {
   setPhase(userDataDir, PHASE.WAITING_NEW_READY, { updateId: prepared?.updateId })
   while (Date.now() - started < timeoutMs) {
     const ready = readReady(userDataDir)
-    const check = validateReadyAck(prepared, ready)
+    // Ignore stale READY for a different updateId; keep waiting for current ACK.
+    if (ready && String(ready.updateId || '') && String(ready.updateId) !== String(prepared?.updateId || '')) {
+      await new Promise((r) => setTimeout(r, pollMs))
+      continue
+    }
+    const check = validateReadyAck(prepared, ready, { expectedNewPid: options.expectedNewPid })
     if (check.ok) return { ok: true, ready, waitedMs: Date.now() - started }
-    // If new process died without ready
+    // Current updateId marker present but invalid → fail closed immediately
+    if (ready && String(ready.updateId || '') === String(prepared?.updateId || '') && !check.ok
+      && check.reason !== 'missing' && check.reason !== 'pid_dead') {
+      return { ok: false, reason: `READY_INVALID_${check.reason}`, waitedMs: Date.now() - started, ready }
+    }
     if (options.newPid) {
       try {
         process.kill(Number(options.newPid), 0)
@@ -308,7 +454,6 @@ function hashFileSync(filePath) {
 
 /**
  * Install-dir current pointer: pending vs committed.
- * Lives beside EXEs for maybeRelaunch, but phase of truth is update-state.
  */
 function writeInstallCurrentPointers(installDir, { pending, current }) {
   const pendingPath = path.join(installDir, 'pending-portable-exe.json')
@@ -328,37 +473,106 @@ function readInstallPending(installDir) {
 
 const STABLE_LAUNCHER_NAME = '微信群控系统.exe'
 
+function verifyCopiedSha(filePath, expectedSha) {
+  if (!fs.existsSync(filePath)) return { ok: false, reason: 'missing' }
+  const actual = hashFileSync(filePath).toLowerCase()
+  const expected = String(expectedSha || '').toLowerCase()
+  if (!expected || actual !== expected) return { ok: false, reason: 'sha_mismatch', actual, expected }
+  return { ok: true, actual }
+}
+
 /**
- * After commit: ensure stable launcher name points at current bytes (full copy).
- * Also refresh old entry path so shortcuts keep working (overwrite with current bytes).
+ * Commit-critical launch entries. Never silent-ignore failures.
  */
 function commitLaunchEntries({ installDir, newExePath, oldExePath, committed }) {
+  const expectedSha = String(committed?.sha256 || '').toLowerCase()
   const stable = path.join(installDir, STABLE_LAUNCHER_NAME)
-  if (path.resolve(newExePath) !== path.resolve(stable)) {
-    try {
-      fs.copyFileSync(newExePath, stable)
-    } catch { /* ignore */ }
+  const result = {
+    ok: true,
+    reason: '',
+    stableLauncher: { path: stable, created: false, shaMatch: false },
+    oldEntry: { path: oldExePath ? path.resolve(oldExePath) : '', updated: false, shaMatch: false },
+    currentPointer: { written: false, valid: false },
   }
-  // Keep original entry path working: overwrite old versioned EXE with new bytes (stub-equivalent)
-  if (oldExePath && path.resolve(oldExePath) !== path.resolve(newExePath) && fs.existsSync(newExePath)) {
+
+  try {
+    if (path.resolve(newExePath) !== path.resolve(stable)) {
+      fs.copyFileSync(newExePath, stable)
+      result.stableLauncher.created = true
+    } else {
+      result.stableLauncher.created = true
+    }
+    const stableCheck = verifyCopiedSha(stable, expectedSha)
+    result.stableLauncher.shaMatch = Boolean(stableCheck.ok)
+    if (!stableCheck.ok) {
+      result.ok = false
+      result.reason = 'LAUNCH_ENTRY_VERIFY_FAILED'
+      return result
+    }
+  } catch (error) {
+    result.ok = false
+    result.reason = 'STABLE_LAUNCHER_WRITE_FAILED'
+    result.error = String(error && error.message || error)
+    return result
+  }
+
+  if (oldExePath && path.resolve(oldExePath) !== path.resolve(newExePath)) {
     try {
       fs.copyFileSync(newExePath, oldExePath)
-    } catch { /* ignore — file may still be locked briefly */ }
+      result.oldEntry.updated = true
+      const oldCheck = verifyCopiedSha(oldExePath, expectedSha)
+      result.oldEntry.shaMatch = Boolean(oldCheck.ok)
+      if (!oldCheck.ok) {
+        result.ok = false
+        result.reason = 'ORIGINAL_ENTRY_UPDATE_FAILED'
+        return result
+      }
+    } catch (error) {
+      result.ok = false
+      result.reason = 'ORIGINAL_ENTRY_WRITE_FAILED'
+      result.error = String(error && error.message || error)
+      return result
+    }
+  } else if (oldExePath) {
+    result.oldEntry.updated = true
+    result.oldEntry.shaMatch = true
   }
-  writeInstallCurrentPointers(installDir, {
-    pending: null,
-    current: {
-      currentPortableExePath: path.resolve(newExePath),
-      stableLauncherPath: path.resolve(stable),
-      buildId: committed.buildId,
-      version: committed.version,
-      sha256: committed.sha256,
-      releaseSequence: committed.releaseSequence,
-      updateId: committed.updateId,
-      committedAt: committed.committedAt,
-    },
-  })
-  return { stableLauncherPath: stable }
+
+  const pointer = {
+    currentPortableExePath: path.resolve(newExePath),
+    stableLauncherPath: path.resolve(stable),
+    buildId: committed.buildId,
+    version: committed.version,
+    sha256: committed.sha256,
+    releaseSequence: committed.releaseSequence,
+    updateId: committed.updateId,
+    committedAt: committed.committedAt || new Date().toISOString(),
+  }
+  try {
+    writeInstallCurrentPointers(installDir, { pending: null, current: pointer })
+    result.currentPointer.written = true
+    const readBack = readInstallCurrent(installDir)
+    const valid = Boolean(
+      readBack
+      && path.resolve(String(readBack.currentPortableExePath || '')) === path.resolve(newExePath)
+      && String(readBack.sha256 || '').toLowerCase() === expectedSha
+      && Number(readBack.releaseSequence || 0) === Number(committed.releaseSequence || 0)
+      && String(readBack.updateId || '') === String(committed.updateId || ''),
+    )
+    result.currentPointer.valid = valid
+    if (!valid) {
+      result.ok = false
+      result.reason = 'CURRENT_POINTER_VERIFY_FAILED'
+      return result
+    }
+  } catch (error) {
+    result.ok = false
+    result.reason = 'CURRENT_POINTER_WRITE_FAILED'
+    result.error = String(error && error.message || error)
+    return result
+  }
+
+  return result
 }
 
 /**
@@ -385,10 +599,56 @@ function cleanupOldVersionedExes(installDir, { keepPaths = [], maxExtras = 0 } =
       try {
         fs.unlinkSync(row.full)
         removed += 1
-      } catch { /* ignore */ }
+      } catch { /* ignore — CLEANUP_BEST_EFFORT */ }
     }
   } catch { /* ignore */ }
   return { removed }
+}
+
+/**
+ * Conservative startup recovery when helper died mid-handoff.
+ * Prefer ROLLBACK OLD unless NEW is clearly COMMITTED.
+ */
+function inspectStaleApplying(userDataDir, { now = Date.now(), ttlMs = APPLYING_LOCK_TTL_MS } = {}) {
+  const phaseRow = getPhase(userDataDir)
+  const phase = String(phaseRow.phase || PHASE.IDLE)
+  const result = readHandoffResult(userDataDir)
+  if (result?.result === 'COMMITTED' || phase === PHASE.COMMITTED) {
+    return { stale: false, action: 'none', reason: 'already_committed' }
+  }
+  if (result?.result === 'ROLLED_BACK' || phase === PHASE.ROLLED_BACK) {
+    return { stale: false, action: 'none', reason: 'already_rolled_back' }
+  }
+  const lock = readApplyingLock(userDataDir)
+  const applyingPhases = [
+    PHASE.WAITING_OLD_EXIT,
+    PHASE.STARTING_NEW,
+    PHASE.WAITING_NEW_READY,
+    PHASE.COMMITTING,
+    PHASE.ROLLING_BACK,
+    PHASE.PREPARED,
+  ]
+  if (!applyingPhases.includes(phase) && !lock) {
+    return { stale: false, action: 'none', reason: 'idle' }
+  }
+  const createdAt = Date.parse(String(lock?.createdAt || phaseRow.at || '')) || 0
+  const lockTtl = Number(lock?.ttlMs || ttlMs) || ttlMs
+  const expired = !createdAt || (now - createdAt) > lockTtl
+  const helperAlive = isPidAlive(lock?.helperPid)
+  if (!expired && helperAlive) {
+    return { stale: false, action: 'wait', reason: 'helper_alive' }
+  }
+  if (phase === PHASE.COMMITTED) {
+    return { stale: false, action: 'none', reason: 'committed' }
+  }
+  // Conservative: cannot prove COMMITTED → prefer rollback
+  return {
+    stale: true,
+    action: 'rollback',
+    reason: helperAlive ? 'ttl_expired' : 'helper_dead_or_missing',
+    phase,
+    lock,
+  }
 }
 
 module.exports = {
@@ -398,6 +658,8 @@ module.exports = {
   READY_FILE,
   COMMITTED_FILE,
   FAILED_FILE,
+  HANDOFF_RESULT_FILE,
+  APPLYING_LOCK_TTL_MS,
   STABLE_LAUNCHER_NAME,
   resolveUpdateStateDir,
   ensureStateDir,
@@ -405,6 +667,14 @@ module.exports = {
   setPhase,
   getPhase,
   isUpdateApplying,
+  writeApplyingLock,
+  readApplyingLock,
+  writeHandoffResult,
+  readHandoffResult,
+  getRollbackArtifactPath,
+  prepareRollbackArtifact,
+  readRollbackMeta,
+  restoreOriginalEntryFromArtifact,
   writePrepared,
   readPrepared,
   writeReadyAck,
@@ -426,4 +696,6 @@ module.exports = {
   readInstallPending,
   commitLaunchEntries,
   cleanupOldVersionedExes,
+  inspectStaleApplying,
+  isPidAlive,
 }

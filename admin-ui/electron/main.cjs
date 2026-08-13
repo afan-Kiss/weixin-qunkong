@@ -188,9 +188,11 @@ let afterUpdateTasksRecovered = false
 let afterUpdateWindowReady = false
 let afterUpdateRendererReady = false
 let afterUpdateReadyEmitted = false
+let afterUpdateStartupFatal = false
 
 function tryEmitAfterUpdateReadyAck(reason = '') {
   if (afterUpdateReadyEmitted) return
+  if (afterUpdateStartupFatal) return
   const cli = parseUpdateCliArgs(process.argv)
   if (!cli.afterUpdate) return
   if (!afterUpdateStorageReady || !afterUpdateTasksRecovered || !afterUpdateWindowReady || !afterUpdateRendererReady) {
@@ -5799,6 +5801,7 @@ function createWindow() {
   const loadPromise = entry.type === 'url' ? win.loadURL(entry.value) : win.loadFile(entry.value)
   loadPromise.catch(async (error) => {
     appLog('ERROR', '界面加载失败', { error: rawErrorMessage(error), entry: entry.value })
+    afterUpdateStartupFatal = true
     try {
       await dialog.showMessageBox(win, {
         type: 'error',
@@ -5810,9 +5813,11 @@ function createWindow() {
   })
   win.webContents.on('did-fail-load', (_event, code, desc, url) => {
     appLog('ERROR', '界面渲染失败', { code, desc, url })
+    if (Number(code) !== 0) afterUpdateStartupFatal = true
   })
   win.webContents.on('render-process-gone', (_event, details) => {
     appLog('ERROR', '界面进程异常退出', { reason: details.reason, exitCode: details.exitCode })
+    afterUpdateStartupFatal = true
   })
   win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
     if (level >= 2) appLog('ERROR', '界面脚本错误', { reason: String(message || '').slice(0, 1000), line, sourceId })
@@ -5962,6 +5967,35 @@ app.whenReady().then(async () => {
     registerIpc()
     markStartup('ipc registered')
 
+    // Stale handoff recovery: helper crashed mid-APPLYING → prefer rollback old
+    try {
+      const updateState = require('./update-state.cjs')
+      const updateHandoff = require('./update-handoff.cjs')
+      const stale = updateState.inspectStaleApplying(app.getPath('userData'))
+      if (stale.stale && stale.action === 'rollback') {
+        const prepared = updateState.readPrepared(app.getPath('userData'))
+        appLog('WARN', '[UPDATE] stale applying lock — recovering via rollback', {
+          reason: stale.reason,
+          phase: stale.phase,
+          updateId: prepared?.updateId || '',
+        })
+        void updateHandoff.finalizeRollback({
+          userDataPath: app.getPath('userData'),
+          updateId: prepared?.updateId,
+          currentExe: prepared?.oldExePath,
+          finalPath: prepared?.exePath,
+          expectedSha256: prepared?.sha256,
+          releaseSequence: prepared?.releaseSequence,
+          buildId: prepared?.buildId,
+          reason: `STALE_APPLYING_${stale.reason || 'unknown'}`,
+        }).catch((err) => {
+          appLog('ERROR', '[UPDATE] stale rollback failed', { error: rawErrorMessage(err) })
+        })
+      }
+    } catch (staleErr) {
+      appLog('WARN', '[UPDATE] stale applying inspect skipped', { error: rawErrorMessage(staleErr) })
+    }
+
     // 首屏必需的轻量设置恢复（无磁盘扫描）
     saveSetting('general', normalizeSettings(getSettings().general))
     const storedQrMonitor = getSettings().qrMonitor
@@ -6033,9 +6067,9 @@ app.whenReady().then(async () => {
         tryEmitAfterUpdateReadyAck('tasks-recovered')
       } catch (error) {
         appLog('ERROR', '恢复中断任务失败', { error: rawErrorMessage(error) })
-        // Still allow READY if recovery throws — but prefer recovered first
-        afterUpdateTasksRecovered = true
-        tryEmitAfterUpdateReadyAck('tasks-recovered-error')
+        // FATAL_READY_GATE: recovery failure must never emit READY
+        afterUpdateTasksRecovered = false
+        afterUpdateStartupFatal = true
       }
       try {
         loadApiContracts()
@@ -6111,6 +6145,9 @@ app.whenReady().then(async () => {
     }
   } catch (error) {
     appLog('ERROR', '软件启动失败', { error: rawErrorMessage(error) })
+    afterUpdateStartupFatal = true
+    afterUpdateStorageReady = false
+    afterUpdateTasksRecovered = false
     try {
       await dialog.showErrorBox('软件启动失败', toUserErrorMessage(error, '启动时发生错误，请重试或重新下载便携版'))
     } catch {}

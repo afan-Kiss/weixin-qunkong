@@ -210,6 +210,12 @@ export async function bootstrapClientUpdate() {
   if (bootstrapStarted) return
   bootstrapStarted = true
   if (!window.wxControl?.checkClientUpdate) return
+  // NEW_VERSION_READY_GATE: wait until Vue root mounted + painted (not first JS line)
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve())
+    })
+  })
   try { await window.wxControl?.notifyUpdateRuntimeReady?.() } catch { /* ignore */ }
 
   let pageReloadGuard = false
