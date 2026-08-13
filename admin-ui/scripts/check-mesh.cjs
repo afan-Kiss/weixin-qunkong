@@ -33,11 +33,26 @@ if (!fs.existsSync(exePath)) {
       problems.push(`${EXE_NAME} too small (${size} bytes) — refuse packaging a broken agent`)
     } else {
       try {
-        const { writePackagedArtifactMeta } = require('../electron/mesh-agent-artifact.cjs')
+        const {
+          writePackagedArtifactMeta,
+          assertPackagedArtifactMetaMatchesExe,
+          sha256FileSync,
+        } = require('../electron/mesh-agent-artifact.cjs')
+        // Always regenerate meta from the real EXE before packaging.
         const meta = writePackagedArtifactMeta(meshDir, exePath)
-        console.log(`[MESH] agent-artifact.json sha256=${String(meta.sha256).slice(0, 16)}… size=${meta.size}`)
+        const check = assertPackagedArtifactMetaMatchesExe(meshDir, exePath, { strict: true })
+        if (!check.ok) {
+          problems.push(`${check.code}: ${check.message}`)
+        } else {
+          const actual = sha256FileSync(exePath)
+          if (String(meta.sha256).toLowerCase() !== actual.toLowerCase()) {
+            problems.push('MESH_AGENT_ARTIFACT_META_MISMATCH: regenerated meta still mismatches exe')
+          }
+          console.log(`[MESH] agent-artifact.json sha256=${String(meta.sha256).slice(0, 16)}… size=${meta.size}`)
+        }
       } catch (err) {
-        warnings.push(`agent-artifact.json not written: ${err.message}`)
+        if (strict) problems.push(`agent-artifact.json failed: ${err.message}`)
+        else warnings.push(`agent-artifact.json not written: ${err.message}`)
       }
     }
   } catch (err) {

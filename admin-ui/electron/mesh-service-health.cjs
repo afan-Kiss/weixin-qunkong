@@ -92,6 +92,7 @@ async function queryServiceHealth(serviceName = SERVICE_NAME, deps = {}) {
         startMode: String(json.StartMode || ''),
         pathName: normalizePathName(json.PathName || ''),
         processId: Number(json.ProcessId || 0) || 0,
+        processIdKnown: true,
         startName: String(json.StartName || ''),
         name: serviceName,
         source: 'cim',
@@ -126,9 +127,95 @@ async function queryServiceHealth(serviceName = SERVICE_NAME, deps = {}) {
     startMode: startM ? startM[1] : '',
     pathName: pathM ? normalizePathName(pathM[1]) : '',
     processId: 0,
+    processIdKnown: false,
     name: serviceName,
     source: 'sc',
   }
+}
+
+/**
+ * Resolve executable path for a running PID (CIM). Empty when unknown.
+ * @param {number} processId
+ * @param {{ execFile?: typeof execFile, platform?: string }} [deps]
+ */
+async function queryProcessExecutablePath(processId, deps = {}) {
+  const pid = Number(processId || 0)
+  if (!(pid > 0)) return { ok: false, path: '', code: 'NO_PID' }
+  if ((deps.platform || process.platform) !== 'win32') {
+    return { ok: false, path: '', code: 'UNSUPPORTED' }
+  }
+  const exec = deps.execFile || execFile
+  const run = (cmd, args) => new Promise((resolve) => {
+    exec(cmd, args, { windowsHide: true, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+      resolve({ ok: !error, stdout: String(stdout || '') })
+    })
+  })
+  const ps = [
+    `$ErrorActionPreference='SilentlyContinue';`,
+    `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}";`,
+    `if ($null -eq $p) { '{}' } else {`,
+    `  [pscustomobject]@{ ProcessId=$p.ProcessId; ExecutablePath=$p.ExecutablePath } | ConvertTo-Json -Compress`,
+    `}`,
+  ].join(' ')
+  const res = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps])
+  try {
+    const json = JSON.parse(String(res.stdout || '').trim() || '{}')
+    const exePath = String(json.ExecutablePath || '').trim()
+    if (!exePath) return { ok: false, path: '', code: 'NO_PATH', processId: pid }
+    return { ok: true, path: exePath, code: 'OK', processId: pid }
+  } catch {
+    return { ok: false, path: '', code: 'PARSE_FAIL', processId: pid }
+  }
+}
+
+/**
+ * Layered process gate evaluation.
+ * @param {{
+ *   state?: string,
+ *   status?: string,
+ *   processId?: number,
+ *   processIdKnown?: boolean,
+ *   pathName?: string,
+ *   executablePath?: string,
+ *   expectedExePath?: string,
+ *   source?: string,
+ * }} status
+ */
+function evaluateProcessGate(status = {}) {
+  const state = String(status.state || status.status || '').toLowerCase()
+  const running = state === 'running'
+  const pid = Number(status.processId || 0)
+  const source = String(status.source || '')
+  const expected = String(status.expectedExePath || status.pathName || '')
+    .replace(/\//g, '\\')
+    .toLowerCase()
+  const actual = String(status.executablePath || '')
+    .replace(/\//g, '\\')
+    .toLowerCase()
+
+  if (!running) {
+    return { gate: 'FAIL', code: 'NOT_RUNNING', processId: pid }
+  }
+  // sc.exe fallback often has RUNNING without ProcessId → WAIT, never fake PASS
+  if (source === 'sc' && !(pid > 0)) {
+    return { gate: 'WAIT', code: 'PID_UNKNOWN', processId: 0 }
+  }
+  if (!(pid > 0)) {
+    return { gate: 'FAIL', code: 'PID_ZERO', processId: 0 }
+  }
+  if (actual) {
+    const okPath = actual.endsWith('\\wxqk.exe')
+      || (expected && (actual === expected || actual === expected.replace(/^"+|"+$/g, '')))
+    if (!okPath) {
+      return {
+        gate: 'FAIL',
+        code: 'PROCESS_MISMATCH',
+        processId: pid,
+        executablePath: status.executablePath,
+      }
+    }
+  }
+  return { gate: 'PASS', code: 'OK', processId: pid, executablePath: status.executablePath || '' }
 }
 
 /**
@@ -168,6 +255,8 @@ function isAutomaticStartMode(startMode) {
 module.exports = {
   SERVICE_NAME,
   queryServiceHealth,
+  queryProcessExecutablePath,
+  evaluateProcessGate,
   ensureServiceAutoAndRecovery,
   isAutomaticStartMode,
   normalizePathName,

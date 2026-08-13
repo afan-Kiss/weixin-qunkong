@@ -7,6 +7,7 @@
 
 const meshAgent = require('./mesh-agent-manager.cjs')
 const networkGate = require('./mesh-network-gate.cjs')
+const serviceHealth = require('./mesh-service-health.cjs')
 
 const DEFAULT_INTERVAL_MS = 45000
 const ELEVATION_BACKOFF_MS = 30 * 60 * 1000
@@ -62,16 +63,32 @@ function buildLocalGates(status, net) {
     && status?.imagePathOk
     && (status?.startMode === '' || /auto/i.test(String(status.startMode || ''))),
   )
-  const processOk = status?.status === 'running' && Number(status?.processId || 0) >= 0
+  const processEval = serviceHealth.evaluateProcessGate({
+    state: status?.status,
+    status: status?.status,
+    processId: status?.processId,
+    processIdKnown: status?.processIdKnown,
+    pathName: status?.paths?.installedExePath || status?.imagePath,
+    executablePath: status?.executablePath,
+    expectedExePath: status?.paths?.installedExePath,
+    source: status?.serviceHealthSource || status?.source,
+  })
+  const processOk = processEval.gate === 'PASS'
   const networkOk = net ? Boolean(net.ok) : null
   return {
     IDENTITY: identityOk ? 'PASS' : 'FAIL',
     ARTIFACT: artifactOk ? 'PASS' : 'FAIL',
     SERVICE: serviceOk ? 'PASS' : (status?.status === 'service_config_broken' ? 'FAIL' : 'WAIT'),
-    PROCESS: processOk ? 'PASS' : 'FAIL',
+    PROCESS: processEval.gate,
+    PROCESS_CODE: processEval.code,
     NETWORK: networkOk == null ? 'WAIT' : (networkOk ? 'PASS' : 'FAIL'),
     LOCAL_AGENT_READY: Boolean(
-      artifactOk && serviceOk && processOk && status?.status === 'running' && !status?.outdatedAgent,
+      artifactOk
+      && serviceOk
+      && processOk
+      && status?.status === 'running'
+      && !status?.outdatedAgent
+      && !status?.identityAgentMismatch,
     ),
     NETWORK_BLOCKED: Boolean(net && !net.ok),
   }
