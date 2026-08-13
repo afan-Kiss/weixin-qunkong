@@ -110,15 +110,22 @@ def main() -> int:
     files_ok = bool(files.get("ok")) and int(files.get("viewmode") or 0) == 13
     desk_url = str(desk.get("embedUrl") or "")
     files_url = str(files.get("embedUrl") or "")
+    desk_ok = desk_ok and "wxqkauto=desktop" in desk_url and "hide=63" in desk_url
+    files_ok = files_ok and "wxqkauto=files" in files_url and "hide=63" in files_url
 
-    _line("DESKTOP_SESSION", desk_ok)
+    _line("DESKTOP_SESSION_GATE", desk_ok)
     if desk_ok:
         print("VIEWMODE: 11")
+        print("WXQKAUTO: desktop")
         print(f"HIDE63: {'yes' if 'hide=63' in desk_url else 'no'}")
-    _line("FILES_SESSION", files_ok)
+    _line("FILES_SESSION_GATE", files_ok)
     if files_ok:
         print("VIEWMODE: 13")
+        print("WXQKAUTO: files")
         print(f"HIDE63: {'yes' if 'hide=63' in files_url else 'no'}")
+    print("DESKTOP_RELAY_GATE: SKIP (use mesh_embed_e2e_check.py / browser)")
+    print("FILES_RELAY_GATE: SKIP (use mesh_embed_e2e_check.py / browser)")
+    print("NOTE: SESSION_URL_GATE != RELAY_CONNECTION_GATE != USER_GUI_GATE")
 
     # Never print tokens / full node / login key
     blob = json.dumps({"desk": desk, "files": files, "status": status}, ensure_ascii=False)
@@ -136,8 +143,8 @@ def main() -> int:
 
     print("")
     if control_ok and node_found and node_online and desk_ok and files_ok:
-        print("RESULT: READY_FOR_USER_LIVE_TEST")
-        print("NOTE: User must verify real Desktop picture/mouse and Files upload/download/SHA256/delete.")
+        print("RESULT: SESSION_GATES_PASS")
+        print("NOTE: Run mesh_embed_e2e_check.py for DESKTOP/FILES_RELAY_CONNECTED before user GUI test.")
         return 0
     print("RESULT: NOT_READY")
     return 2

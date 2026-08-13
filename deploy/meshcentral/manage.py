@@ -229,7 +229,23 @@ def cmd_up(_: argparse.Namespace) -> int:
     cmd_prepare(_)
     if cmd_validate(_) != 0:
         return 1
-    return _run(["docker", "compose", "up", "-d"]).returncode
+    rc = _run(["docker", "compose", "up", "-d"]).returncode
+    if rc != 0:
+        return rc
+    if not _wait_mesh_http(90):
+        print("[MESH] WARN MeshCentral HTTP not ready yet; skip autoconnect patch for now")
+        return 0
+    try:
+        from wxqk_patch import apply_autoconnect_patch
+
+        patch_result = apply_autoconnect_patch(restart=False)
+        if patch_result.get("ok"):
+            print(f"[MESH] autoconnect patch re-applied: {patch_result.get('views')}")
+        else:
+            print(f"[MESH] WARN autoconnect patch: {patch_result}")
+    except Exception as exc:
+        print(f"[MESH] WARN autoconnect patch: {type(exc).__name__}: {exc}")
+    return 0
 
 
 def cmd_down(_: argparse.Namespace) -> int:
@@ -412,6 +428,15 @@ def _apply_config_defaults(public_host: str, framing_origins: list[str]) -> None
     settings["webRTC"] = False
     settings["allowLoginToken"] = True
     settings["allowFraming"] = True
+    # Docker + nginx TLS offload: trust X-Forwarded-For from bridge gateway,
+    # not only 127.0.0.1 (container sees 172.18.0.1 as peer).
+    try:
+        from wxqk_patch import normalize_tls_offload
+
+        normalize_tls_offload(settings)
+    except Exception:
+        if str(settings.get("TlsOffload") or "").strip() == "127.0.0.1":
+            settings["TlsOffload"] = "127.0.0.1,172.16.0.0/12"
     if not settings.get("Cert"):
         settings["Cert"] = public_host
     domains = data.setdefault("domains", {})
@@ -578,6 +603,24 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
 
     synced = _sync_wxqk_mesh_env(login_key, env)
     print(f"[MESH] wxqk mesh env synced → {synced}")
+
+    # WXQK embed auto-connect patch (MeshCentral 1.2.4 only; idempotent)
+    try:
+        from wxqk_patch import apply_autoconnect_patch, ensure_compose_view_mounts_note
+
+        patch_result = apply_autoconnect_patch(restart=False)
+        if not patch_result.get("ok"):
+            print(f"[MESH] FAIL autoconnect patch: {patch_result}")
+            return 1
+        print(
+            f"[MESH] autoconnect patch OK version={patch_result.get('version')} "
+            f"views={patch_result.get('views')} sha={patch_result.get('snippet_sha256')}"
+        )
+        print(f"[MESH] {ensure_compose_view_mounts_note()}")
+    except Exception as exc:
+        print(f"[MESH] FAIL autoconnect patch exception: {type(exc).__name__}: {exc}")
+        return 1
+
     print("[MESH] bootstrap complete — run: python manage.py doctor")
     # Run doctor as final gate (non-fatal for control.ashx if websocket missing on host)
     return cmd_doctor(args)
@@ -843,6 +886,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "skipped (set --wxqk-health-url to probe)",
             hint="",
         )
+
+    # WXQK embed auto-connect patch (1.2.4)
+    try:
+        from wxqk_patch import apply_autoconnect_patch, verify_autoconnect_patch
+
+        verified = verify_autoconnect_patch()
+        if not verified.get("ok"):
+            # Self-heal once during doctor when container was recreated
+            applied = apply_autoconnect_patch(restart=False)
+            verified = verify_autoconnect_patch() if applied.get("ok") else applied
+        patch_ok = bool(verified.get("ok"))
+        _print_check(
+            patch_ok,
+            "WXQK authcookie+autoconnect patch",
+            f"version={verified.get('version')} views={verified.get('views')}",
+            hint="python manage.py bootstrap (applies 1.2.4-only patch)",
+        )
+        if not patch_ok:
+            failures += 1
+    except Exception as exc:
+        _print_check(False, "WXQK autoconnect patch", f"{type(exc).__name__}: {exc}")
+        failures += 1
 
     print("")
     if failures:

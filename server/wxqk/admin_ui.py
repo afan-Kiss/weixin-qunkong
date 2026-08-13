@@ -159,6 +159,10 @@ select.input{padding-right:28px}
 .desktop-stage.has-frame iframe{display:block}
 .desktop-stage.has-frame{display:block;padding:0}
 .desktop-stage.has-frame #deskHint{display:none}
+.desktop-stage #deskRelayStatus{display:none;position:absolute;left:12px;right:12px;bottom:12px;z-index:4;padding:10px 12px;border-radius:8px;font-size:13px;font-weight:600;text-align:center;color:#fff;background:rgba(15,23,42,.82)}
+.desktop-stage #deskRelayStatus.is-visible{display:block}
+.desktop-stage #deskRelayStatus.is-ok{background:rgba(21,128,61,.88)}
+.desktop-stage #deskRelayStatus.is-err{background:rgba(185,28,28,.88)}
 .desktop-stage #deskStaleBanner{display:none;position:absolute;top:0;left:0;right:0;z-index:3;padding:8px 12px;font-size:13px;font-weight:600;text-align:center;color:#fff;background:rgba(185,28,28,.88);pointer-events:none}
 .desktop-stage.is-stale #deskStaleBanner{display:block}
 .desktop-stats{position:absolute;bottom:0;left:0;right:0;padding:4px 10px;font-size:11px;color:#cbd5e1;background:rgba(0,0,0,.55);font-variant-numeric:tabular-nums;z-index:2;display:none;gap:12px;flex-wrap:wrap}
@@ -1073,10 +1077,50 @@ async function stopDesktop() {
   }
   if (stage) stage.classList.remove('has-frame', 'fs');
   state.desktopSession = 0;
+  setDeskRelayStatus('');
   const closeBtn = document.getElementById('deskClose');
   const fsBtn = document.getElementById('deskFullscreen');
   if (closeBtn) closeBtn.disabled = true;
   if (fsBtn) fsBtn.disabled = true;
+}
+function setDeskRelayStatus(text, kind) {
+  const el = document.getElementById('deskRelayStatus');
+  if (!el) return;
+  const msg = String(text || '').trim();
+  if (!msg) {
+    el.hidden = true;
+    el.textContent = '';
+    el.classList.remove('is-visible', 'is-ok', 'is-err');
+    return;
+  }
+  el.hidden = false;
+  el.textContent = msg;
+  el.classList.add('is-visible');
+  el.classList.toggle('is-ok', kind === 'ok');
+  el.classList.toggle('is-err', kind === 'err');
+}
+function onWxqkMeshRelayMessage(ev) {
+  try {
+    const data = ev && ev.data;
+    if (!data || data.source !== 'wxqk') return;
+    // Only accept messages while an embed session is open
+    if (!state.desktopSession) return;
+    const kind = String(data.kind || '');
+    const st = String(data.state || '');
+    if (kind !== 'desktop' && kind !== 'files') return;
+    if (st === 'page_loaded' || st === 'connecting') {
+      setDeskRelayStatus(kind === 'files' ? '正在连接文件…' : '正在连接桌面…');
+    } else if (st === 'connected') {
+      setDeskRelayStatus(kind === 'files' ? '文件已连接' : '桌面已连接', 'ok');
+      // Auto-hide success banner after a moment so it does not cover the canvas
+      setTimeout(() => {
+        const el = document.getElementById('deskRelayStatus');
+        if (el && /已连接/.test(el.textContent || '')) setDeskRelayStatus('');
+      }, 2500);
+    } else if (st === 'failed') {
+      setDeskRelayStatus(kind === 'files' ? '文件连接失败，请重试' : '桌面连接失败，请重试', 'err');
+    }
+  } catch (_) { /* ignore */ }
 }
 function renderDesktopShell() {
   return '<div class="desktop-layout">'
@@ -1097,10 +1141,11 @@ function renderDesktopShell() {
     + '<button class="btn btn-ghost btn-sm" id="deskClose" disabled>关闭画面</button></div>'
     + '<div class="desktop-stage" id="deskStage">'
     + '<iframe id="deskFrame" title="mesh-desktop" allow="clipboard-read; clipboard-write; fullscreen"></iframe>'
-    + '<div id="deskHint">选择左侧在线客户端 →「打开桌面」查看画面并操作键鼠；「文件管理」用于传文件。若内嵌失败请点「新窗口」。</div></div></div>'
+    + '<div id="deskHint">选择左侧在线客户端 →「打开桌面」查看画面并操作键鼠；「文件管理」用于传文件。若内嵌失败请点「新窗口」。</div>'
+    + '<div id="deskRelayStatus" class="desk-relay-status" hidden></div></div></div>'
     + '<div class="card desktop-info"><h3 style="margin:0 0 10px;font-size:14px">设备状态</h3>'
     + '<div id="deskInfo" class="muted">未选择</div>'
-    + '<p class="muted" style="margin-top:16px;font-size:12px;line-height:1.6">画面、键鼠与文件由 MeshCentral Relay 提供（webRTC 关闭）。</p></div></div>';
+    + '<p class="muted" style="margin-top:16px;font-size:12px;line-height:1.6">画面、键鼠与文件由远程维护通道提供。</p></div></div>';
 }
 function deskFilteredClients(data) {
   const rows = (data && data.online) || [];
@@ -1281,6 +1326,9 @@ async function openMeshSession(mode, { forceTab } = {}) {
       window.open(url, '_blank', 'noopener');
       return;
     }
+    setDeskRelayStatus(mode === 'files' ? '正在连接文件…' : '正在连接桌面…');
+    // Tear down previous relay before attaching a new clean session
+    try { frame.src = 'about:blank'; } catch (_) {}
     frame.src = url;
     stage.classList.add('has-frame');
     const closeBtn = document.getElementById('deskClose');
@@ -1292,6 +1340,7 @@ async function openMeshSession(mode, { forceTab } = {}) {
     await refreshDesktopMeshStatus();
   } catch (e) {
     handleAuthError(e);
+    setDeskRelayStatus((mode === 'files' ? '文件' : '桌面') + '连接失败', 'err');
     alert(e.message || ('打开' + label + '失败'));
   }
 }
@@ -1344,6 +1393,10 @@ function bindDesktopPageEvents() {
   };
   const close = document.getElementById('deskClose');
   if (close) close.onclick = () => stopDesktop();
+  if (!state._wxqkRelayMsgBound) {
+    window.addEventListener('message', onWxqkMeshRelayMessage);
+    state._wxqkRelayMsgBound = true;
+  }
   if (state.desktopSelectedId) selectDesktopClient(state.desktopSelectedId);
 }
 

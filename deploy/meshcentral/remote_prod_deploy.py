@@ -191,7 +191,7 @@ def _config_json(host: str) -> str:
             "AliasPort": MESH_PUBLIC_PORT,
             "RedirPort": 80,
             "AgentPort": MESH_AGENT_PORT,
-            "TlsOffload": "127.0.0.1",
+            "TlsOffload": "127.0.0.1,172.16.0.0/12",
             "SelfUpdate": False,
             "sessionSameSite": "none",
             "webRTC": False,

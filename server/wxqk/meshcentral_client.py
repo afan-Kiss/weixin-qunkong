@@ -223,13 +223,17 @@ def build_embed_url(node_id: str, viewmode: int, *, userid: str = "", login_toke
     if vm not in (VIEWMODE_DESKTOP, VIEWMODE_FILES):
         raise ValueError(f"unsupported viewmode {vm}")
     token = login_token or mint_login_token(userid or _normalize_userid(""))
+    auto = "desktop" if vm == VIEWMODE_DESKTOP else "files"
+    # Keep wxqkauto in query for logs/tests; also put it in the hash because MeshCentral
+    # login cleanup often strips unknown query args from location.search.
     q = (
         f"login={quote(token, safe='')}"
         f"&node={quote(nid, safe='')}"
         f"&viewmode={vm}"
         f"&hide={EMBED_HIDE}"
+        f"&wxqkauto={auto}"
     )
-    return f"{base}/?{q}"
+    return f"{base}/?{q}#wxqkauto={auto}"
 
 
 def _ssl_context_for_url(url: str) -> ssl.SSLContext | None:
