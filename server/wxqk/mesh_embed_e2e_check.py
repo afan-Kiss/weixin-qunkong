@@ -60,7 +60,10 @@ def wait_relay_connected(page, *, status_id: str, timeout_ms: int = 90000) -> tu
             last = str(page.evaluate(deadline_js) or "")
         except Exception as exc:
             last = f"eval_error:{type(exc).__name__}"
-        if "Connected" in last and "Disconnected" not in last:
+        # EN Connected / ZH 已连接
+        if "Disconnected" in last or "已断开" in last:
+            pass
+        elif ("Connected" in last) or ("已连接" in last):
             return True, last.strip()[:80]
         page.wait_for_timeout(500)
     return False, last.strip()[:80]
@@ -72,6 +75,11 @@ def main() -> int:
     parser.add_argument("--hostname", default="")
     parser.add_argument("--data-dir", default=os.environ.get("WXQK_DATA_DIR") or str(ROOT / "_e2e_data"))
     parser.add_argument("--hide-diag", action="store_true", help="Use hide=0 for diagnosis (default hide=63)")
+    parser.add_argument(
+        "--locale",
+        default=os.environ.get("WXQK_MESH_E2E_LOCALE") or "zh-CN",
+        help="Browser locale / Accept-Language (default zh-CN; Mesh serves translated views)",
+    )
     args = parser.parse_args()
 
     try:
@@ -96,33 +104,21 @@ def main() -> int:
     files = mc.get_files_session(data_dir, cid, hostname=args.hostname)
     desk_url = str(desk.get("embedUrl") or "")
     files_url = str(files.get("embedUrl") or "")
-    # Browser on the Mesh host cannot hairpin to the public IP for control WS.
-    # Rewrite embed host to loopback for local relay verification only.
-    local_host = str(os.environ.get("WXQK_MESH_WS_LOCAL_HOST") or "127.0.0.1").strip() or "127.0.0.1"
-    try:
-        from urllib.parse import urlparse, urlunparse
+    # Keep public host in the embed URL so browser Origin stays valid.
+    # MeshCentral rejects Origin https://127.0.0.1:… ("Invalid origin").
+    # On the Mesh host, optional WXQK_MESH_WS_LOCAL_HOST maps DNS→loopback via Chromium.
+    local_host = str(os.environ.get("WXQK_MESH_WS_LOCAL_HOST") or "").strip()
+    chromium_args: list[str] = []
+    if local_host:
+        try:
+            from urllib.parse import urlparse
 
-        def _to_local(u: str) -> str:
-            p = urlparse(u)
-            if not p.scheme:
-                return u
-            netloc = p.netloc
-            if "@" in netloc:
-                return u
-            hostport = netloc
-            if hostport.startswith("["):
-                return u
-            if ":" in hostport:
-                host, port = hostport.rsplit(":", 1)
-                netloc2 = f"{local_host}:{port}"
-            else:
-                netloc2 = local_host
-            return urlunparse((p.scheme, netloc2, p.path, p.params, p.query, p.fragment))
-
-        desk_url = _to_local(desk_url)
-        files_url = _to_local(files_url)
-    except Exception:
-        pass
+            host = urlparse(desk_url).hostname or urlparse(files_url).hostname or ""
+            if host and host not in ("127.0.0.1", "localhost"):
+                chromium_args.append(f"--host-resolver-rules=MAP {host} {local_host}")
+                print(f"hairpin MAP {host} -> {local_host}")
+        except Exception:
+            pass
     desk_sess = bool(desk.get("ok")) and "viewmode=11" in desk_url and "wxqkauto=desktop" in desk_url
     files_sess = bool(files.get("ok")) and "viewmode=13" in files_url and "wxqkauto=files" in files_url
     _line("DESKTOP_SESSION_GATE", desk_sess)
@@ -140,19 +136,41 @@ def main() -> int:
     desk_detail = ""
     files_detail = ""
 
+    locale = str(args.locale or "zh-CN").strip() or "zh-CN"
+    print(f"browser locale={locale}")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(ignore_https_errors=True)
+        browser = p.chromium.launch(headless=True, args=chromium_args)
+        context = browser.new_context(
+            ignore_https_errors=True,
+            locale=locale,
+            extra_http_headers={"Accept-Language": f"{locale},{locale.split('-')[0]};q=0.9,en;q=0.5"},
+        )
         try:
             page = context.new_page()
             page.goto(desk_url, wait_until="domcontentloaded", timeout=60000)
-            desk_relay, desk_detail = wait_relay_connected(page, status_id="deskstatus")
-            _line("DESKTOP_RELAY_GATE", desk_relay, desk_detail)
+            try:
+                p0 = str(page.evaluate("() => (document.querySelector('#p0span')||{}).textContent||''") or "")
+            except Exception:
+                p0 = ""
+            if "无法执行身份验证" in p0 or "Unable to authenticate" in p0 or "Invalid origin" in p0 or "无效来源" in p0:
+                _line("DESKTOP_RELAY_GATE", False, f"auth_or_origin:{p0[:60]}")
+                desk_relay, desk_detail = False, p0[:80]
+            else:
+                desk_relay, desk_detail = wait_relay_connected(page, status_id="deskstatus")
+                _line("DESKTOP_RELAY_GATE", desk_relay, desk_detail)
 
             page2 = context.new_page()
             page2.goto(files_url, wait_until="domcontentloaded", timeout=60000)
-            files_relay, files_detail = wait_relay_connected(page2, status_id="p13Status")
-            _line("FILES_RELAY_GATE", files_relay, files_detail)
+            try:
+                p0f = str(page2.evaluate("() => (document.querySelector('#p0span')||{}).textContent||''") or "")
+            except Exception:
+                p0f = ""
+            if "无法执行身份验证" in p0f or "Unable to authenticate" in p0f or "Invalid origin" in p0f or "无效来源" in p0f:
+                _line("FILES_RELAY_GATE", False, f"auth_or_origin:{p0f[:60]}")
+                files_relay, files_detail = False, p0f[:80]
+            else:
+                files_relay, files_detail = wait_relay_connected(page2, status_id="p13Status")
+                _line("FILES_RELAY_GATE", files_relay, files_detail)
         finally:
             browser.close()
 

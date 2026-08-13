@@ -79,12 +79,14 @@
 
     function isConnected() {
       var t = mode === 'desktop' ? statusText('deskstatus') : statusText('p13Status');
-      return /(^|\s)Connected/i.test(t) || /Connected,/i.test(t);
+      // MeshCentral en: Connected / zh-chs: 已连接 (exclude Disconnected / 已断开)
+      if (/已断开|Disconnected/i.test(t)) return false;
+      return /(^|\s)Connected/i.test(t) || /Connected,/i.test(t) || /已连接/.test(t);
     }
 
     function isConnecting() {
       var t = mode === 'desktop' ? statusText('deskstatus') : statusText('p13Status');
-      return /Connecting|Setup/i.test(t);
+      return /Connecting|Setup/i.test(t) || /正在连接|正在设置|准备/.test(t);
     }
 
     postState(mode, 'page_loaded', 'baked=' + bakedView);

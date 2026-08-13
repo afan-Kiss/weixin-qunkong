@@ -65,6 +65,14 @@ class WxqkPatchTest(unittest.TestCase):
         self.assertEqual(a2, "unchanged")
         self.assertEqual(once.count(AUTH_DONE), 1)
 
+    def test_authcookie_does_not_double_patch_nospace(self):
+        # Minified locales may already pass authCookie without spaces.
+        base = "meshserver=MeshServerCreateControl(domainUrl,authCookie);\n"
+        once, a1 = _inject_authcookie(base)
+        self.assertIn(a1, ("marked", "unchanged"))
+        self.assertEqual(once.count("authCookie"), 1)
+        self.assertNotIn("authCookie)/* WXQK_AUTHCOOKIE_V1 */,authCookie", once)
+
     def test_normalize_tls_offload_adds_docker_cidr(self):
         s = {"TlsOffload": "127.0.0.1"}
         self.assertTrue(normalize_tls_offload(s))

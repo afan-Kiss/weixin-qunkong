@@ -87,3 +87,4 @@ admin-ui/config/
 # Server one-off diagnostics (never commit)
 server/wxqk/_tmp_*
 server/wxqk/_e2e_data/
+deploy/meshcentral/_tmp_*
