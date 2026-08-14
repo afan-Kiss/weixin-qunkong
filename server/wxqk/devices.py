@@ -9,15 +9,22 @@ import os
 import secrets
 import threading
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 _lock = threading.RLock()
+_rate_lock = threading.RLock()
+_challenge_hits: dict[str, list[float]] = defaultdict(list)
 
 STATUS_PENDING = "PENDING"
 STATUS_ACTIVE = "ACTIVE"
 STATUS_SUSPENDED = "SUSPENDED"
 STATUS_REVOKED = "REVOKED"
+
+# Enrollment challenge rate limit (per IP / publicKey hash)
+CHALLENGE_RATE_WINDOW_SEC = 60.0
+CHALLENGE_RATE_MAX = 20
 
 
 def _path(data_dir: Path) -> Path:
@@ -71,10 +78,38 @@ def device_id_from_pubkey_b64(pub_b64: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def begin_challenge(body: dict[str, Any], data_dir: Path | None = None) -> dict[str, Any]:
+def _auto_activate_enabled() -> bool:
+    """Production default OFF. Legacy FACAI888_* still honored when explicitly set to 1."""
+    for key in ("WXQK_DEVICE_AUTO_ACTIVATE", "FACAI888_AUTO_ACTIVATE_DEVICES"):
+        raw = str(os.environ.get(key) or "").strip()
+        if raw == "1":
+            print(
+                f"WARN: {key}=1 enables auto-activate for new devices "
+                "(not recommended for public production enrollment)",
+                flush=True,
+            )
+            return True
+        if raw == "0":
+            return False
+    return False
+
+
+def _check_challenge_rate(bucket: str) -> bool:
+    now = time.time()
+    with _rate_lock:
+        hits = _challenge_hits[bucket]
+        hits[:] = [t for t in hits if now - t <= CHALLENGE_RATE_WINDOW_SEC]
+        if len(hits) >= CHALLENGE_RATE_MAX:
+            return False
+        hits.append(now)
+        return True
+
+
+def begin_challenge(body: dict[str, Any], data_dir: Path | None = None, *, client_ip: str = "") -> dict[str, Any]:
     dd = data_dir or Path(os.environ.get("FACAI888_DATA") or "/opt/facai888/data")
     pub = str(body.get("publicKey") or "").strip()
     build_id = str(body.get("buildId") or "").strip()
+    client_id = str(body.get("clientId") or "").strip()
     if not pub:
         return {"ok": False, "message": "missing_public_key"}
     try:
@@ -82,11 +117,23 @@ def begin_challenge(body: dict[str, Any], data_dir: Path | None = None) -> dict[
     except Exception:
         return {"ok": False, "message": "bad_public_key"}
     device_id = device_id_from_pubkey_b64(pub)
+    tip = str(client_ip or body.get("clientIp") or "").strip() or "unknown"
+    rate_key = f"{tip}|{device_id[:16]}"
+    if not _check_challenge_rate(rate_key):
+        return {"ok": False, "code": "RATE_LIMITED", "message": "注册挑战过于频繁"}
     with _lock:
         data = _load(dd)
         prev = (data.get("devices") or {}).get(device_id)
         if prev and str(prev.get("publicKey") or "") and str(prev.get("publicKey")) != pub:
             return {"ok": False, "code": "DEVICE_KEY_MISMATCH", "message": "公钥不可覆盖，请走管理端轮换"}
+        if prev and str(prev.get("clientId") or "").strip() and client_id:
+            bound = str(prev.get("clientId") or "").strip()
+            if client_id != bound:
+                return {
+                    "ok": False,
+                    "code": "CLIENT_ID_BOUND",
+                    "message": "clientId 已绑定，不能覆盖",
+                }
         challenge = secrets.token_hex(32)
         challenge_id = secrets.token_hex(12)
         ch = _load_challenges(dd)
@@ -96,22 +143,16 @@ def begin_challenge(body: dict[str, Any], data_dir: Path | None = None) -> dict[
             "publicKey": pub,
             "deviceId": device_id,
             "buildId": build_id,
+            "clientId": client_id,
             "expiresAt": time.time() + 300,
         }
-        # prune expired
         now = time.time()
         ch["challenges"] = {
             k: v for k, v in ch["challenges"].items()
             if float(v.get("expiresAt") or 0) > now
         }
         _save_challenges(dd, ch)
-    # Keep EXE-stamped buildId on the allow list (may differ from package buildId).
-    if build_id:
-        try:
-            import version_policy as vp
-            vp.allow_build_id(dd, build_id)
-        except Exception:
-            pass
+    # Never call version_policy.allow_build_id here — only release publish may widen allowlist.
     return {
         "ok": True,
         "challengeId": challenge_id,
@@ -138,23 +179,16 @@ def complete_challenge(body: dict[str, Any], data_dir: Path | None = None) -> di
             return {"ok": False, "code": "CHALLENGE_EXPIRED", "message": "challenge过期"}
         if str(row.get("publicKey")) != pub:
             return {"ok": False, "message": "public_key_mismatch"}
-        # Verify Ed25519(sig, challenge) — challenge string is returned once; client signs it.
-        # We only stored hash; client must also echo challenge in complete OR we keep plaintext briefly.
-        # Prefer: client signs challengeId||publicKey; for P0 require challengeEcho.
         challenge_echo = str(body.get("challenge") or "").strip()
         if not challenge_echo or hashlib.sha256(challenge_echo.encode()).hexdigest() != row.get("challengeHash"):
             return {"ok": False, "code": "CHALLENGE_MISMATCH", "message": "challenge不匹配"}
         try:
             from nacl.signing import VerifyKey  # type: ignore
-            from nacl.exceptions import BadSignatureError  # type: ignore
             vk = VerifyKey(base64.b64decode(pub))
             vk.verify(challenge_echo.encode(), base64.b64decode(sig_b64))
         except ImportError:
-            # Fallback: use cryptography or pure ed25519 via hashlib only unavailable —
-            # use Python 3.11+ or cryptography library if present.
             try:
                 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-                from cryptography.exceptions import InvalidSignature
                 key = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub))
                 key.verify(base64.b64decode(sig_b64), challenge_echo.encode())
             except Exception as e:
@@ -166,31 +200,59 @@ def complete_challenge(body: dict[str, Any], data_dir: Path | None = None) -> di
         data = _load(dd)
         devices = data.setdefault("devices", {})
         prev = devices.get(device_id) or {}
-        # Invite code auto-activate for owned fleets
-        invite = str(os.environ.get("FACAI888_DEVICE_INVITE") or "").strip()
+        invite = str(
+            os.environ.get("WXQK_DEVICE_INVITE")
+            or os.environ.get("FACAI888_DEVICE_INVITE")
+            or ""
+        ).strip()
         provided_invite = str(body.get("inviteCode") or "").strip()
         status = prev.get("status") or STATUS_PENDING
         if invite and provided_invite and secrets.compare_digest(invite, provided_invite):
             status = STATUS_ACTIVE
-        elif status == STATUS_PENDING and os.environ.get("FACAI888_AUTO_ACTIVATE_DEVICES") == "1":
+        elif status == STATUS_PENDING and _auto_activate_enabled():
             status = STATUS_ACTIVE
         build_id = str(row.get("buildId") or prev.get("buildId") or "")
+        bound_client = str(prev.get("clientId") or "").strip()
+        claimed = str(row.get("clientId") or body.get("clientId") or "").strip()
+        if bound_client:
+            client_id = bound_client
+            if claimed and claimed != bound_client:
+                return {"ok": False, "code": "CLIENT_ID_BOUND", "message": "clientId 已绑定，不能覆盖"}
+        else:
+            client_id = claimed
         devices[device_id] = {
             "deviceId": device_id,
             "publicKey": pub,
+            "clientId": client_id,
             "buildId": build_id,
             "status": status,
             "registeredAt": prev.get("registeredAt") or time.time(),
             "lastSeen": time.time(),
         }
         _save(dd, data)
-    if build_id:
-        try:
-            import version_policy as vp
-            vp.allow_build_id(dd, build_id)
-        except Exception:
-            pass
-    return {"ok": True, "deviceId": device_id, "status": status}
+    # Do not widen allowlist from enrollment.
+    return {"ok": True, "deviceId": device_id, "clientId": client_id, "status": status}
+
+
+def bind_client_id_once(device_id: str, client_id: str, data_dir: Path | None = None) -> dict[str, Any]:
+    """One-time migration bind: empty registry clientId ← authenticated device claim."""
+    dd = data_dir or Path(os.environ.get("FACAI888_DATA") or "/opt/facai888/data")
+    did = str(device_id or "").strip()
+    cid = str(client_id or "").strip()
+    if not did or not cid:
+        return {"ok": False, "code": "MISSING", "message": "deviceId/clientId required"}
+    with _lock:
+        data = _load(dd)
+        row = (data.get("devices") or {}).get(did)
+        if not row:
+            return {"ok": False, "code": "DEVICE_NOT_FOUND", "message": "设备未登记"}
+        bound = str(row.get("clientId") or "").strip()
+        if bound and bound != cid:
+            return {"ok": False, "code": "CLIENT_ID_BOUND", "message": "clientId 已绑定"}
+        if not bound:
+            row["clientId"] = cid
+            _save(dd, data)
+        return {"ok": True, "deviceId": did, "clientId": str(row.get("clientId") or cid)}
 
 
 def get_device(device_id: str, data_dir: Path | None = None) -> dict[str, Any] | None:
@@ -198,6 +260,21 @@ def get_device(device_id: str, data_dir: Path | None = None) -> dict[str, Any] |
     with _lock:
         data = _load(dd)
         return (data.get("devices") or {}).get(str(device_id).strip())
+
+
+def find_device_by_client_id(client_id: str, data_dir: Path | None = None) -> dict[str, Any] | None:
+    cid = str(client_id or "").strip()
+    if not cid:
+        return None
+    dd = data_dir or Path(os.environ.get("FACAI888_DATA") or "/opt/facai888/data")
+    with _lock:
+        data = _load(dd)
+        for row in (data.get("devices") or {}).values():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("clientId") or "").strip() == cid:
+                return row
+    return None
 
 
 def touch_device(device_id: str, data_dir: Path | None = None) -> None:
@@ -211,11 +288,9 @@ def touch_device(device_id: str, data_dir: Path | None = None) -> None:
         _save(dd, data)
 
 
-# Backward-compat shim — rejects direct register without challenge.
 def register_device(body: dict[str, Any], data_dir: Path | None = None) -> dict[str, Any]:
     return {
         "ok": False,
         "code": "CHALLENGE_REQUIRED",
         "message": "请使用 /api/device/register/challenge 与 /complete",
-        "httpStatus": 410,
     }

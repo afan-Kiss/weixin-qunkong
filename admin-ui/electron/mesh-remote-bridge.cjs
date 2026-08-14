@@ -12,9 +12,22 @@ const http = require('http')
 const https = require('https')
 const { getServiceBase } = require('./secure-config.cjs')
 const { insecureTlsForService } = require('./service-tls.cjs')
-const softwareAuth = require('./software-auth.cjs')
+const { loadOrCreate, authHeaders } = require('./device-identity.cjs')
 const meshAgent = require('./mesh-agent-manager.cjs')
 const networkGate = require('./mesh-network-gate.cjs')
+
+/** @type {() => string} */
+let resolveUserDataPath = () => ''
+
+function setMeshBridgeDepsForTest(overrides = {}) {
+  if (typeof overrides.resolveUserDataPath === 'function') {
+    resolveUserDataPath = overrides.resolveUserDataPath
+  }
+}
+
+function resetMeshBridgeDepsForTest() {
+  resolveUserDataPath = () => ''
+}
 
 /**
  * Retry gaps inside a single prepare deadline.
@@ -171,13 +184,27 @@ async function requestMeshJson(method, pathname, body, deadlineMs) {
   const target = `${base}${pathname}`
   const u = new URL(target)
   const lib = u.protocol === 'https:' ? https : http
-  const token = softwareAuth.getToken ? softwareAuth.getToken() : ''
-  const payload = body != null ? JSON.stringify(body) : ''
+  // Canonical JSON must match server body_hash for device signature.
+  const payload = body != null
+    ? JSON.stringify(body)
+    : ''
+  const bodyBuf = Buffer.from(payload || '', 'utf8')
+  const signPath = pathname.split('?')[0] || pathname
+  let deviceHdrs = {}
+  try {
+    const userData = resolveUserDataPath()
+    if (userData) {
+      const identity = loadOrCreate(userData)
+      deviceHdrs = authHeaders(identity, method, signPath, bodyBuf)
+    }
+  } catch (error) {
+    log('device auth headers unavailable', { error: String(error?.message || error).slice(0, 120) })
+  }
   const headers = {
     Accept: 'application/json',
+    ...deviceHdrs,
     ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}),
   }
-  if (token) headers.Authorization = `Bearer ${token}`
 
   const left = deadlineMs ? remainingMs(deadlineMs) : REQUEST_TIMEOUT_CAP_MS
   if (deadlineMs && left < 200) {
@@ -551,6 +578,8 @@ module.exports = {
   waitForMeshReady,
   getMeshPrepareStatus,
   resetMeshPrepareStateForTest,
+  setMeshBridgeDepsForTest,
+  resetMeshBridgeDepsForTest,
   safeClientId,
   PREPARE_RETRY_DELAYS_MS,
   DEFAULT_PREPARE_TIMEOUT_MS,

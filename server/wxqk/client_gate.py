@@ -129,4 +129,5 @@ def require_client(
     dev.touch_device(device_id, data_dir=data_dir)
     meta["deviceStatus"] = status
     meta["publicKey"] = row.get("publicKey")
+    meta["boundClientId"] = str(row.get("clientId") or "").strip()
     return meta

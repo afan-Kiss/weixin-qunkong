@@ -9,6 +9,7 @@ const { existsSync } = require('fs')
  */
 const { pinStableUserData, migrateLegacyPortableUserDataIfNeeded } = require('./wxqk-data-paths.cjs')
 const { migrateLegacyBusinessDataIfNeeded } = require('./wxqk-business-migration.cjs')
+const { isBackgroundLaunchArgv } = require('./background-startup.cjs')
 const __wxqkDataPaths = (() => {
   try {
     return pinStableUserData(app)
@@ -61,6 +62,8 @@ if (!hasSingleInstanceLock) {
 }
 /** second-instance arrived before mainWindow / ready-to-show */
 let pendingSecondInstanceFocus = false
+/** Windows login / --background: keep tray + Device Channel, do not force main window */
+const launchInBackground = isBackgroundLaunchArgv(process.argv)
 
 // 部分机器 GPU/驱动异常会导致进程在但窗口不显示/白屏
 try { app.disableHardwareAcceleration() } catch {}
@@ -90,9 +93,14 @@ const {
 } = require('./task-instance-wait.cjs')
 const { resolveIpcApiTimeout } = require('./ipc-api-timeout.cjs')
 const { buildHistoryImagePageSql } = require('./qr-history-pagination.cjs')
-const { startRemoteAgent, stopRemoteAgent, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
+const { startRemoteAgent, stopRemoteAgent, updateRemoteAgentAccount, kickRemoteAgentReconnect, getStatus: getRemoteAgentStatus, openAdminConsole, DEFAULT_BASE } = require('./remote-agent.cjs')
 const meshRemote = require('./mesh-remote-bridge.cjs')
 const meshAgentWatchdog = require('./mesh-agent-watchdog.cjs')
+const {
+  ensureWindowsBackgroundStartup,
+  ensureStableLauncherCopy,
+  resolveStableLauncherPath,
+} = require('./background-startup.cjs')
 const softwareAuth = require('./software-auth.cjs')
 const { safeFolderName, classifyQrText, qrTypeLabel, contentHash, messageTableName, rowsFromApi, valueOf, fieldString, existingImagePath, cdnDownloadRequest, downloadRequest, decodeNativeImages, accurateFileName, prepareHistoryMessageRow, yieldMain, normalizeQrText } = require('./qr-collector.cjs')
 const {
@@ -4982,6 +4990,7 @@ function registerIpc() {
         resumeQueuedTasks()
       }
       startRemoteAgent(remoteAgentOptions(account.username)).catch(() => {})
+      try { updateRemoteAgentAccount(account.username) } catch { /* ignore */ }
       // Mesh prepare uses local identity + single-flight（与 cold_boot 合并，不重复 UAC）
       startLocalMeshPrepareOnStartup('auth:login')
       return { ok: true, account }
@@ -5000,7 +5009,12 @@ function registerIpc() {
       return { ok: true, account }
     } catch (error) { return { ok: false, error: toUserErrorMessage(error, '注册失败，请稍后重试') } }
   })
-  ipcMain.handle('auth:logout', async () => { await softwareAuth.logout(); stopRemoteAgent(); return true })
+  ipcMain.handle('auth:logout', async () => {
+    await softwareAuth.logout()
+    // Machine Device Channel must keep running after software logout.
+    try { updateRemoteAgentAccount('微信群控本机') } catch { /* ignore */ }
+    return true
+  })
   ipcMain.handle('system:metrics', () => softwareMetrics())
   ipcMain.handle('wechat:list-instances', async () => {
     await synchronizeInstanceProcesses()
@@ -5771,9 +5785,11 @@ function createWindow() {
     markStartup('ready-to-show')
     setSplashProgress(100, '启动完成')
     closeSplashWindow()
-    // 全应用唯一允许的“首次启动主动 focus”
-    win.show()
-    win.focus()
+    // 后台启动（--background/--startup）：不弹主窗口，仅托盘 + Device Channel
+    if (!launchInBackground) {
+      win.show()
+      win.focus()
+    }
     mainWindowFirstShowDone = true
     afterUpdateWindowReady = true
     tryEmitAfterUpdateReadyAck('ready-to-show')
@@ -5788,7 +5804,7 @@ function createWindow() {
       markStartup('ready-to-show fallback')
       setSplashProgress(100, '启动完成')
       closeSplashWindow()
-      win.show()
+      if (!launchInBackground) win.show()
       mainWindowFirstShowDone = true
       if (pendingSecondInstanceFocus) {
         pendingSecondInstanceFocus = false
@@ -5898,7 +5914,14 @@ function createTray() {
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
-  try { createSplashWindow() } catch { /* splash 失败不挡启动 */ }
+  try {
+    meshRemote.setMeshBridgeDepsForTest({
+      resolveUserDataPath: () => app.getPath('userData'),
+    })
+  } catch { /* ignore */ }
+  if (!launchInBackground) {
+    try { createSplashWindow() } catch { /* splash 失败不挡启动 */ }
+  }
   markStartup('app ready')
   try { installServiceCertificateTrust(session.defaultSession) } catch {}
   try {
@@ -6044,7 +6067,38 @@ app.whenReady().then(async () => {
 
     // Local WXQK Agent：与账号 session / 业务 WSS 解耦；不 await，不挡主界面
     startLocalMeshPrepareOnStartup('cold_boot')
+    // Device Channel：cold boot 即启动，不依赖 softwareAuth.session
+    startRemoteAgent(remoteAgentOptions('微信群控本机'))
+      .catch((error) => appLog('ERROR', '业务设备通道启动失败', { error: rawErrorMessage(error) }))
+    try {
+      const { powerMonitor } = require('electron')
+      powerMonitor.on('resume', () => {
+        try { kickRemoteAgentReconnect('power_resume') } catch { /* ignore */ }
+      })
+    } catch { /* ignore */ }
     markStartup('mesh prepare requested')
+
+    // Portable 稳定启动器 + HKCU / login item（幂等；永远指向 launcher 路径）
+    setImmediate(() => {
+      try {
+        const userRoot = __wxqkDataPaths.stableUserDataDir || app.getPath('userData')
+        const sourceExe = resolvePortableExePath()
+        ensureStableLauncherCopy({ userDataRoot: userRoot, sourceExe, allowMissing: true })
+        const boot = ensureWindowsBackgroundStartup({
+          userDataRoot: userRoot,
+          sourceExe,
+          allowMissing: true,
+          app,
+        })
+        appLog('INFO', '[BACKGROUND-STARTUP]', {
+          code: boot.code,
+          path: boot.path || resolveStableLauncherPath(userRoot),
+          backgroundLaunch: launchInBackground,
+        })
+      } catch (bootErr) {
+        appLog('WARN', '[BACKGROUND-STARTUP] register failed', { error: rawErrorMessage(bootErr) })
+      }
+    })
 
     try {
       meshAgentWatchdog.startLocalAgentWatchdog({
@@ -6154,12 +6208,14 @@ app.whenReady().then(async () => {
       },
     })
 
-    // 账号校验走网络，绝不 await 挡住启动；也不再作为 Mesh Agent 启动门槛
+    // 账号校验走网络，绝不 await 挡住启动；也不再作为 Device Channel / Mesh 启动门槛
     void softwareAuth.session().then((account) => {
-      if (!account) return
-      // 业务 remote-agent（WSS）与实例恢复；Mesh Agent 已在 cold_boot 独立准备
-      startRemoteAgent(remoteAgentOptions(account.username))
-        .catch((error) => appLog('ERROR', '业务设备连接失败', { error: rawErrorMessage(error) }))
+      if (!account) {
+        try { updateRemoteAgentAccount('微信群控本机') } catch { /* ignore */ }
+        return
+      }
+      // 仅更新 account metadata；Device Channel 已在 cold_boot 启动
+      try { updateRemoteAgentAccount(account.username) } catch { /* ignore */ }
       restoreInstancesThenResumeQueuedTasks()
         .catch((error) => appLog('ERROR', '恢复微信实例失败', { error: rawErrorMessage(error) }))
     }).catch((error) => appLog('ERROR', '读取登录会话失败', { error: rawErrorMessage(error) }))

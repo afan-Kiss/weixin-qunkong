@@ -106,7 +106,7 @@ TOKEN_TTL = _parse_admin_token_ttl()
 ONLINE_TTL = 90  # seconds
 DATA_DIR = Path(_env("WXQK_DATA", "FACAI888_DATA", "SIREN_DATA", default="/opt/wxqk/data"))
 PUBLIC_BASE_URL = str(
-    _env("FACAI888_PUBLIC_BASE_URL", "WXQK_PUBLIC_BASE_URL", default="https://mesh.example.invalid/wxqk") or ""
+    _env("WXQK_PUBLIC_BASE_URL", "FACAI888_PUBLIC_BASE_URL", default="https://mesh.example.invalid/wxqk") or ""
 ).strip().rstrip("/") or "https://mesh.example.invalid/wxqk"
 _TRUSTED_PROXIES_RAW = str(_env("FACAI888_TRUSTED_PROXIES", "SIREN_TRUSTED_PROXIES", default="127.0.0.1,::1"))
 LOG_DIR = DATA_DIR / "logs"
@@ -1186,8 +1186,15 @@ def build_client_detail(client_id: str) -> dict[str, Any]:
         "planSteps": meta.get("planSteps") if isinstance(meta.get("planSteps"), list) else [],
         "monitorFormulas": meta.get("monitorFormulas") if isinstance(meta.get("monitorFormulas"), list) else [],
         "lastSeenText": meta.get("lastSeenText") or "",
+        "lastSeen": float(meta.get("lastSeen") or 0) or None,
         "desktopWatching": False,
         "online": is_online,
+        "appChannelOnline": is_online,
+        "meshAgentOnline": bool(meta.get("meshAgentOnline")),
+        "remoteReady": bool(meta.get("remoteReady")),
+        "meshNodeId": str(meta.get("meshNodeId") or "")[:120],
+        "meshStatus": str(meta.get("meshStatus") or "")[:80],
+        "appVersion": meta.get("version") or "",
         "allowed": bool(permit.get("allowed")),
         "allowMessage": permit.get("message") or "",
     }
@@ -1240,10 +1247,32 @@ def list_online() -> list[dict[str, Any]]:
     rows.sort(key=lambda x: (float(x.get("firstSeen") or x.get("lastSeen") or 0), str(x.get("clientId") or "")))
     pol = load_policy()
     out = []
+    mesh_lookup = None
+    try:
+        import meshcentral_client as _mc
+        mesh_lookup = _mc
+    except Exception:
+        mesh_lookup = None
     for r in rows:
         cid = r.get("clientId")
         ip = r.get("ip")
         permit = check_run_allowed(str(cid or ""), str(ip or ""), policy=pol)
+        mesh_agent_online = bool(r.get("meshAgentOnline"))
+        remote_ready = bool(r.get("remoteReady"))
+        mesh_node_id = str(r.get("meshNodeId") or "")[:120]
+        mesh_status = str(r.get("meshStatus") or "")[:80]
+        if mesh_lookup and cid:
+            try:
+                mapping = mesh_lookup.get_mapping(DATA_DIR, str(cid)) or {}
+                if mapping:
+                    mesh_node_id = str(mapping.get("meshNodeId") or mapping.get("mesh_node_id") or mesh_node_id)[:120]
+                    mesh_status = str(mapping.get("meshAgentStatus") or mapping.get("status") or mesh_status)[:80]
+                    if mapping.get("meshNodeId") or mapping.get("mesh_node_id"):
+                        # Mapping present; agent online/ready may still be unknown without live probe.
+                        if not mesh_status:
+                            mesh_status = "mapped"
+            except Exception:
+                pass
         out.append(
             {
                 "clientId": cid,
@@ -1258,9 +1287,16 @@ def list_online() -> list[dict[str, Any]]:
                 "planSteps": r.get("planSteps") if isinstance(r.get("planSteps"), list) else [],
                 "monitorFormulas": r.get("monitorFormulas") if isinstance(r.get("monitorFormulas"), list) else [],
                 "lastSeenText": r.get("lastSeenText"),
+                "lastSeen": float(r.get("lastSeen") or 0) or None,
                 "firstSeen": float(r.get("firstSeen") or 0) or None,
                 "desktopWatching": False,
                 "online": True,
+                "appChannelOnline": True,
+                "meshAgentOnline": mesh_agent_online,
+                "remoteReady": remote_ready,
+                "meshNodeId": mesh_node_id,
+                "meshStatus": mesh_status,
+                "appVersion": r.get("version") or "",
                 "allowed": bool(permit.get("allowed")),
                 "allowMessage": permit.get("message") or "",
                 "globalAllow": bool(pol.get("globalAllow", True)),
@@ -2251,7 +2287,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 import update_manifest as um
-                seed = str(_env("FACAI888_PUBLISH_KEY_B64", default="") or "").strip()
+                seed = str(
+                    _env("WXQK_PUBLISH_KEY_B64", "FACAI888_PUBLISH_KEY_B64", default="") or ""
+                ).strip()
                 self._send(200, um.status(DATA_DIR, seed_b64=seed))
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})
@@ -2463,16 +2501,46 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})
                 return
+            auth_device_id = str((meta or {}).get("deviceId") or "").strip()
+            bound_cid = str((meta or {}).get("boundClientId") or "").strip()
             cid_raw = (qs.get("clientId") or [""])[0]
             if str(cid_raw or "").strip().lower() == "unknown":
                 self._send(400, {"ok": False, "message": "invalid_clientId"})
                 return
-            cid, _cerr = require_client_id(cid_raw) if str(cid_raw or "").strip() else (None, None)
-            if cid is None:
-                cid = ""
+            query_cid, _cerr = require_client_id(cid_raw) if str(cid_raw or "").strip() else (None, None)
+            if bound_cid:
+                if query_cid and query_cid != bound_cid:
+                    self._send(403, {
+                        "ok": False,
+                        "code": "CLIENT_IDENTITY_MISMATCH",
+                        "message": "query clientId 与已认证设备绑定不一致",
+                    })
+                    return
+                cid = bound_cid
+            else:
+                # Migration: first authenticated claim binds clientId once.
+                if query_cid:
+                    try:
+                        import devices as _dev
+                        bind = _dev.bind_client_id_once(auth_device_id, query_cid, data_dir=DATA_DIR)
+                        if not bind.get("ok"):
+                            self._send(403, {
+                                "ok": False,
+                                "code": bind.get("code") or "CLIENT_IDENTITY_MISMATCH",
+                                "message": bind.get("message") or "clientId 绑定失败",
+                            })
+                            return
+                        cid = str(bind.get("clientId") or query_cid)
+                    except Exception as e:
+                        self._send(500, {"ok": False, "message": str(e)})
+                        return
+                else:
+                    # Prefer deviceId as hub id when no clientId claimed yet.
+                    cid = auth_device_id
             role = "agent"
             filter_cid = ""
             filter_uid = ""
+            connection_client_id = cid
         else:
             self._send(410, {
                 "ok": False,
@@ -2568,6 +2636,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if role == "agent":
+            # Frozen at handshake — never rebind from hello/heartbeat payload.
+            cid = connection_client_id
             if cid:
                 register_agent(cid, sock)
                 touch_online({"clientId": cid, "ip": ip})
@@ -2581,11 +2651,20 @@ class Handler(BaseHTTPRequestHandler):
                         hello_cid, herr = require_client_id(msg.get("clientId") or cid)
                         if herr:
                             try:
-                                send_json(sock, {"type": "error", "message": herr.get("message")})
+                                send_json(sock, {"type": "error", "code": "INVALID_CLIENT_ID", "message": herr.get("message")})
                             except Exception:
                                 pass
-                            continue
-                        cid = hello_cid or cid
+                            break
+                        if hello_cid and hello_cid != cid:
+                            try:
+                                send_json(sock, {
+                                    "type": "error",
+                                    "code": "CLIENT_IDENTITY_MISMATCH",
+                                    "message": "hello.clientId 与连接身份不一致",
+                                })
+                            except Exception:
+                                pass
+                            break
                         touch_online({
                             "clientId": cid,
                             "ip": ip,
@@ -2600,8 +2679,16 @@ class Handler(BaseHTTPRequestHandler):
                     elif typ == "heartbeat":
                         payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else msg
                         hb_cid, _ = require_client_id(payload.get("clientId") or cid)
-                        if hb_cid:
-                            cid = hb_cid
+                        if hb_cid and hb_cid != cid:
+                            try:
+                                send_json(sock, {
+                                    "type": "error",
+                                    "code": "CLIENT_IDENTITY_MISMATCH",
+                                    "message": "heartbeat.clientId 与连接身份不一致",
+                                })
+                            except Exception:
+                                pass
+                            break
                         if cid:
                             touch_online({
                                 "clientId": cid,
@@ -2812,7 +2899,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/device/register/challenge":
             try:
                 import devices as dev
-                self._send(200, dev.begin_challenge(body if isinstance(body, dict) else {}, data_dir=DATA_DIR))
+                self._send(200, dev.begin_challenge(
+                    body if isinstance(body, dict) else {},
+                    data_dir=DATA_DIR,
+                    client_ip=client_ip(self),
+                ))
             except Exception as e:
                 self._send(500, {"ok": False, "message": str(e)})
             return
@@ -3450,7 +3541,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 import update_manifest as um
-                seed = str(_env("FACAI888_PUBLISH_KEY_B64", default="") or "").strip()
+                seed = str(
+                    _env("WXQK_PUBLISH_KEY_B64", "FACAI888_PUBLISH_KEY_B64", default="") or ""
+                ).strip()
                 targets = body.get("targetClientIds")
                 if isinstance(targets, list) and any(str(x).strip() for x in targets):
                     raw_seq = body.get("releaseSequence")
