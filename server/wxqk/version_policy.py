@@ -176,23 +176,15 @@ def evaluate_client(meta: dict[str, Any], pol: dict[str, Any] | None = None, dat
             "message": "当前版本已停止使用。",
         }
     if mode != "test" and allowed and build not in allowed:
-        # Publish stores packages under a server-side buildId that often differs from the
-        # buildId stamped into the EXE. Accept clients that report the latest releaseSequence
-        # (or a newer feature-build sequence — local build-feature bumps ahead of publish).
-        try:
-            latest_seq = int(pol.get("latestReleaseSequence") or 0)
-        except Exception:
-            latest_seq = 0
-        if not (latest_seq > 0 and rel_seq >= latest_seq):
-            return {
-                "ok": False,
-                "httpStatus": 426,
-                "code": "CLIENT_UPGRADE_REQUIRED",
-                "message": "当前版本已停止使用。",
-                "minimumVersion": pol.get("minimumVersion"),
-                "minimumBuildId": min_build or (allowed[0] if allowed else ""),
-                "minimumReleaseSequence": min_seq,
-            }
+        return {
+            "ok": False,
+            "httpStatus": 426,
+            "code": "CLIENT_UPGRADE_REQUIRED",
+            "message": "当前版本已停止使用。",
+            "minimumVersion": pol.get("minimumVersion"),
+            "minimumBuildId": min_build or (allowed[0] if allowed else ""),
+            "minimumReleaseSequence": min_seq,
+        }
     if min_seq > 0 and rel_seq < min_seq:
         return {
             "ok": False,

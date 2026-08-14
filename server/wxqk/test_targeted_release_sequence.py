@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Targeted releaseSequence: same artifact keeps seq; different SHA never collides."""
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 import update_manifest as um
 
 SEED = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+BASE = "https://updates.wxqk.test/wxqk"
 
 
 def _write_pkg(root: Path, bid: str, blob: bytes, seq: int = 0) -> None:
@@ -37,7 +38,7 @@ class TargetedReleaseSequenceTest(unittest.TestCase):
 
             out1 = um.publish_targeted_release(
                 data_dir, version="1.106", build_id=bid, target_client_ids=[a],
-                mandatory=True, file_name="微信群控系统v1.106.exe", seed_b64=SEED,
+                mandatory=True, file_name="寰俊缇ゆ帶绯荤粺v1.106.exe", seed_b64=SEED, public_base_url=BASE,
             )
             self.assertTrue(out1.get("ok"), out1)
             self.assertEqual(int(out1["manifest"]["releaseSequence"]), 102)
@@ -46,7 +47,7 @@ class TargetedReleaseSequenceTest(unittest.TestCase):
 
             out2 = um.publish_targeted_release(
                 data_dir, version="1.106", build_id=bid, target_client_ids=[b],
-                mandatory=True, file_name="微信群控系统v1.106.exe", seed_b64=SEED,
+                mandatory=True, file_name="寰俊缇ゆ帶绯荤粺v1.106.exe", seed_b64=SEED, public_base_url=BASE,
             )
             self.assertTrue(out2.get("ok"), out2)
             self.assertEqual(int(out2["manifest"]["releaseSequence"]), 102)
@@ -57,7 +58,7 @@ class TargetedReleaseSequenceTest(unittest.TestCase):
             # same artifact + same target republish keeps seq
             out3 = um.publish_targeted_release(
                 data_dir, version="1.106", build_id=bid, target_client_ids=[a],
-                mandatory=True, file_name="微信群控系统v1.106.exe", seed_b64=SEED,
+                mandatory=True, file_name="寰俊缇ゆ帶绯荤粺v1.106.exe", seed_b64=SEED, public_base_url=BASE,
             )
             self.assertTrue(out3.get("ok"), out3)
             self.assertEqual(int(out3["manifest"]["releaseSequence"]), 102)
@@ -73,14 +74,14 @@ class TargetedReleaseSequenceTest(unittest.TestCase):
             _write_pkg(root, "build-a", b"bytes-a", seq=102)
             out1 = um.publish_targeted_release(
                 data_dir, version="1.106", build_id="build-a",
-                target_client_ids=["aaaa" * 16], seed_b64=SEED,
+                target_client_ids=["aaaa" * 16], seed_b64=SEED, public_base_url=BASE,
             )
             self.assertEqual(int(out1["manifest"]["releaseSequence"]), 102)
 
             _write_pkg(root, "build-b", b"bytes-b", seq=102)
             out2 = um.publish_targeted_release(
                 data_dir, version="1.107", build_id="build-b",
-                target_client_ids=["bbbb" * 16], seed_b64=SEED,
+                target_client_ids=["bbbb" * 16], seed_b64=SEED, public_base_url=BASE,
             )
             self.assertTrue(out2.get("ok"), out2)
             self.assertGreaterEqual(int(out2["manifest"]["releaseSequence"]), 103)
@@ -96,14 +97,14 @@ class TargetedReleaseSequenceTest(unittest.TestCase):
             _write_pkg(root, "build-a", b"bytes-a", seq=102)
             out1 = um.publish_targeted_release(
                 data_dir, version="1.106", build_id="build-a",
-                target_client_ids=["aaaa" * 16], seed_b64=SEED, release_sequence=102,
+                target_client_ids=["aaaa" * 16], seed_b64=SEED, public_base_url=BASE, release_sequence=102,
             )
             self.assertTrue(out1.get("ok"), out1)
 
             _write_pkg(root, "build-b", b"bytes-b-different")
             out2 = um.publish_targeted_release(
                 data_dir, version="1.107", build_id="build-b",
-                target_client_ids=["bbbb" * 16], seed_b64=SEED, release_sequence=102,
+                target_client_ids=["bbbb" * 16], seed_b64=SEED, public_base_url=BASE, release_sequence=102,
             )
             self.assertFalse(out2.get("ok"), out2)
             self.assertEqual(out2.get("code"), "RELEASE_SEQUENCE_ARTIFACT_CONFLICT")
@@ -115,7 +116,7 @@ class TargetedReleaseSequenceTest(unittest.TestCase):
             _write_pkg(root, "build-a", b"bytes-a", seq=102)
             out = um.publish_targeted_release(
                 data_dir, version="1.106", build_id="build-a",
-                target_client_ids=[], seed_b64=SEED,
+                target_client_ids=[], seed_b64=SEED, public_base_url=BASE,
             )
             self.assertFalse(out.get("ok"))
             self.assertEqual(out.get("code"), "TARGET_CLIENT_IDS_REQUIRED")
@@ -133,14 +134,14 @@ class TargetedReleaseSequenceTest(unittest.TestCase):
             _write_pkg(root, bid, b"good-bytes", seq=0)
             first = um.publish_targeted_release(
                 data_dir, version="1.106", build_id=bid,
-                target_client_ids=["cccc" * 16], seed_b64=SEED, release_sequence=78,
+                target_client_ids=["cccc" * 16], seed_b64=SEED, public_base_url=BASE, release_sequence=78,
             )
             self.assertEqual(int(first["manifest"]["releaseSequence"]), 78)
             # Correct to portable package sequence
-            um.save_package_meta(data_dir, bid, "微信群控系统v1.106.exe", releaseSequence=102)
+            um.save_package_meta(data_dir, bid, "寰俊缇ゆ帶绯荤粺v1.106.exe", releaseSequence=102)
             second = um.publish_targeted_release(
                 data_dir, version="1.106", build_id=bid,
-                target_client_ids=["cccc" * 16], seed_b64=SEED, release_sequence=102,
+                target_client_ids=["cccc" * 16], seed_b64=SEED, public_base_url=BASE, release_sequence=102,
             )
             self.assertTrue(second.get("ok"), second)
             self.assertEqual(int(second["manifest"]["releaseSequence"]), 102)
@@ -148,3 +149,4 @@ class TargetedReleaseSequenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

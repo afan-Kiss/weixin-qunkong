@@ -14,7 +14,11 @@ from typing import Any
 
 _lock = threading.RLock()
 
-SIGNING_KEY_ID = "facai888-v1"
+SIGNING_KEY_ID = str(
+    os.environ.get("WXQK_PUBLISH_SIGNING_KEY_ID")
+    or os.environ.get("FACAI888_PUBLISH_SIGNING_KEY_ID")
+    or "facai888-v1"
+).strip() or "facai888-v1"
 UPDATER_PROTOCOL_V1 = "updater-v1"
 UPDATER_PROTOCOL_V2 = "updater-v2"
 
@@ -116,6 +120,31 @@ def save_targeted_releases(data_dir: Path, data: dict[str, Any]) -> None:
         tmp.replace(path)
 
 
+def client_stamped_build_ids(version: str) -> list[str]:
+    """BuildIds embedded in portable EXE (wxqk-electron-<version>)."""
+    ver = str(version or "").strip().lstrip("vV")
+    if not ver:
+        return []
+    out = [f"wxqk-electron-{ver}"]
+    if ver.endswith(".0") and ver.count(".") == 2:
+        short = ver[:-2]
+        out.append(f"wxqk-electron-{short}")
+    return out
+
+
+def merge_publish_allowed_build_ids(allowed: list[str], *, package_build_id: str, version: str = "") -> list[str]:
+    """Only release publish may widen the allowlist — never anonymous enrollment."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in list(allowed or []) + [package_build_id, "dev"] + client_stamped_build_ids(version):
+        bid = str(item or "").strip()
+        if not bid or bid in seen:
+            continue
+        seen.add(bid)
+        out.append(bid)
+    return out
+
+
 def resolve_manifest_for_client(
     data_dir: Path,
     *,
@@ -124,7 +153,11 @@ def resolve_manifest_for_client(
     online_lookup=None,
     clients_by_ip=None,
 ) -> tuple[dict[str, Any], str, str]:
-    """Return (manifest, signature_v1, signature_v2). Targeted override wins for matching clientId/IP."""
+    """Return (manifest, signature_v1, signature_v2). Targeted override wins only on exact clientId.
+
+    Intentionally ignores client_ip / clients_by_ip for targeting — same NAT must not
+    deliver another device's targeted release.
+    """
     stable = load_manifest(data_dir)
     stable_sig = load_signature_hex(data_dir)
     stable_sig_v2 = load_signature_v2_hex(data_dir)
@@ -134,28 +167,9 @@ def resolve_manifest_for_client(
         return stable, stable_sig, stable_sig_v2
 
     cid = str(client_id or "").strip()
-    tip = str(client_ip or "").strip()
-    candidate_ids: set[str] = set()
-    if cid:
-        candidate_ids.add(cid)
-    if tip and callable(clients_by_ip):
-        try:
-            for item in clients_by_ip(tip) or []:
-                if item:
-                    candidate_ids.add(str(item))
-        except Exception:
-            pass
-    # Fall back to persisted client records by IP
-    if tip and not candidate_ids:
-        clients_dir = Path(data_dir) / "clients"
-        if clients_dir.is_dir():
-            for path in clients_dir.glob("*.json"):
-                try:
-                    row = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if str(row.get("ip") or "").strip() == tip:
-                    candidate_ids.add(str(row.get("clientId") or path.stem))
+    if not cid:
+        # Empty clientId must never widen to IP-based targeted selection.
+        return stable, stable_sig, stable_sig_v2
 
     for rel in releases:
         if not isinstance(rel, dict):
@@ -163,14 +177,13 @@ def resolve_manifest_for_client(
         targets = normalize_target_client_ids(rel.get("targetClientIds") or [])
         if not targets:
             continue
-        if not candidate_ids.intersection(targets):
+        if cid not in targets:
             continue
         man = rel.get("manifest") if isinstance(rel.get("manifest"), dict) else None
         if not man:
             continue
         sig = str(rel.get("signature") or "") or stable_sig
         sig_v2 = str(rel.get("signatureV2") or "") or stable_sig_v2
-        # Ensure target list is visible to new clients
         man = dict(man)
         man["targetClientIds"] = targets
         return man, sig, sig_v2
@@ -376,6 +389,19 @@ def publish_targeted_release(
     release_sequence: int | None = None,
 ) -> dict[str, Any]:
     """Publish a package only for selected clientIds; keep global stable manifest unchanged."""
+    try:
+        from production_url import assert_production_public_base_url, is_placeholder_public_base_url
+        import os as _os
+        prod_flag = str(_os.environ.get("WXQK_PRODUCTION") or "").strip().lower() in (
+            "1", "true", "yes", "production", "prod",
+        )
+        if prod_flag or is_placeholder_public_base_url(public_base_url):
+            # Placeholder URLs are never allowed into published manifests.
+            assert_production_public_base_url(public_base_url, production=True)
+    except ValueError as e:
+        return {"ok": False, "code": "PRODUCTION_URL_INVALID", "message": str(e)}
+    except Exception:
+        pass
     targets = normalize_target_client_ids(target_client_ids)
     if not targets:
         return {"ok": False, "code": "TARGET_CLIENT_IDS_REQUIRED", "message": "targetClientIds 必填"}
@@ -468,19 +494,30 @@ def publish_targeted_release(
         "signatureV2": sig_v2,
         "publishedAt": published_at,
     })
-    save_targeted_releases(data_dir, {"releases": kept})
+    new_store = {"releases": kept}
+    # Prepare policy in memory first — never leave targeted committed if policy cannot be saved.
     try:
         import version_policy as vp
         pol = vp.load(data_dir)
-        allowed = [str(x) for x in (pol.get("allowedBuildIds") or [])]
-        if bid not in allowed:
-            allowed.append(bid)
-        if "dev" not in allowed:
-            allowed.append("dev")
-        pol["allowedBuildIds"] = allowed
+        pol = dict(pol)
+        pol["allowedBuildIds"] = merge_publish_allowed_build_ids(
+            list(pol.get("allowedBuildIds") or []),
+            package_build_id=bid,
+            version=ver,
+        )
+    except Exception as e:
+        return {"ok": False, "code": "VERSION_POLICY_PREPARE_FAILED", "message": f"版本策略准备失败: {e}"}
+
+    backup = load_targeted_releases(data_dir)
+    try:
+        save_targeted_releases(data_dir, new_store)
         vp.save(data_dir, pol)
     except Exception as e:
-        return {"ok": False, "message": f"版本策略更新失败（定向清单已写入）: {e}"}
+        try:
+            save_targeted_releases(data_dir, backup)
+        except Exception:
+            pass
+        return {"ok": False, "code": "PUBLISH_ATOMICITY_FAILED", "message": f"定向发布原子写入失败: {e}"}
     report_event(data_dir, {
         "t": published_at,
         "event": "TARGETED_RELEASE_PUBLISHED",
@@ -1094,6 +1131,14 @@ def publish_release(
         return {"ok": False, "message": "请先上传对应 buildId 的安装包"}
     digest = sha256_file(pkg)
     size = pkg.stat().st_size
+    try:
+        from production_url import assert_production_public_base_url, is_placeholder_public_base_url
+        prod_flag = str(os.environ.get("WXQK_PRODUCTION", os.environ.get("FACAI888_PRODUCTION", "")) or "").strip() == "1"
+        if prod_flag or is_placeholder_public_base_url(public_base_url):
+            # Always reject placeholder URLs even outside explicit production flag.
+            assert_production_public_base_url(public_base_url, production=True)
+    except Exception as e:
+        return {"ok": False, "code": "PRODUCTION_URL_INVALID", "message": str(e)}
     # Idempotent on content: same sha256 must never bump releaseSequence
     # (admin invents a new timestamp buildId every click — that must not loop clients).
     cur_man = load_manifest(data_dir)
@@ -1173,15 +1218,18 @@ def publish_release(
         import version_policy as vp
 
         pol = vp.load(data_dir)
-        allowed = [str(x) for x in (pol.get("allowedBuildIds") or [])]
-        if bid not in allowed:
-            allowed.append(bid)
-        if "dev" not in allowed:
-            allowed.append("dev")
+        allowed = merge_publish_allowed_build_ids(
+            list(pol.get("allowedBuildIds") or []),
+            package_build_id=bid,
+            version=ver,
+        )
         # Keep previous latest buildId allowed so mid-fleet clients still pass gate.
         prev = str(cur_man.get("buildId") or "").strip()
         if prev and prev not in allowed:
             allowed.append(prev)
+        for extra in client_stamped_build_ids(str(cur_man.get("version") or "")):
+            if extra not in allowed:
+                allowed.append(extra)
         pol["allowedBuildIds"] = allowed
         pol["latestBuildId"] = bid
         pol["latestVersion"] = ver
