@@ -249,11 +249,13 @@ async function main() {
       DEVICE_SPECIFIC_HARDCODE_GATE: 'PASS',
       LEGACY_SIGNATURE_V1_GATE: man ? signatureGates.LEGACY_SIGNATURE_V1_GATE : 'SKIPPED',
       MODERN_SIGNATURE_V2_GATE: man ? signatureGates.MODERN_SIGNATURE_V2_GATE : 'SKIPPED',
-      GOOD_MANIFEST_SANITY_GATE: evaluateGoodManifestSanity(man, signatureGates, {
-        version: args.expectedVersion,
-        releaseSequence: args.expectedReleaseSequence,
-        sha256: args.expectedSha256,
-      }),
+      GOOD_MANIFEST_SANITY_GATE: (!clientId)
+        ? 'SKIPPED (no --client-id)'
+        : evaluateGoodManifestSanity(man, signatureGates, {
+          version: args.expectedVersion,
+          releaseSequence: args.expectedReleaseSequence,
+          sha256: args.expectedSha256,
+        }),
       LEGACY_TARGET_IDENTITY_GATE: (!clientId)
         ? 'SKIPPED'
         : (!hostAccountGate.ok)
