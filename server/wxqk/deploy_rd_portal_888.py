@@ -6,6 +6,7 @@ import os
 import time
 
 import paramiko
+from ssh_host_key import configure_ssh_client
 
 # 屏幕墙挂在旧域名机；独立环境变量，避免被 WXQK_SSH_HOST=新服 带偏
 HOST = os.environ.get("RD_PORTAL_SSH_HOST") or "47.108.21.50"
@@ -177,7 +178,7 @@ def main() -> None:
     if not PASSWORD:
         raise SystemExit("RD_PORTAL_SSH_PASSWORD or WXQK_SSH_PASSWORD is required (set env var, do NOT hardcode)")
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    configure_ssh_client(client)
     client.connect(
         HOST,
         username=USER,

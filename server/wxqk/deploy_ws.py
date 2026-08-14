@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import paramiko
+from ssh_host_key import configure_ssh_client
 
 HOST = os.environ.get("WXQK_SSH_HOST", "47.108.21.50")
 PASSWORD = os.environ.get("WXQK_SSH_PASSWORD") or None
@@ -16,7 +17,7 @@ HERE = Path(__file__).resolve().parent
 
 def main() -> None:
     c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    configure_ssh_client(c)
     c.connect(HOST, username=os.environ.get("WXQK_SSH_USER", "root"), password=PASSWORD, timeout=20, allow_agent=PASSWORD is None, look_for_keys=PASSWORD is None)
 
     def run(cmd: str) -> str:

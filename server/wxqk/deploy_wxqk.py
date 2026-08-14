@@ -37,9 +37,10 @@ Environment=FACAI888_PORT={PORT}
 Environment=FACAI888_BIND=127.0.0.1
 Environment=FACAI888_DATA={REMOTE_DIR}/data
 Environment=FACAI888_PUBLIC_PREFIX={PUBLIC_PREFIX}
-Environment=FACAI888_PUBLIC_BASE_URL=https://mesh.example.invalid{PUBLIC_PREFIX}
-Environment=FACAI888_AUTO_ACTIVATE_DEVICES=1
-Environment=FACAI888_PUBLISH_KEY_B64=TIwR8GPTQsAO49IXWjfXok0xHouoHGFbkTsi5B4Pf9A=
+# PUBLIC_BASE_URL must be set in /etc/wxqk/wxqk.env (production fail-closed; no placeholder).
+Environment=FACAI888_AUTO_ACTIVATE_DEVICES=0
+Environment=WXQK_DEVICE_AUTO_ACTIVATE=0
+# Publish private seed ONLY via EnvironmentFile=/etc/wxqk/wxqk.env (0600). Never hardcode in Git.
 ExecStart=/usr/bin/python3 {REMOTE_DIR}/server.py
 Restart=always
 RestartSec=2
@@ -87,7 +88,8 @@ UPLOAD_FILES = [
 
 def main() -> None:
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    from ssh_host_key import configure_ssh_client
+    configure_ssh_client(client)
     client.connect(HOST, username=USER, password=PASSWORD, timeout=20, allow_agent=PASSWORD is None, look_for_keys=PASSWORD is None)
 
     def run(command: str) -> str:

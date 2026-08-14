@@ -83,8 +83,9 @@ Environment=FACAI888_BIND=127.0.0.1
 Environment=FACAI888_DATA={REMOTE}/data
 Environment=FACAI888_PUBLIC_PREFIX=/wxqk
 Environment=FACAI888_PUBLIC_BASE_URL={PUBLIC_HTTPS}
-Environment=FACAI888_AUTO_ACTIVATE_DEVICES=1
-Environment=FACAI888_PUBLISH_KEY_B64=TIwR8GPTQsAO49IXWjfXok0xHouoHGFbkTsi5B4Pf9A=
+Environment=FACAI888_AUTO_ACTIVATE_DEVICES=0
+Environment=WXQK_DEVICE_AUTO_ACTIVATE=0
+# Publish private seed ONLY via EnvironmentFile (never hardcode in Git).
 ExecStart=/usr/bin/python3 {REMOTE}/server.py
 Restart=always
 RestartSec=2
@@ -98,7 +99,8 @@ def main() -> None:
     if not PASSWORD:
         raise SystemExit("WXQK_SSH_PASSWORD required")
     c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    from ssh_host_key import configure_ssh_client
+    configure_ssh_client(c)
     c.connect(HOST, username=USER, password=PASSWORD, timeout=30, allow_agent=False, look_for_keys=False)
 
     def run(cmd: str, timeout: int = 180) -> str:

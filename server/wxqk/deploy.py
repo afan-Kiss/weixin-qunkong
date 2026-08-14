@@ -150,8 +150,8 @@ Environment=FACAI888_BIND=127.0.0.1
 EnvironmentFile=-/etc/facai888/facai888.env
 Environment=FACAI888_DATA=/opt/facai888/data
 Environment=FACAI888_GIT_COMMIT=__GIT_COMMIT__
-Environment=FACAI888_AUTO_ACTIVATE_DEVICES=1
-Environment=FACAI888_PUBLISH_KEY_B64=TIwR8GPTQsAO49IXWjfXok0xHouoHGFbkTsi5B4Pf9A=
+Environment=FACAI888_AUTO_ACTIVATE_DEVICES=0
+# Publish private seed ONLY via EnvironmentFile (never hardcode in Git).
 ExecStart=/usr/bin/python3 /opt/facai888/server.py
 Restart=always
 RestartSec=2
@@ -163,7 +163,8 @@ WantedBy=multi-user.target
 
 def main() -> None:
     c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    from ssh_host_key import configure_ssh_client
+    configure_ssh_client(c)
     c.connect(HOST, username=USER, password=PASSWORD, timeout=20, allow_agent=PASSWORD is None, look_for_keys=PASSWORD is None)
 
     def run(cmd: str) -> str:

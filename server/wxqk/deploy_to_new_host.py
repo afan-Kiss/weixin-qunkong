@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 import paramiko
+from ssh_host_key import configure_ssh_client
 
 from deploy import EXTRA_PY, VERSION_POLICY
 from deploy_rd_portal_888 import NGINX_PORT_CONF, PORTAL_HTML
@@ -79,8 +80,9 @@ Environment=FACAI888_BIND=127.0.0.1
 Environment=FACAI888_DATA={REMOTE_DIR}/data
 Environment=FACAI888_PUBLIC_PREFIX={PUBLIC_PREFIX}
 Environment=FACAI888_PUBLIC_BASE_URL={base}
-Environment=FACAI888_AUTO_ACTIVATE_DEVICES=1
-Environment=FACAI888_PUBLISH_KEY_B64=TIwR8GPTQsAO49IXWjfXok0xHouoHGFbkTsi5B4Pf9A=
+Environment=FACAI888_AUTO_ACTIVATE_DEVICES=0
+Environment=WXQK_DEVICE_AUTO_ACTIVATE=0
+# Publish private seed ONLY via EnvironmentFile (never hardcode in Git).
 ExecStart=/usr/bin/python3 {REMOTE_DIR}/server.py
 Restart=always
 RestartSec=2
@@ -184,7 +186,7 @@ def main() -> None:
     print(f"deploy target={HOST} public_base={base}")
 
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    configure_ssh_client(client)
     client.connect(HOST, username=USER, password=PASSWORD, timeout=30, allow_agent=False, look_for_keys=False)
 
     def run(command: str, timeout: int = 300) -> str:
@@ -283,7 +285,7 @@ import paramiko
 src_host = os.environ["SRC_HOST"]
 src_pass = os.environ["SRC_PASS"]
 c = paramiko.SSHClient()
-c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+configure_ssh_client(c)
 c.connect(src_host, username="root", password=src_pass, timeout=30, allow_agent=False, look_for_keys=False)
 sftp = c.open_sftp()
 # always sync manifests + keys + latest package referenced by manifest
