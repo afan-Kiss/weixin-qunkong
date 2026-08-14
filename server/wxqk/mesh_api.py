@@ -41,29 +41,77 @@ def resolve_mesh_auth(
     data_dir: Path,
     *,
     check_admin_token: Callable[[str], bool],
+    method: str = "GET",
+    path: str = "/api/mesh/status",
+    body_raw: bytes | None = None,
+    allow_device: bool = False,
 ) -> AuthResult:
-    """Return {ok, role: admin|software, username, message}."""
+    """Return {ok, role: admin|software|device, username, clientId, message}."""
     tok = str(getattr(headers, "get", lambda *_: "")("X-Admin-Token") or "")
     if not tok and hasattr(headers, "get"):
         tok = str(headers.get("X-Admin-Token") or "")
     if tok and check_admin_token(tok):
-        return {"ok": True, "role": "admin", "username": "", "message": "admin"}
+        return {"ok": True, "role": "admin", "username": "", "clientId": "", "message": "admin"}
 
     auth = ""
     if hasattr(headers, "get"):
         auth = str(headers.get("Authorization") or "")
     bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    if not bearer:
-        return {"ok": False, "role": "", "username": "", "message": "需要管理员或软件登录"}
-    try:
-        import software_accounts as accounts
-        account = accounts.session(data_dir, bearer)
-    except Exception as exc:
-        return {"ok": False, "role": "", "username": "", "message": str(exc)}
-    if not account:
-        return {"ok": False, "role": "", "username": "", "message": "登录已失效"}
-    username = str(account.get("username") or "").strip()
-    return {"ok": True, "role": "software", "username": username, "message": "software"}
+    if bearer:
+        try:
+            import software_accounts as accounts
+            account = accounts.session(data_dir, bearer)
+        except Exception as exc:
+            return {"ok": False, "role": "", "username": "", "clientId": "", "message": str(exc)}
+        if not account:
+            return {"ok": False, "role": "", "username": "", "clientId": "", "message": "登录已失效"}
+        username = str(account.get("username") or "").strip()
+        return {"ok": True, "role": "software", "username": username, "clientId": "", "message": "software"}
+
+    if allow_device:
+        captured: dict[str, Any] = {}
+
+        def _capture(status: int, body: dict[str, Any]) -> None:
+            captured["status"] = status
+            captured["body"] = body
+
+        try:
+            import client_gate as cg
+            meta = cg.require_client(
+                data_dir=data_dir,
+                headers=headers,
+                method=method,
+                path=path,
+                body_raw=body_raw or b"",
+                send=_capture,
+                require_active_device=True,
+            )
+        except Exception as exc:
+            return {"ok": False, "role": "", "username": "", "clientId": "", "message": str(exc)}
+        if meta is None:
+            body = captured.get("body") if isinstance(captured.get("body"), dict) else {}
+            return {
+                "ok": False,
+                "role": "",
+                "username": "",
+                "clientId": "",
+                "message": str(body.get("message") or "设备未认证"),
+                "code": str(body.get("code") or "DEVICE_AUTH_REQUIRED"),
+            }
+        cid = str(meta.get("boundClientId") or "").strip()
+        if not cid:
+            # Migration: fall back to deviceId as hub id until clientId is bound.
+            cid = str(meta.get("deviceId") or "").strip()
+        return {
+            "ok": True,
+            "role": "device",
+            "username": "",
+            "clientId": cid,
+            "deviceId": str(meta.get("deviceId") or ""),
+            "message": "device",
+        }
+
+    return {"ok": False, "role": "", "username": "", "clientId": "", "message": "需要管理员、软件登录或设备签名"}
 
 
 def authorize_client_access(
@@ -73,19 +121,24 @@ def authorize_client_access(
     *,
     get_online_meta: Optional[Callable[[str], dict]] = None,
 ) -> dict[str, Any]:
-    """Enforce user A cannot control user B's devices."""
+    """Enforce user A cannot control user B's devices; device role is self-only."""
     if not auth.get("ok"):
         return {"ok": False, "code": "UNAUTHORIZED", "message": auth.get("message") or "未授权"}
     if auth.get("role") == "admin":
         return {"ok": True}
+    cid = str(client_id or "").strip()
+    if not cid:
+        return {"ok": False, "code": "BAD_REQUEST", "message": "clientId 必填"}
+    if auth.get("role") == "device":
+        self_cid = str(auth.get("clientId") or "").strip()
+        if self_cid and self_cid == cid:
+            return {"ok": True}
+        return {"ok": False, "code": "FORBIDDEN", "message": "设备只能访问自身 Mesh 状态/绑定"}
     username = str(auth.get("username") or "").strip()
     if not username:
         return {"ok": False, "code": "FORBIDDEN", "message": "缺少软件账号"}
     if username.lower() in _ops_usernames():
         return {"ok": True}
-    cid = str(client_id or "").strip()
-    if not cid:
-        return {"ok": False, "code": "BAD_REQUEST", "message": "clientId 必填"}
     meta: dict = {}
     if get_online_meta:
         try:
@@ -338,16 +391,24 @@ def try_handle_get(
 
     auth: AuthResult
     if headers is not None and check_admin_token is not None:
-        auth = resolve_mesh_auth(headers, data_dir, check_admin_token=check_admin_token)
+        auth = resolve_mesh_auth(
+            headers,
+            data_dir,
+            check_admin_token=check_admin_token,
+            method="GET",
+            path=path,
+            body_raw=b"",
+            allow_device=(path == "/api/mesh/status"),
+        )
         if not auth.get("ok"):
             # fallback to legacy admin-only gate for callers that only pass require_admin
             if not require_admin():
                 return True
-            auth = {"ok": True, "role": "admin", "username": "", "message": "admin"}
+            auth = {"ok": True, "role": "admin", "username": "", "clientId": "", "message": "admin"}
     else:
         if not require_admin():
             return True
-        auth = {"ok": True, "role": "admin", "username": "", "message": "admin"}
+        auth = {"ok": True, "role": "admin", "username": "", "clientId": "", "message": "admin"}
 
     if path == "/api/mesh/health":
         is_admin = auth.get("role") == "admin" or str(auth.get("username") or "").lower() in _ops_usernames()
@@ -357,6 +418,8 @@ def try_handle_get(
         return handle_health(data_dir, send, deep=True, admin=True)
 
     client_id = str((qs.get("clientId") or qs.get("client_id") or [""])[0] or "")
+    if auth.get("role") == "device" and not client_id:
+        client_id = str(auth.get("clientId") or "")
     gate = authorize_client_access(data_dir, auth, client_id, get_online_meta=get_online_meta)
     if not gate.get("ok"):
         send(403 if gate.get("code") == "FORBIDDEN" else 401, gate)
@@ -384,18 +447,45 @@ def try_handle_post(
         return False
 
     if headers is not None and check_admin_token is not None:
-        auth = resolve_mesh_auth(headers, data_dir, check_admin_token=check_admin_token)
+        import json as _json
+        body_raw = b""
+        try:
+            body_raw = _json.dumps(body if isinstance(body, dict) else {}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except Exception:
+            body_raw = b""
+        auth = resolve_mesh_auth(
+            headers,
+            data_dir,
+            check_admin_token=check_admin_token,
+            method="POST",
+            path=path,
+            body_raw=body_raw,
+            allow_device=(path == "/api/mesh/auto-bind"),
+        )
         if not auth.get("ok"):
             if not require_admin():
                 return True
-            auth = {"ok": True, "role": "admin", "username": "", "message": "admin"}
+            auth = {"ok": True, "role": "admin", "username": "", "clientId": "", "message": "admin"}
     else:
         if not require_admin():
             return True
-        auth = {"ok": True, "role": "admin", "username": "", "message": "admin"}
+        auth = {"ok": True, "role": "admin", "username": "", "clientId": "", "message": "admin"}
 
     row = body if isinstance(body, dict) else {}
     client_id = str(row.get("clientId") or "").strip()
+    if auth.get("role") == "device" and not client_id:
+        client_id = str(auth.get("clientId") or "")
+        if isinstance(row, dict) and client_id:
+            row = dict(row)
+            row["clientId"] = client_id
+    # Device role: never allow desktop/files/bind-other
+    if auth.get("role") == "device" and path in (
+        "/api/mesh/session/desktop",
+        "/api/mesh/session/files",
+        "/api/mesh/bind",
+    ):
+        send(403, {"ok": False, "code": "FORBIDDEN", "message": "设备签名不能打开远控/文件会话"})
+        return True
     gate = authorize_client_access(data_dir, auth, client_id, get_online_meta=get_online_meta)
     if not gate.get("ok"):
         send(403 if gate.get("code") == "FORBIDDEN" else 401, gate)
@@ -428,7 +518,7 @@ def try_handle_post(
             data_dir,
             row,
             send,
-            owner_username=str(auth.get("username") or ""),
+            owner_username=str(auth.get("username") or auth.get("clientId") or ""),
             get_online_meta=get_online_meta,
         )
     return handle_bind(data_dir, row, send, owner_username=str(auth.get("username") or ""))
