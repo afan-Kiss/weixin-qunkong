@@ -1827,6 +1827,21 @@ async function cleanupOwnedLegacyAfterBrandHealthy(options = {}) {
   if (status.status !== 'running' || !isBrandedInstallHealthy(status)) {
     return { ok: false, code: 'BRAND_NOT_READY', message: 'branded agent not healthy; skip legacy cleanup' }
   }
+  // Always stop/disable competing "Mesh Agent" Windows service so only WXQK dials MeshCentral.
+  // Full uninstall still requires ownership proof below.
+  try {
+    const legacy = await queryLegacyServiceState()
+    if (legacy.present && legacy.state !== 'stopped') {
+      log('WARN', 'disabling competing Mesh Agent service while WXQK is healthy')
+      await runElevated('sc.exe', ['stop', LEGACY_SERVICE_NAME])
+    }
+    if (legacy.present) {
+      await runElevated('sc.exe', ['config', LEGACY_SERVICE_NAME, 'start=', 'disabled'])
+    }
+    try { await runElevated('taskkill', ['/F', '/IM', 'MeshAgent.exe']) } catch { /* ignore */ }
+  } catch (error) {
+    log('WARN', 'failed to disable competing Mesh Agent service', { error: String(error?.message || error).slice(0, 160) })
+  }
   const clientId = safeClientIdForAgent(options.clientId)
   const ownership = isLegacyAgentOwnedByWxqk({ clientId })
   const alts = []
