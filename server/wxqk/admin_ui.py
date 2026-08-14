@@ -1424,7 +1424,22 @@ async function refreshDesktopMeshStatus() {
     }
   } catch (_) { /* device status still useful */ }
   try {
-    const st = await api('/api/mesh/status?clientId=' + encodeURIComponent(cid));
+    const online = findOnlineByClientId(cid) || {};
+    const hostname = String(online.hostname || online.host || '').trim();
+    // Status alone used to auto-bind without hostname → MESH_NO_MATCH when Agent
+    // is registered under OS hostname (培育钻石). Bind with hostname first.
+    try {
+      await api('/api/mesh/auto-bind', {
+        method: 'POST',
+        body: JSON.stringify({
+          clientId: cid,
+          allowHostnameFallback: true,
+          hostname: hostname || undefined,
+          agentName: 'WXQK-' + cid,
+        }),
+      });
+    } catch (_) { /* status below still shows state */ }
+    const st = await api('/api/mesh/status?clientId=' + encodeURIComponent(cid) + '&force=1');
     const ready = !!(st.ready || st.remoteState === 'ready');
     const remoteState = String(st.remoteState || '');
     const userMsg = st.userMessage || st.message || '';

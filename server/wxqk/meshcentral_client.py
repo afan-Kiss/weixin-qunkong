@@ -801,14 +801,27 @@ def match_node_for_client(
         if not isinstance(node, dict):
             continue
         name = str(node.get("name") or "").strip().lower()
-        host = str(node.get("host") or node.get("hostname") or "").strip().lower()
+        host = str(
+            node.get("host")
+            or node.get("hostname")
+            or node.get("computerName")
+            or node.get("osname")
+            or ""
+        ).strip().lower()
         agent_field = str(node.get("agentName") or node.get("agentname") or "").strip().lower()
         # MeshAgent agentName is exposed primarily as the device "name"
         if name == agent_name or agent_field == agent_name:
             by_agent.append(node)
         elif name == cid_l or host == cid_l:
             by_client_id.append(node)
-        if host_hint and (name == host_hint or host == host_hint or agent_field == host_hint):
+        if host_hint and (
+            name == host_hint
+            or host == host_hint
+            or agent_field == host_hint
+            # MeshCentral sometimes keeps OS hostname in name even when agentName is set later.
+            or name.endswith(host_hint)
+            or host.endswith(host_hint)
+        ):
             by_hostname.append(node)
 
     def _prefer_online(

@@ -203,7 +203,15 @@ def handle_health(data_dir: Path, send: SendFn, *, deep: bool = False, admin: bo
     return True
 
 
-def handle_status(data_dir: Path, client_id: str, send: SendFn) -> bool:
+def handle_status(
+    data_dir: Path,
+    client_id: str,
+    send: SendFn,
+    *,
+    get_online_meta: Optional[Callable[[str], dict]] = None,
+    hostname: str = "",
+    force_refresh: bool = False,
+) -> bool:
     mc = _load_client()
     if mc is None:
         send(200, {**_disabled_payload(), "clientId": client_id})
@@ -212,8 +220,23 @@ def handle_status(data_dir: Path, client_id: str, send: SendFn) -> bool:
     if not cid:
         send(400, {"ok": False, "code": "BAD_REQUEST", "message": "clientId 必填"})
         return True
+    host = str(hostname or "").strip()
+    if not host and get_online_meta:
+        try:
+            meta = get_online_meta(cid) or {}
+            host = str(meta.get("hostname") or meta.get("host") or "").strip()
+        except Exception:
+            host = ""
     try:
-        send(200, mc.get_device_status(data_dir, cid))
+        send(
+            200,
+            mc.get_device_status(
+                data_dir,
+                cid,
+                hostname=host,
+                force_refresh=bool(force_refresh),
+            ),
+        )
     except Exception as exc:
         send(200, {"ok": False, "code": "MESH_ERROR", "message": str(exc), "clientId": cid})
     return True
@@ -424,7 +447,13 @@ def try_handle_get(
     if not gate.get("ok"):
         send(403 if gate.get("code") == "FORBIDDEN" else 401, gate)
         return True
-    return handle_status(data_dir, client_id, send)
+    return handle_status(
+        data_dir,
+        client_id,
+        send,
+        get_online_meta=get_online_meta,
+        force_refresh=str((qs.get("force") or [""])[0] or "").strip() in ("1", "true", "yes"),
+    )
 
 
 def try_handle_post(
