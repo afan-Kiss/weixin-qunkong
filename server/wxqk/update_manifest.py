@@ -194,6 +194,173 @@ def _max_targeted_release_sequence(data_dir: Path) -> int:
     return highest
 
 
+def _iter_known_release_artifacts(data_dir: Path) -> list[dict[str, Any]]:
+    """Stable + targeted artifacts as {releaseSequence, sha256, buildId, version, source}."""
+    out: list[dict[str, Any]] = []
+    stable = load_manifest(data_dir)
+    try:
+        seq = int(stable.get("releaseSequence") or 0)
+    except Exception:
+        seq = 0
+    sha = str(stable.get("sha256") or "").strip().lower()
+    if seq > 0 and sha:
+        out.append({
+            "releaseSequence": seq,
+            "sha256": sha,
+            "buildId": str(stable.get("buildId") or ""),
+            "version": str(stable.get("version") or ""),
+            "source": "stable",
+        })
+    store = load_targeted_releases(data_dir)
+    releases = store.get("releases") if isinstance(store, dict) else []
+    if not isinstance(releases, list):
+        return out
+    for rel in releases:
+        if not isinstance(rel, dict):
+            continue
+        man = rel.get("manifest") if isinstance(rel.get("manifest"), dict) else {}
+        try:
+            seq = int(man.get("releaseSequence") or 0)
+        except Exception:
+            seq = 0
+        sha = str(man.get("sha256") or "").strip().lower()
+        if seq <= 0 or not sha:
+            continue
+        out.append({
+            "releaseSequence": seq,
+            "sha256": sha,
+            "buildId": str(man.get("buildId") or ""),
+            "version": str(man.get("version") or ""),
+            "source": "targeted",
+            "targetClientIds": normalize_target_client_ids(rel.get("targetClientIds") or man.get("targetClientIds") or []),
+            "record": rel,
+        })
+    return out
+
+
+def resolve_targeted_release_sequence(
+    data_dir: Path,
+    *,
+    digest: str,
+    build_id: str = "",
+    release_sequence: int | None = None,
+    package_meta_sequence: int = 0,
+) -> dict[str, Any]:
+    """Resolve releaseSequence for a targeted publish.
+
+    Same artifact (sha256) keeps the same sequence across batch targets.
+    Different SHA must never reuse an existing sequence.
+    """
+    sha = str(digest or "").strip().lower()
+    if not sha:
+        return {"ok": False, "code": "MISSING_SHA256", "message": "sha256 必填"}
+    known = _iter_known_release_artifacts(data_dir)
+    same = [row for row in known if row.get("sha256") == sha]
+    try:
+        explicit = int(release_sequence) if release_sequence is not None else 0
+    except Exception:
+        explicit = 0
+    try:
+        meta_seq = int(package_meta_sequence or 0)
+    except Exception:
+        meta_seq = 0
+
+    if same:
+        bound = int(same[0]["releaseSequence"])
+        desired = bound
+        if explicit > 0 and explicit != bound:
+            desired = explicit
+        elif meta_seq > bound:
+            desired = meta_seq
+        if desired != bound:
+            if desired < bound:
+                return {
+                    "ok": False,
+                    "code": "RELEASE_SEQUENCE_ARTIFACT_CONFLICT",
+                    "message": f"同 artifact 已绑定 releaseSequence={bound}，不能降为 {desired}",
+                    "releaseSequence": bound,
+                }
+            for row in known:
+                row_seq = int(row.get("releaseSequence") or 0)
+                row_sha = str(row.get("sha256") or "").strip().lower()
+                if row_seq == desired and row_sha and row_sha != sha:
+                    return {
+                        "ok": False,
+                        "code": "RELEASE_SEQUENCE_ARTIFACT_CONFLICT",
+                        "message": f"不能把 artifact 升到 releaseSequence={desired}：已被其他 SHA 占用",
+                        "releaseSequence": desired,
+                    }
+        return {
+            "ok": True,
+            "releaseSequence": desired,
+            "reuseArtifact": True,
+            "versionHint": str(same[0].get("version") or ""),
+            "existingTargets": normalize_target_client_ids(
+                [cid for row in same for cid in (row.get("targetClientIds") or [])]
+            ),
+        }
+
+    # New artifact: never collide with an existing seq belonging to another SHA.
+    max_seq = 0
+    for row in known:
+        max_seq = max(max_seq, int(row.get("releaseSequence") or 0))
+    try:
+        stable_seq = int(load_manifest(data_dir).get("releaseSequence") or 0)
+    except Exception:
+        stable_seq = 0
+    max_seq = max(max_seq, stable_seq)
+    next_seq = max(1, max_seq + 1)
+
+    def _taken_by_other(seq: int) -> dict[str, Any] | None:
+        for row in known:
+            row_seq = int(row.get("releaseSequence") or 0)
+            row_sha = str(row.get("sha256") or "").strip().lower()
+            if row_seq == seq and row_sha and row_sha != sha:
+                return row
+        return None
+
+    if explicit > 0:
+        other = _taken_by_other(explicit)
+        if other:
+            return {
+                "ok": False,
+                "code": "RELEASE_SEQUENCE_ARTIFACT_CONFLICT",
+                "message": f"releaseSequence={explicit} 已绑定其他 SHA（{str(other.get('sha256'))[:12]}…）",
+                "releaseSequence": explicit,
+            }
+        if explicit < next_seq:
+            return {
+                "ok": False,
+                "code": "RELEASE_SEQUENCE_TOO_LOW",
+                "message": f"显式 releaseSequence={explicit} 低于下一可用序号 {next_seq}",
+                "releaseSequence": explicit,
+            }
+        desired = explicit
+    else:
+        desired = next_seq
+        if meta_seq > desired:
+            desired = meta_seq
+        other = _taken_by_other(desired)
+        if other:
+            # Package meta asked for a taken seq — safely normalize upward.
+            desired = next_seq
+            other2 = _taken_by_other(desired)
+            if other2:
+                return {
+                    "ok": False,
+                    "code": "RELEASE_SEQUENCE_ARTIFACT_CONFLICT",
+                    "message": f"releaseSequence={desired} 已绑定其他 SHA",
+                    "releaseSequence": desired,
+                }
+
+    return {
+        "ok": True,
+        "releaseSequence": desired,
+        "reuseArtifact": False,
+        "existingTargets": [],
+    }
+
+
 def publish_targeted_release(
     data_dir: Path,
     *,
@@ -211,7 +378,7 @@ def publish_targeted_release(
     """Publish a package only for selected clientIds; keep global stable manifest unchanged."""
     targets = normalize_target_client_ids(target_client_ids)
     if not targets:
-        return {"ok": False, "message": "targetClientIds 必填"}
+        return {"ok": False, "code": "TARGET_CLIENT_IDS_REQUIRED", "message": "targetClientIds 必填"}
     bid = _safe_build_id(build_id)
     if not bid:
         return {"ok": False, "message": "buildId 必填"}
@@ -220,28 +387,25 @@ def publish_targeted_release(
         return {"ok": False, "message": "请先上传对应 buildId 的安装包"}
     digest = sha256_file(pkg)
     size = pkg.stat().st_size
-    stable = load_manifest(data_dir)
-    try:
-        stable_seq = int(stable.get("releaseSequence") or 0)
-    except Exception:
-        stable_seq = 0
-    # Prefer portable package releaseSequence (e.g. 102) over global-stable+1 (often stale).
     meta = load_package_meta(data_dir, bid)
     try:
         meta_seq = int(meta.get("releaseSequence") or 0)
     except Exception:
         meta_seq = 0
-    try:
-        explicit_seq = int(release_sequence) if release_sequence is not None else 0
-    except Exception:
-        explicit_seq = 0
-    seq = max(
-        1,
-        stable_seq + 1,
-        meta_seq,
-        explicit_seq,
-        _max_targeted_release_sequence(data_dir),
+    resolved = resolve_targeted_release_sequence(
+        data_dir,
+        digest=digest,
+        build_id=bid,
+        release_sequence=release_sequence,
+        package_meta_sequence=meta_seq,
     )
+    if not resolved.get("ok"):
+        return {
+            "ok": False,
+            "code": resolved.get("code") or "RELEASE_SEQUENCE_ERROR",
+            "message": resolved.get("message") or "releaseSequence 冲突",
+        }
+    seq = int(resolved["releaseSequence"])
     caller_ver = str(version or "").strip().lstrip("vV")
     if not (len(caller_ver) <= 16 and caller_ver.replace(".", "", 1).isdigit() and caller_ver.count(".") == 1):
         stem = Path(str(file_name or "")).stem
@@ -249,11 +413,17 @@ def publish_targeted_release(
             maybe = stem.lower().rsplit("v", 1)[-1].strip()
             if maybe.replace(".", "", 1).isdigit() and maybe.count(".") == 1:
                 caller_ver = maybe
+    # Prefer previously published version label for the same artifact.
+    if resolved.get("reuseArtifact") and resolved.get("versionHint"):
+        hint = str(resolved.get("versionHint") or "").strip().lstrip("vV")
+        if len(hint) <= 16 and hint.replace(".", "", 1).isdigit() and hint.count(".") == 1:
+            caller_ver = hint
     ver = caller_ver if (len(caller_ver) <= 16 and caller_ver.replace(".", "", 1).isdigit() and caller_ver.count(".") == 1) else f"1.{max(0, min(9, seq - 1))}"
     fname = str(file_name or "").strip() or f"微信群控系统v{ver}.exe"
     base = str(public_base_url or "").rstrip("/")
     url = str(download_url or "").strip() or (base + "/api/update/package/" + bid)
     published_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    merged_targets = normalize_target_client_ids(list(targets) + list(resolved.get("existingTargets") or []))
     man = {
         "version": ver,
         "buildId": bid,
@@ -273,22 +443,26 @@ def publish_targeted_release(
         "authenticodePublisher": "",
         "releaseSequence": seq,
         "minimumReleaseSequence": 0,
-        "targetClientIds": targets,
+        "targetClientIds": merged_targets,
         "securityEmergency": False,
     }
     sig_v1, sig_v2 = sign_manifest_dual(data_dir, man, seed_b64=seed_b64)
     store = load_targeted_releases(data_dir)
     releases = [r for r in (store.get("releases") or []) if isinstance(r, dict)]
-    # Replace overlapping targets
     kept = []
-    target_set = set(targets)
+    sha_l = digest.lower()
     for rel in releases:
-        old = set(str(x).strip() for x in (rel.get("targetClientIds") or []) if str(x).strip())
-        if old & target_set:
+        old_targets = set(normalize_target_client_ids(rel.get("targetClientIds") or []))
+        old_man = rel.get("manifest") if isinstance(rel.get("manifest"), dict) else {}
+        old_sha = str(old_man.get("sha256") or "").strip().lower()
+        # Drop same-artifact rows (will rewrite merged) and rows overlapping new targets.
+        if old_sha and old_sha == sha_l:
+            continue
+        if old_targets & set(merged_targets):
             continue
         kept.append(rel)
     kept.append({
-        "targetClientIds": targets,
+        "targetClientIds": merged_targets,
         "manifest": man,
         "signature": sig_v1,
         "signatureV2": sig_v2,
@@ -314,7 +488,8 @@ def publish_targeted_release(
         "version": ver,
         "releaseSequence": seq,
         "sha256": digest,
-        "targetClientIds": targets,
+        "targetClientIds": merged_targets,
+        "reuseArtifact": bool(resolved.get("reuseArtifact")),
     })
     return {
         "ok": True,
@@ -322,7 +497,9 @@ def publish_targeted_release(
         "signature": sig_v1,
         "signatureV2": sig_v2,
         "targeted": True,
-        "targetClientIds": targets,
+        "targetClientIds": merged_targets,
+        "reuseArtifact": bool(resolved.get("reuseArtifact")),
+        "code": "OK",
     }
 
 

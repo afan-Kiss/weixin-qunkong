@@ -215,30 +215,72 @@ function canonicalManifestBytes(man) {
  * @param {string} [signatureV2Hex]
  * @returns {boolean}
  */
+function _ed25519VerifyHex(body, signatureHex, publicKeyB64) {
+  const raw = Buffer.from(String(publicKeyB64 || '').trim(), 'base64')
+  if (raw.length !== 32) return false
+  const key = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), raw]), format: 'der', type: 'spki' })
+  const h = String(signatureHex || '').trim()
+  if (!/^[0-9a-fA-F]+$/.test(h) || h.length % 2 !== 0) return false
+  try {
+    return verify(null, body, key, Buffer.from(h, 'hex'))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Legacy wire signature (v1 canonical bytes).
+ * @param {Record<string, unknown>} man
+ * @param {string} signatureHex
+ * @param {string} [publicKeyB64]
+ * @returns {boolean}
+ */
+function verifyManifestSignatureV1(man, signatureHex, publicKeyB64 = BUILTIN_PUBLISH_PUBLIC_KEY_B64) {
+  if (allowUnsignedForTest && !publicKeyB64) return true
+  try {
+    return _ed25519VerifyHex(canonicalManifestBytesV1(man), signatureHex, publicKeyB64)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Modern control-plane signature (v2 canonical bytes).
+ * @param {Record<string, unknown>} man
+ * @param {string} signatureV2Hex
+ * @param {string} [publicKeyB64]
+ * @returns {boolean}
+ */
+function verifyManifestSignatureV2(man, signatureV2Hex, publicKeyB64 = BUILTIN_PUBLISH_PUBLIC_KEY_B64) {
+  if (allowUnsignedForTest && !publicKeyB64) return true
+  try {
+    return _ed25519VerifyHex(canonicalManifestBytesV2(man), signatureV2Hex, publicKeyB64)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 用内嵌 Ed25519 公钥校验清单签名。
+ * 优先 signatureV2（控制面字段）；否则按协议版本选择 v1/v2 wire。
+ * @param {Record<string, unknown>} man
+ * @param {string} signatureHex
+ * @param {string} [publicKeyB64]
+ * @param {string} [signatureV2Hex]
+ * @returns {boolean}
+ */
 function verifyManifestSignature(man, signatureHex, publicKeyB64 = BUILTIN_PUBLISH_PUBLIC_KEY_B64, signatureV2Hex = '') {
   if (allowUnsignedForTest && !publicKeyB64) return true
   try {
-    const raw = Buffer.from(String(publicKeyB64 || '').trim(), 'base64')
-    if (raw.length !== 32) return false
-    const key = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), raw]), format: 'der', type: 'spki' })
-    const tryVerify = (body, hex) => {
-      const h = String(hex || '').trim()
-      if (!/^[0-9a-fA-F]+$/.test(h) || h.length % 2 !== 0) return false
-      try {
-        return verify(null, body, key, Buffer.from(h, 'hex'))
-      } catch {
-        return false
-      }
-    }
     const v2Hex = String(signatureV2Hex || '').trim()
     if (v2Hex) {
-      return tryVerify(canonicalManifestBytesV2(man), v2Hex)
+      return verifyManifestSignatureV2(man, v2Hex, publicKeyB64)
     }
     // 无 signatureV2：仅当 signature 本身就是 v2 wire（或 v1 协议）时通过
     if (manifestUsesProtocolV2(man?.updaterProtocolVersion)) {
-      return tryVerify(canonicalManifestBytesV2(man), signatureHex)
+      return verifyManifestSignatureV2(man, signatureHex, publicKeyB64)
     }
-    return tryVerify(canonicalManifestBytesV1(man), signatureHex)
+    return verifyManifestSignatureV1(man, signatureHex, publicKeyB64)
   } catch {
     return false
   }
@@ -1536,6 +1578,8 @@ module.exports = {
   canonicalManifestBytesV1,
   canonicalManifestBytesV2,
   verifyManifestSignature,
+  verifyManifestSignatureV1,
+  verifyManifestSignatureV2,
   needsUpgrade,
   isManifestTargetedToClient,
   parseVersionParts,
