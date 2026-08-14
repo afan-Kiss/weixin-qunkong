@@ -16,6 +16,8 @@ const BLOB = Object.freeze({
   // 线上 8443 SPKI pins（双 pin：旧自签 + Let's Encrypt IP leaf；可用 WXQK_TLS_SPKI_PINS 覆盖）
   tlsSpkiPins: Object.freeze([41, 84, 240, 28, 66, 62, 155, 129, 166, 106, 11, 244, 1, 231, 76, 62, 44, 75, 221, 72, 2, 88, 222, 133, 165, 43, 0, 246, 57, 250, 84, 20, 20, 91, 208, 67, 17, 74, 242, 149, 185, 117, 63, 249, 24, 250, 113, 6, 27, 87, 172, 2, 4, 96, 213, 227, 214, 47, 69, 182, 7, 241, 76, 0, 22, 12, 214, 95, 33, 94, 231, 180, 132, 97, 25, 129, 62, 227, 14, 33, 46, 101, 203, 111, 46, 71, 214, 147, 208, 104, 32, 247, 123, 187, 90, 39, 50, 23, 245, 109, 52, 127, 137]),
   pubKey: Object.freeze([105, 93, 223, 28, 17, 98, 240, 189, 177, 67, 6, 177, 120, 225, 81, 28, 21, 118, 166, 118, 67, 121, 228, 135, 173, 77, 16, 137, 29, 187, 108, 5, 10, 12, 162, 67, 29, 77, 225, 130, 130, 122, 9, 253]),
+  // Transition publish public key (wxqk-v2). Private seed must NEVER enter Git.
+  pubKeyV2: Object.freeze([60, 5, 213, 94, 66, 124, 217, 231, 213, 87, 27, 143, 25, 203, 80, 25, 34, 109, 231, 88, 0, 126, 225, 146, 141, 73, 15, 244, 29, 242, 126, 39, 25, 11, 210, 104, 62, 103, 242, 149, 212, 124, 5, 253]),
   protoApp: Object.freeze([59, 76, 225, 3, 1, 57]),
   protoSec: Object.freeze([41, 89, 242, 3, 1, 57]),
   protoDesk: Object.freeze([62, 89, 226, 69, 90, 126, 133]),
@@ -86,6 +88,11 @@ function getAllowedHosts() {
 /** @returns {string} */
 function getPublishPublicKeyB64() {
   return secret('pubKey')
+}
+
+/** @returns {string} Transition / NEW publish public key (wxqk-v2). */
+function getPublishPublicKeyV2B64() {
+  return secret('pubKeyV2')
 }
 
 /**
@@ -191,6 +198,7 @@ module.exports = {
   getServiceBase,
   getAllowedHosts,
   getPublishPublicKeyB64,
+  getPublishPublicKeyV2B64,
   getTlsSpkiPins,
   getProtocol,
   getLegacyManifestDefaults,

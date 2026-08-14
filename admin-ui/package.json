@@ -8,6 +8,7 @@
   "scripts": {
     "extract:har": "node --experimental-strip-types scripts/extract-wechat-har.ts",
     "test": "node --test test/*.test.cjs",
+    "secret:scan": "node scripts/secret-scan.cjs",
     "check:mesh": "node scripts/check-mesh.cjs",
     "check:mesh:strict": "node scripts/check-mesh.cjs --strict",
     "fetch:mesh-agent": "node scripts/fetch-mesh-agent.cjs",
@@ -20,8 +21,8 @@
     "bump:version": "node scripts/bump-version.cjs",
     "ensure:hooks": "node scripts/ensure-hooks.cjs",
     "generate:portable-splash": "node scripts/generate-portable-splash.cjs",
-    "package:win": "node scripts/ensure-hooks.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/generate-portable-splash.cjs && node scripts/package-portable.cjs",
-    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/generate-portable-splash.cjs && node scripts/package-portable.cjs",
+    "package:win": "node scripts/ensure-hooks.cjs && node scripts/secret-scan.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/generate-portable-splash.cjs && node scripts/package-portable.cjs",
+    "package:portable": "node scripts/ensure-hooks.cjs && node scripts/secret-scan.cjs && node scripts/check-mesh.cjs --strict && node scripts/bump-version.cjs && npm run build && node scripts/generate-portable-splash.cjs && node scripts/package-portable.cjs",
     "publish:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory",
     "publish:release:skip-bump": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1 -Mandatory -SkipBump",
     "preview": "vite preview",

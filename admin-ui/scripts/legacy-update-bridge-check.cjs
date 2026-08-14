@@ -109,7 +109,9 @@ function assertOptionalHostAccount(args, actual) {
 }
 
 function evaluateSignatureGates(man, signature, signatureV2, publicKeyB64) {
-  const pub = String(publicKeyB64 || BUILTIN_PUBLISH_PUBLIC_KEY_B64 || '').trim()
+  // Never trust server-supplied publicKey as verify root.
+  const pub = String(BUILTIN_PUBLISH_PUBLIC_KEY_B64 || publicKeyB64 || '').trim()
+  void publicKeyB64
   const v1 = Boolean(man && signature && verifyManifestSignatureV1(man, signature, pub))
   const v2 = Boolean(man && signatureV2 && verifyManifestSignatureV2(man, signatureV2, pub))
   return {
@@ -190,7 +192,7 @@ async function main() {
   }
 
   const man = targeted?.manifest || null
-  const pub = String(targeted?.publicKey || BUILTIN_PUBLISH_PUBLIC_KEY_B64 || '')
+  const pub = String(BUILTIN_PUBLISH_PUBLIC_KEY_B64 || '')
   const signatureGates = evaluateSignatureGates(man, targeted?.signature, targeted?.signatureV2, pub)
   const hostAccountGate = clientId
     ? assertOptionalHostAccount(args, row || {})
@@ -286,6 +288,22 @@ async function main() {
   if (args.trigger) {
     if (!hostAccountGate.ok) {
       console.error(hostAccountGate.code)
+      console.log(JSON.stringify(report, null, 2))
+      process.exit(2)
+    }
+    const sanity = String(report.gates?.GOOD_MANIFEST_SANITY_GATE || '')
+    // Trigger requires an explicit PASS — SKIPPED/FAIL both block.
+    if (!sanity.startsWith('PASS')) {
+      console.error('LEGACY_MANIFEST_TRIGGER_BLOCKED')
+      report.gates.LEGACY_UPDATE_TRIGGER_GATE = `BLOCKED (${sanity})`
+      console.log(JSON.stringify(report, null, 2))
+      process.exit(2)
+    }
+    const v1 = String(report.gates?.LEGACY_SIGNATURE_V1_GATE || '')
+    const v2 = String(report.gates?.MODERN_SIGNATURE_V2_GATE || '')
+    if (v1 === 'FAIL' || v2 === 'FAIL') {
+      console.error('LEGACY_MANIFEST_SIGNATURE_BLOCKED')
+      report.gates.LEGACY_UPDATE_TRIGGER_GATE = `BLOCKED (v1=${v1} v2=${v2})`
       console.log(JSON.stringify(report, null, 2))
       process.exit(2)
     }

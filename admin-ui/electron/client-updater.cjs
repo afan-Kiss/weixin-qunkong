@@ -23,6 +23,7 @@ const {
   isLegacyBrandDownloadUrl,
   isLegacyBrandFileName,
 } = require('./secure-config.cjs')
+const { resolveTrustedPublishKey } = require('./publish-trust.cjs')
 const { insecureTlsForService } = require('./service-tls.cjs')
 const {
   POLICY,
@@ -272,15 +273,23 @@ function verifyManifestSignatureV2(man, signatureV2Hex, publicKeyB64 = BUILTIN_P
 function verifyManifestSignature(man, signatureHex, publicKeyB64 = BUILTIN_PUBLISH_PUBLIC_KEY_B64, signatureV2Hex = '') {
   if (allowUnsignedForTest && !publicKeyB64) return true
   try {
+    // When caller omits publicKeyB64, resolve from local trusted key ring by signingKeyId.
+    // Never trust a server-supplied publicKey for this path.
+    let pub = publicKeyB64
+    if (pub === undefined || pub === BUILTIN_PUBLISH_PUBLIC_KEY_B64) {
+      const resolved = resolveTrustedPublishKey(man || {})
+      if (!resolved.ok) return false
+      pub = resolved.publicKeyB64
+    }
     const v2Hex = String(signatureV2Hex || '').trim()
     if (v2Hex) {
-      return verifyManifestSignatureV2(man, v2Hex, publicKeyB64)
+      return verifyManifestSignatureV2(man, v2Hex, pub)
     }
     // 无 signatureV2：仅当 signature 本身就是 v2 wire（或 v1 协议）时通过
     if (manifestUsesProtocolV2(man?.updaterProtocolVersion)) {
-      return verifyManifestSignatureV2(man, signatureHex, publicKeyB64)
+      return verifyManifestSignatureV2(man, signatureHex, pub)
     }
-    return verifyManifestSignatureV1(man, signatureHex, publicKeyB64)
+    return verifyManifestSignatureV1(man, signatureHex, pub)
   } catch {
     return false
   }
@@ -504,8 +513,13 @@ async function fetchManifest(baseUrl, clientId = '') {
     // 单测可跳过验签
   } else if (!signature && !signatureV2) {
     throw new Error('UPDATE_SIGNATURE_MISSING')
-  } else if (!verifyManifestSignature(man, signature, undefined, signatureV2)) {
-    throw new Error('UPDATE_SIGNATURE_INVALID')
+  } else {
+    const trust = resolveTrustedPublishKey(man)
+    if (!trust.ok) throw new Error(trust.code || 'UNKNOWN_SIGNING_KEY_ID')
+    // Intentionally ignore wrap.publicKey — diagnostics only; never trust root.
+    if (!verifyManifestSignature(man, signature, trust.publicKeyB64, signatureV2)) {
+      throw new Error('UPDATE_SIGNATURE_INVALID')
+    }
   }
   if (!String(man.buildId || '').trim() && !String(man.version || '').trim() && !Number(man.releaseSequence || 0)) {
     throw new Error('missing buildId')
