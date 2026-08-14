@@ -571,6 +571,7 @@ function commitLaunchEntries({ installDir, newExePath, oldExePath, committed }) 
     ok: true,
     reason: '',
     stableLauncher: { path: stable, created: false, shaMatch: false },
+    userDataLauncher: { path: '', created: false, shaMatch: false },
     oldEntry: { path: oldExePath ? path.resolve(oldExePath) : '', updated: false, shaMatch: false },
     currentPointer: { written: false, valid: false },
   }
@@ -594,6 +595,21 @@ function commitLaunchEntries({ installDir, newExePath, oldExePath, committed }) 
     result.reason = 'STABLE_LAUNCHER_WRITE_FAILED'
     result.error = String(error && error.message || error)
     return result
+  }
+
+  // Also maintain %LOCALAPPDATA%\WXQK\launcher\微信群控系统.exe for login-item startup (best-effort).
+  try {
+    const { resolveStableLauncherPath, ensureStableLauncherCopy } = require('./background-startup.cjs')
+    const userLauncher = resolveStableLauncherPath(process.env.WXQK_USER_DATA_DIR || '')
+    const copy = ensureStableLauncherCopy({ sourceExe: newExePath, userDataRoot: process.env.WXQK_USER_DATA_DIR || '' })
+    result.userDataLauncher.path = userLauncher
+    result.userDataLauncher.created = Boolean(copy.ok)
+    if (copy.ok && fs.existsSync(userLauncher)) {
+      const udCheck = verifyCopiedSha(userLauncher, expectedSha)
+      result.userDataLauncher.shaMatch = Boolean(udCheck.ok)
+    }
+  } catch {
+    // Best-effort only — installDir stable launcher remains the commit-critical entry.
   }
 
   if (oldExePath && path.resolve(oldExePath) !== path.resolve(newExePath)) {
